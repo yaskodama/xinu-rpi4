@@ -35,6 +35,7 @@
 #define UART_CR      (*(volatile unsigned int *)(UART0_BASE + 0x30))
 #define UART_ICR     (*(volatile unsigned int *)(UART0_BASE + 0x44))
 
+#define FR_RXFE      (1u << 4)   /* RX FIFO empty  */
 #define FR_TXFF      (1u << 5)   /* TX FIFO full   */
 #define LCRH_FEN     (1u << 4)   /* enable FIFOs   */
 #define LCRH_WLEN_8  (3u << 5)   /* 8-bit words    */
@@ -81,4 +82,47 @@ void uart_puts(const char *s)
         }
         uart_putc(*s++);
     }
+}
+
+char uart_getc(void)
+{
+    /* Busy-wait until the RX FIFO has something. */
+    while (UART_FR & FR_RXFE) {
+        /* spin */
+    }
+    return (char)(UART_DR & 0xFF);
+}
+
+/* Line editor: blocking, echo + backspace + DEL.  CR/LF terminates. */
+int uart_getline(char *buf, int max)
+{
+    int n = 0;
+    if (max <= 0) {
+        return 0;
+    }
+    while (n < max - 1) {
+        char c = uart_getc();
+        if (c == '\r' || c == '\n') {
+            uart_puts("\n");
+            buf[n] = 0;
+            return n;
+        }
+        if (c == 0x08 || c == 0x7F) {  /* BS / DEL */
+            if (n > 0) {
+                n--;
+                /* Visually erase: backspace, space, backspace. */
+                uart_putc('\b');
+                uart_putc(' ');
+                uart_putc('\b');
+            }
+            continue;
+        }
+        if (c >= 0x20 && c < 0x7F) {   /* printable */
+            buf[n++] = c;
+            uart_putc(c);              /* echo */
+        }
+        /* Silently swallow other control chars. */
+    }
+    buf[n] = 0;
+    return n;
 }

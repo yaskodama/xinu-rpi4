@@ -18,4 +18,14 @@ void uart_init(void);
 void uart_putc(char c);
 void uart_puts(const char *s);
 
+/* Blocking read of one byte from RX FIFO. */
+char uart_getc(void);
+
+/* Read a line into `buf` up to `max - 1` chars.  Echoes characters
+ * back to the terminal so the user can see what they typed; handles
+ * backspace (0x08) and DEL (0x7F).  Returns the number of bytes
+ * placed in `buf` (excluding the trailing NUL).  CR (0x0D) and LF
+ * (0x0A) both terminate input. */
+int uart_getline(char *buf, int max);
+
 #endif /* XINU_RPI5_UART_H */

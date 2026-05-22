@@ -24,12 +24,12 @@ clean split easier than ifdef-walling everything in place.
 | M1 Kernel heap                            | ⏳ |
 | S0 AArch64 context switch                 | ⏳ |
 | S1 GIC-400 + generic timer                | ⏳ |
-| X0 xsh on Pi 5                            | ⏳ |
+| **X0** xsh on Pi 5 — interactive REPL      | ✅ minimal (help/echo/hello/mem/peek/uptime/reboot) |
 | X1 AIPL hello                             | ⏳ |
 
 The boot path right now is **leex stub → BSS clear → `kernel_main` →
-banner → WFE loop**.  USB-serial cable on header pins 8 / 10 should
-show:
+banner → `shell_main()` REPL**.  USB-serial cable on header pins 8 / 10
+should show:
 
 ```
 ================================================
@@ -38,9 +38,25 @@ show:
   bootstrap: leex-style stub + xinu-rpi5 main
 ================================================
 
-kernel_main: parked in WFE loop (Round 1 phase B/U done)
+Round 1 phase B/U done — entering interactive shell.
 Next milestones: M0 MMU, S0 ctxsw, S1 GIC+timer
+
+type `help` for the command list.
+xinu-pi5$ _
 ```
+
+The shell handles backspace/DEL, echoes input, and dispatches via a
+`davidxyz/xinuPi`-style `centry` table.  Built-ins:
+
+| command           | what it does                                        |
+|-------------------|-----------------------------------------------------|
+| `help` / `?`      | list registered commands                            |
+| `echo <words…>`   | echo args back (whitespace-collapsed)               |
+| `hello`           | friendly greeting (smoke marker)                    |
+| `mem`             | `__bss_start`, `__bss_end`, `_end` from `link.ld`   |
+| `peek <hex_addr>` | read 32-bit MMIO word; e.g. `peek 0x107d001018` (UART_FR) |
+| `uptime`          | raw `CNTPCT_EL0` (until phase S1 wires the timer)   |
+| `reboot`          | stub — spins until power-cycle (RP1 watchdog TBD)   |
 
 ## Hardware vs Pi 4 (leex baseline)
 
@@ -103,8 +119,10 @@ xinu-rpi5/
 │   ├── boot.S          # AArch64 entry stub (leex pattern, Pi-5 tuned)
 │   ├── link.ld         # load address 0x80000
 │   ├── Makefile        # aarch64-none-elf → kernel_2712.img
-│   ├── main.c          # current sign-of-life
-│   ├── uart.c          # PL011 UART0 @ 0x107D001000
+│   ├── main.c          # banner + shell handoff
+│   ├── shell.c         # bare-metal REPL (davidxyz/xinuPi-style)
+│   ├── shell.h
+│   ├── uart.c          # PL011 UART0 @ 0x107D001000 (+ getc/getline)
 │   └── uart.h
 ├── sdcard/
 │   └── config.txt      # firmware settings (arm_64bit=1, etc)

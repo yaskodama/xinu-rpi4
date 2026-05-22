@@ -12,6 +12,7 @@
 // has time to read it before resetting the board.
 
 #include "uart.h"
+#include "shell.h"
 
 void kernel_main(void)
 {
@@ -24,12 +25,10 @@ void kernel_main(void)
     uart_puts("  bootstrap: leex-style stub + xinu-rpi5 main\n");
     uart_puts("================================================\n");
     uart_puts("\n");
-    uart_puts("kernel_main: parked in WFE loop (Round 1 phase B/U done)\n");
+    uart_puts("Round 1 phase B/U done — entering interactive shell.\n");
     uart_puts("Next milestones: M0 MMU, S0 ctxsw, S1 GIC+timer\n");
+    uart_puts("\n");
 
-    /* Park.  boot.S would do this too if we returned, but explicit
-     * is friendlier when scrolling the disassembly. */
-    for (;;) {
-        __asm__ volatile ("wfe");
-    }
+    /* Hand off to the bare-metal REPL (never returns). */
+    shell_main();
 }
