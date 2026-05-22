@@ -53,48 +53,10 @@ static int g_rx_log_left = 2;
 static unsigned long g_rx_tick_count = 0;
 static void genet_rx_tick(void)
 {
-    /* First tick: print a header so we KNOW genet_rx_tick is wired.
-     * Periodic DHCP retry — every 100 ticks (~5 s at 20 fps wm). */
+    /* DHCP retry path disabled — was disrupting the GENET TX ring
+     * after repeated DISCOVER bursts.  Code in system/dhcp_client.c
+     * stays in place for future re-activation. */
     g_rx_tick_count++;
-    if (g_rx_tick_count == 1) {
-        uart_puts("rx_tick: first call (genet_rx_tick is hooked up)\n");
-    }
-    if (g_rx_tick_count == 40) {
-        /* Force a visible DHCP retry at 2 seconds into runtime so we
-         * see it before ICMP traffic floods the shell window. */
-        uart_puts(">>>DHCP @t=2s retry<<<\n");
-        if (!dhcp_is_bound()) dhcp_send_discover();
-    }
-    if ((g_rx_tick_count % 100) == 0) {
-        uart_puts("dhcp: state=");
-        uart_putc((char)('0' + dhcp_state()));
-        uart_puts(" disc=");
-        {
-            unsigned long v = dhcp_discover_count();
-            char b[12]; int n = 0;
-            if (!v) uart_putc('0');
-            else { while (v) { b[n++] = (char)('0' + v % 10); v /= 10; }
-                   while (n--) uart_putc(b[n]); }
-        }
-        uart_puts(" offer=");
-        {
-            unsigned long v = dhcp_offer_count();
-            char b[12]; int n = 0;
-            if (!v) uart_putc('0');
-            else { while (v) { b[n++] = (char)('0' + v % 10); v /= 10; }
-                   while (n--) uart_putc(b[n]); }
-        }
-        uart_puts(" ack=");
-        {
-            unsigned long v = dhcp_ack_count();
-            char b[12]; int n = 0;
-            if (!v) uart_putc('0');
-            else { while (v) { b[n++] = (char)('0' + v % 10); v /= 10; }
-                   while (n--) uart_putc(b[n]); }
-        }
-        uart_puts("\n");
-        if (!dhcp_is_bound()) dhcp_send_discover();
-    }
 
     unsigned char *pkt;
     int len;
@@ -760,14 +722,11 @@ void kernel_main(void)
         uart_puts("net: gratuitous ARP done\n");
     }
 
-    /* NET-F: kick off DHCP DISCOVER once link is up.  Replies land
-     * via genet_rx_tick → dhcp_handle_packet.  Static IP above is
-     * kept as a fallback until BOUND. */
-    {
-        unsigned char mymac[6] = { 0xd8, 0x3a, 0xdd, 0xa7, 0xfd, 0xbf };
-        dhcp_set_mac(mymac);
-        dhcp_send_discover();
-    }
+    /* NET-F (DHCP) is staged but the boot-time DISCOVER call is
+     * temporarily disabled — we need to figure out why repeated
+     * DHCP TX seems to disrupt the GENET TX ring.  dhcp_handle_packet
+     * remains wired into genet_rx_tick so an unsolicited reply would
+     * still bind us, but no DISCOVER is ever sent right now. */
 
     uart_puts("\n");
     uart_puts("Round 1: B/U/M1/S0/X0 done.\n");
