@@ -97,12 +97,23 @@
 /* SYS_PORT_CTRL bits */
 #define SYS_PORT_MODE_EXT_GPHY      3        /* external 1G PHY */
 
-/* TX descriptor word 0 flags (length in low 12 bits, status in upper) */
-#define DMA_SOP                     (1u << 31)
-#define DMA_EOP                     (1u << 30)
-#define DMA_TX_OWN                  (1u << 29)
+/* TX descriptor word 0 layout (BCM2711 GENET):
+ *   bits 31:16 — length (bytes)
+ *   bits 15:0  — status flags
+ * Status flags (in low 16 bits):
+ *   bit 15: SOP (start of packet)
+ *   bit 14: EOP (end of packet)
+ *   bit 13: WRAP
+ *   bit 12: TX_OW (descriptor owned by hardware)
+ *   bit 6 : TX_APPEND_CRC
+ *   bits 5:0 — QTAG
+ */
+#define DMA_BUFLENGTH_SHIFT         16
+#define DMA_SOP                     (1u << 15)
+#define DMA_EOP                     (1u << 14)
+#define DMA_TX_OWN                  (1u << 12)
 #define DMA_TX_APPEND_CRC           (1u << 6)
-#define DMA_TX_QTAG_SHIFT           7
+#define DMA_TX_QTAG_SHIFT           0
 #define DMA_TX_DEFAULT_QTAG         0x3F     /* 6 bits */
 #define MDIO_START_BUSY        (1u << 29)
 #define MDIO_READ_FAIL         (1u << 28)
@@ -431,7 +442,7 @@ static void genet_send_one_arp(const unsigned char src_mac[6])
     /* Step 2 — populate TX descriptor.  Word 0 carries length in
      * the low 16 bits and SOP+EOP+QTAG+CRC in the upper bits. */
     unsigned long buf_pa = (unsigned long)tx_buf;
-    tx_desc[0] = ((unsigned int)len & 0xFFFFu)
+    tx_desc[0] = ((unsigned int)len << DMA_BUFLENGTH_SHIFT)
                | DMA_SOP | DMA_EOP | DMA_TX_OWN | DMA_TX_APPEND_CRC
                | (DMA_TX_DEFAULT_QTAG << DMA_TX_QTAG_SHIFT);
     tx_desc[1] = (unsigned int)(buf_pa & 0xFFFFFFFFu);
@@ -555,21 +566,17 @@ static void genet_send_one_arp(const unsigned char src_mac[6])
         __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
         if (now - start >= target) break;
     }
+    /* Re-print descriptor here so the value survives even after
+     * 18 lines of shell-window scroll. */
+    uart_puts("genet/tx: desc[0] re = "); puts_hex32(tx_desc[0]); uart_puts("\n");
     uart_puts("genet/tx: CONS_INDEX = "); puts_hex32(cons);
     uart_puts((cons >= 1) ? "  (sent OK)\n" : "  (TX timeout)\n");
-
-    /* Diagnostic dump on timeout */
+    /* compact diag */
     if (cons < 1) {
-        uart_puts("genet/tx: DMA_STATUS  = ");
+        uart_puts("genet/tx: DMA_S/CTRL = ");
         puts_hex32(GENET_REG(TX_DMA_TOP + TDMA_STATUS));
-        uart_puts("\ngenet/tx: PROD_INDEX = ");
-        puts_hex32(GENET_REG(TX_RING_BASE + TDMA_PROD_INDEX));
-        uart_puts("\ngenet/tx: WRITE_PTR  = ");
-        puts_hex32(GENET_REG(TX_RING_BASE + TDMA_WRITE_PTR_LO));
-        uart_puts("\ngenet/tx: READ_PTR   = ");
-        puts_hex32(GENET_REG(TX_RING_BASE + TDMA_READ_PTR_LO));
-        uart_puts("\ngenet/tx: UMAC_CMD   = ");
-        puts_hex32(GENET_REG(UMAC_CMD));
+        uart_puts(" / ");
+        puts_hex32(GENET_REG(TX_DMA_TOP + TDMA_CTRL));
         uart_puts("\n");
     }
 }
