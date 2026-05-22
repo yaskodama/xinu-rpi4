@@ -21,7 +21,41 @@
 .global _start
 .global dtb_addr
 
+// ============================================================
+// Linux ARM64 Image header  (Documentation/arm64/booting.rst)
+// ============================================================
+// Required by Pi 5 firmware: the EEPROM bootloader refuses to
+// jump to `kernel_2712.img` unless it sees the magic "ARM\x64"
+// at offset 0x38 of the file (i.e. of this header).  Without
+// the header the firmware leaves its rainbow boot pattern on
+// HDMI and our code never runs — symptom: "rainbow unchanged
+// even with the early-paint diagnostic in place".
+//
+// Field layout (every field is little-endian):
+//   0x00  code0       4   first executable instruction
+//   0x04  code1       4   second executable instruction
+//   0x08  text_offset 8   load offset from image base (0)
+//   0x10  image_size  8   effective image size hint (1 MiB)
+//   0x18  flags       8   bit0=BE, bit1:2=page size, bit3=anywhere
+//   0x20  res2        8
+//   0x28  res3        8
+//   0x30  res4        8
+//   0x38  magic       4   ASCII "ARM\x64"
+//   0x3c  res5        4   PE-COFF header offset (0 — no PE)
+// Total: 64 bytes; real code starts at _real_start below.
 _start:
+    b       _real_start             // 0x00 code0 — jump over header
+    .word   0                       // 0x04 code1 — unused (padding)
+    .quad   0x80000                 // 0x08 text_offset (matches link.ld)
+    .quad   0x100000                // 0x10 image_size = 1 MiB hint
+    .quad   2                       // 0x18 flags (4K pages, LE)
+    .quad   0                       // 0x20 res2
+    .quad   0                       // 0x28 res3
+    .quad   0                       // 0x30 res4
+    .ascii  "ARM\x64"               // 0x38 magic
+    .word   0                       // 0x3c res5 (no PE header)
+
+_real_start:
     // ---- (1) pin secondary cores ---------------------------------
     mrs     x1, mpidr_el1
     and     x1, x1, #3
