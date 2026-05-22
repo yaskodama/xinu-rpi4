@@ -11,7 +11,15 @@
 #define SHELL_BUFLEN   128
 #define SHELL_MAXTOK    16
 
-/* Never returns. */
+/* Never returns — for use when the kernel falls back to UART-only
+ * mode (no HDMI framebuffer). */
 void shell_main(void);
+
+/* Dispatch a single shell line (in-place tokenisation; `line` must
+ * be writable and at most SHELL_BUFLEN chars).  Used by shellwin
+ * to drive the shell from the wm frame loop without a blocking
+ * uart_getline().  Returns 0 on dispatch / unknown command, never
+ * blocks. */
+int  shell_dispatch_line(char *line);
 
 #endif /* XINU_RPI5_SHELL_H */

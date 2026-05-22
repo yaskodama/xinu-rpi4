@@ -23,6 +23,7 @@
 
 #include "uart.h"
 #include "video.h"
+#include "shellwin.h"
 
 /* BCM2712 high-memory MMIO base + PL011 UART0 offset.
  * (Pi 4's base was 0xFE000000 + 0x201000 — both moved on Pi 5.)
@@ -96,6 +97,10 @@ void uart_putc(char c)
      * a parallel log channel in case the UART cable is silent on
      * this particular Pi 5 board. */
     screen_putc(c);
+
+    /* Also feed the wm shell window's scrollback ring.  Safe to
+     * call before shellwin_init() — it just drops the byte then. */
+    shellwin_record_char(c);
 }
 
 void uart_puts(const char *s)
@@ -115,6 +120,12 @@ char uart_getc(void)
         /* spin */
     }
     return (char)(UART_DR & 0xFF);
+}
+
+int uart_poll_char(void)
+{
+    if (UART_FR & FR_RXFE) return -1;
+    return (int)(UART_DR & 0xFF);
 }
 
 /* Line editor: blocking, echo + backspace + DEL.  CR/LF terminates. */

@@ -22,6 +22,39 @@
 #include "vfs.h"
 #include "sd.h"
 #include "fat32.h"
+#include "usb.h"
+#include "shellwin.h"
+#include "softkbd.h"
+#include "exception.h"
+#include "gic.h"
+#include "timer.h"
+#include "irq.h"
+#include "xhci.h"
+
+/* USPi is gone (DWC2 only — Pi 4 USB-A keyboards/mice need xHCI).
+ * Keyboard input from the future xHCI HID driver will land here. */
+void xhci_keyboard_event(char c)
+{
+    shellwin_handle_key(c);
+}
+
+static int  g_cursor_x = 320;
+static int  g_cursor_y = 240;
+
+void xhci_mouse_event(unsigned nButtons, int dx, int dy)
+{
+    g_cursor_x += dx;
+    g_cursor_y += dy;
+    int sw = (int)video_screen_width();
+    int sh = (int)video_screen_height();
+    wm_set_autopan(0);
+    if (g_cursor_x < 0)        { wm_pan(g_cursor_x, 0);          g_cursor_x = 0; }
+    if (g_cursor_y < 0)        { wm_pan(0, g_cursor_y);          g_cursor_y = 0; }
+    if (g_cursor_x >= sw)      { wm_pan(g_cursor_x - sw + 1, 0); g_cursor_x = sw - 1; }
+    if (g_cursor_y >= sh)      { wm_pan(0, g_cursor_y - sh + 1); g_cursor_y = sh - 1; }
+    wm_cursor_set(g_cursor_x, g_cursor_y, 1);
+    (void)nButtons;
+}
 
 extern unsigned char _end[];   /* set by link.ld — top of static image */
 
@@ -439,6 +472,13 @@ void kernel_main(void)
     early_paint_diagnostic();
 
     uart_init();
+    shellwin_init();   /* must run before the first uart_putc so the
+                          ring captures the boot banner */
+
+    /* S1a — install VBAR_EL1 so a stray data abort surfaces on the
+     *       UART/shell window instead of jumping to address 0 and
+     *       silently freezing the kernel. */
+    exception_init();
 
     /* Try to bring up the HDMI framebuffer before printing anything,
      * so the banner appears on both UART and the monitor.  Failure
@@ -514,6 +554,27 @@ void kernel_main(void)
         uart_puts(" nodes\n");
     }
 
+    /* USB-M0 — power on the DWC2 HCD via VC mailbox and read
+     *           GSNPSID to confirm the controller answers MMIO.
+     *           Skips MMIO probe if the mailbox call fails so a
+     *           data abort can't brick the desktop. */
+    usb_init();
+
+    /* S1b/c/d — GIC + generic timer + IRQ unmask.  After this
+     * point a 100 Hz IRQ runs in the background; timer_ticks()
+     * advances and any future USPi handler attached via
+     * connect_interrupt() will fire. */
+    gic_init();
+    timer_init();
+    uart_puts("gic+timer: 100 Hz PPI 30 armed; unmasking DAIF.I\n");
+    irq_enable_all();
+
+    /* XHCI-A — probe the Pi 4 BCM2711 PCIe-1 controller.  Step 1 of
+     * the multi-phase xHCI bring-up that will eventually drive the
+     * USB-A ports.  Today: just read the controller revision so we
+     * can see "the MMIO at 0xFD500000 responds". */
+    xhci_init();
+
     uart_puts("\n");
     uart_puts("Round 1: B/U/M1/S0/X0 done.\n");
 
@@ -525,7 +586,7 @@ void kernel_main(void)
         uart_puts("Entering window system (wm_run, no input)...\n");
 
         unsigned int sw = video_screen_width();
-        /* unsigned int sh = video_screen_height(); -- not needed */
+        unsigned int sh = video_screen_height();
 
         /* 5-window layout (640x480):
          *   +--- title 640x40 -----------------+
@@ -533,11 +594,13 @@ void kernel_main(void)
          *   | ftree  320x200 | memory   316x200 |
          */
 
-        /* Title-bar window: full width, 40 px tall. */
+        /* Title-bar window: full *virtual* desktop width, slimmer
+         * to make room for everything below.  Only the part inside
+         * the viewport (0..sw) shows at any moment. */
         banner_win.x = 0;
         banner_win.y = 0;
-        banner_win.width  = (int)sw;
-        banner_win.height = 44;
+        banner_win.width  = WM_DESKTOP_W;
+        banner_win.height = 28;
         const char *bt = "Xinu " BOARD_NAME " on " SOC_NAME;
         for (int i = 0; i < WM_TITLE_MAX && bt[i]; i++) banner_win.title[i] = bt[i];
         banner_win.chrome_color = 0xFFAACCEEU;
@@ -547,9 +610,10 @@ void kernel_main(void)
         banner_win.draw_content = win_banner;
         wm_add(&banner_win);
 
-        /* Status window: top-left, below title bar. */
-        status_win.x = 0;
-        status_win.y = 48;
+        /* Status window: right side of the initial viewport so
+         * the shell on the left has room to show the full log. */
+        status_win.x = 320;
+        status_win.y = 32;
         status_win.width  = 320;
         status_win.height = 200;
         const char *st = "System status";
@@ -561,25 +625,12 @@ void kernel_main(void)
         status_win.draw_content = win_status;
         wm_add(&status_win);
 
-        /* Animation window: top-right. */
-        anim_win.x = 324;
-        anim_win.y = 48;
-        anim_win.width  = (int)sw - 324;
-        anim_win.height = 200;
-        const char *an = "Animation";
-        for (int i = 0; i < WM_TITLE_MAX && an[i]; i++) anim_win.title[i] = an[i];
-        anim_win.chrome_color = 0xFFFFAA60U;
-        anim_win.title_bg     = 0xFF704020U;
-        anim_win.title_fg     = 0xFFFFFFFFU;
-        anim_win.content_bg   = 0xFF000000U;
-        anim_win.draw_content = win_anim;
-        wm_add(&anim_win);
-
-        /* File-tree window: bottom-left. */
-        ftree_win.x = 0;
-        ftree_win.y = 252;
+        /* File-tree window: well off the initial viewport so the
+         * user can pan right to discover it. */
+        ftree_win.x = WM_DESKTOP_W - 320;
+        ftree_win.y = 32;
         ftree_win.width  = 320;
-        ftree_win.height = 220;
+        ftree_win.height = 200;
         const char *ft = "VFS tree";
         for (int i = 0; i < WM_TITLE_MAX && ft[i]; i++) ftree_win.title[i] = ft[i];
         ftree_win.chrome_color = 0xFF60D0FFU;
@@ -589,10 +640,11 @@ void kernel_main(void)
         ftree_win.draw_content = win_ftree;
         wm_add(&ftree_win);
 
-        /* Memory window: bottom-right. */
-        mem_win.x = 324;
-        mem_win.y = 252;
-        mem_win.width  = (int)sw - 324;
+        /* Memory window: right side, below status so it sits in
+         * the initial viewport with the shell on the left. */
+        mem_win.x = 320;
+        mem_win.y = 240;
+        mem_win.width  = 320;
         mem_win.height = 220;
         const char *mt = "Memory";
         for (int i = 0; i < WM_TITLE_MAX && mt[i]; i++) mem_win.title[i] = mt[i];
@@ -602,6 +654,44 @@ void kernel_main(void)
         mem_win.content_bg   = 0xFF181410U;
         mem_win.draw_content = win_mem;
         wm_add(&mem_win);
+
+        /* Shell window: left half of the *initial* viewport — the
+         * boot log lives here and must stay visible without any
+         * scrolling so the user can read what happened during
+         * USPi init. */
+        shell_win.x = 0;
+        shell_win.y = 32;
+        shell_win.width  = 320;
+        shell_win.height = 432;
+        const char *swt = "Shell (UART)";
+        for (int i = 0; i < WM_TITLE_MAX && swt[i]; i++) shell_win.title[i] = swt[i];
+        shell_win.chrome_color = 0xFF80E080U;
+        shell_win.title_bg     = 0xFF205020U;
+        shell_win.title_fg     = 0xFFFFFFFFU;
+        shell_win.content_bg   = 0xFF000010U;
+        shell_win.draw_content = shellwin_draw;
+        wm_add(&shell_win);
+        wm_set_tick(shellwin_step);
+
+        /* Soft keyboard window: bottom-left of the initial 640×480
+         * viewport.  Half-size as the user requested. */
+        softkbd_win.x = 0;
+        softkbd_win.y = 360;
+        softkbd_win.width  = 320;
+        softkbd_win.height = 120;
+        const char *kbt = "Soft keyboard";
+        for (int i = 0; i < WM_TITLE_MAX && kbt[i]; i++) softkbd_win.title[i] = kbt[i];
+        softkbd_win.chrome_color = 0xFFFFB060U;
+        softkbd_win.title_bg     = 0xFF704020U;
+        softkbd_win.title_fg     = 0xFFFFFFFFU;
+        softkbd_win.content_bg   = 0xFF0A0A14U;
+        softkbd_win.draw_content = softkbd_draw;
+        wm_add(&softkbd_win);
+
+        /* Start the cursor at the centre of the *screen* (not the
+         * virtual desktop) so it stays in view as the viewport
+         * pans.  USPi (later) will drive it from mouse reports. */
+        wm_cursor_set((int)sw / 2, (int)sh / 2, 1);
 
         wm_run();   /* never returns */
     }

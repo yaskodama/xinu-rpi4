@@ -1,0 +1,96 @@
+// device/usb/xhci/xhci.c — VL805 xHCI driver, phase XHCI-A (probe).
+//
+// Today this file:
+//   1. Tries VC mailbox tag 0x00030058 (notify-xhci-reset).  On Pi 4
+//      firmware this re-runs the VL805 bring-up sequence — Linux's
+//      xhci-pci.c does the same thing when it sees vendor 0x1106
+//      device 0x3483.
+//   2. Probes the BCM2711 PCIe-1 controller MMIO at several offsets
+//      (revision, status, link cap, root-port vendor) so we can see
+//      from the shell-window log which registers respond and which
+//      don't.
+//
+// All output goes through uart_puts() so it shows up both on the
+// (absent) UART cable and in the on-screen shell window.
+
+#include "xhci.h"
+#include "uart.h"
+#include "mbox.h"
+
+#ifdef PCIE_BASE
+
+#define PCIE_REG(off)         (*(volatile unsigned int *)(PCIE_BASE + (off)))
+#define PCIE_RC_CFG_VENDOR    0x0000  /* root-complex CFG: PCI vendor/device */
+#define PCIE_RC_CFG_CLASS     0x0008
+#define PCIE_MISC_CTRL        0x4008
+#define PCIE_MISC_REVISION    0x406C
+#define PCIE_MISC_STATUS      0x4068
+#define PCIE_MISC_HARD_DBG    0x4204
+#define PCIE_RC_CFG_LINK_CAP  0x04DC
+
+static void puts_hex32(unsigned int v)
+{
+    char buf[11];
+    buf[0] = '0'; buf[1] = 'x';
+    for (int i = 0; i < 8; i++) {
+        unsigned int nyb = (v >> ((7 - i) * 4)) & 0xF;
+        buf[2 + i] = (char)(nyb < 10 ? '0' + nyb : 'a' + (nyb - 10));
+    }
+    buf[10] = 0;
+    uart_puts(buf);
+}
+
+static int xhci_notify_reset(void)
+{
+    /* Property tag 0x00030058 (notify-xhci-reset) — argument is the
+     * VL805 PCI bus/device/function packed as devid.  Pi 4 has VL805
+     * at bus 1 dev 0 fn 0 (after the root-complex on bus 0).  The
+     * encoding Linux uses is (bus << 20) | (dev << 15) | (fn << 12)
+     * = 0x100000 for bus=1 dev=0 fn=0 — but we pass 0 as a fallback
+     * because the firmware default targets VL805 anyway. */
+    static volatile unsigned int __attribute__((aligned(16))) buf[8];
+    buf[0] = 32;
+    buf[1] = 0;
+    buf[2] = 0x00030058U;        /* notify-xhci-reset */
+    buf[3] = 4;
+    buf[4] = 0;
+    buf[5] = 0x00100000U;        /* devid: bus=1, dev=0, fn=0 */
+    buf[6] = 0;
+    buf[7] = 0;
+    return mbox_call(buf);
+}
+
+unsigned int xhci_pcie_revision(void)
+{
+    return PCIE_REG(PCIE_MISC_REVISION);
+}
+
+static void dump_pcie_probe(const char *label)
+{
+    uart_puts("xhci: --- "); uart_puts(label); uart_puts(" ---\n");
+    uart_puts("  vendor[0x000] = ");  puts_hex32(PCIE_REG(PCIE_RC_CFG_VENDOR));   uart_puts("\n");
+    uart_puts("  class [0x008] = ");  puts_hex32(PCIE_REG(PCIE_RC_CFG_CLASS));    uart_puts("\n");
+    uart_puts("  ctrl  [0x4008]= ");  puts_hex32(PCIE_REG(PCIE_MISC_CTRL));       uart_puts("\n");
+    uart_puts("  stat  [0x4068]= ");  puts_hex32(PCIE_REG(PCIE_MISC_STATUS));     uart_puts("\n");
+    uart_puts("  rev   [0x406C]= ");  puts_hex32(PCIE_REG(PCIE_MISC_REVISION));   uart_puts("\n");
+    uart_puts("  dbg   [0x4204]= ");  puts_hex32(PCIE_REG(PCIE_MISC_HARD_DBG));   uart_puts("\n");
+    uart_puts("  lcap  [0x04DC]= ");  puts_hex32(PCIE_REG(PCIE_RC_CFG_LINK_CAP)); uart_puts("\n");
+}
+
+void xhci_init(void)
+{
+    uart_puts("xhci: BCM2711 PCIe-1 base = ");
+    puts_hex32((unsigned int)PCIE_BASE);
+    uart_puts("\n");
+
+    dump_pcie_probe("pre-mailbox");
+
+    int rc = xhci_notify_reset();
+    uart_puts("xhci: notify-xhci-reset rc = ");
+    puts_hex32((unsigned int)rc);
+    uart_puts("\n");
+
+    dump_pcie_probe("post-mailbox");
+}
+
+#endif /* PCIE_BASE */

@@ -197,30 +197,45 @@ void screen_puts(const char *s)
 unsigned int video_screen_width(void)  { return fb_width;  }
 unsigned int video_screen_height(void) { return fb_height; }
 
+/* Viewport offset: subtracted from every virtual-coord input
+ * before it touches the framebuffer.  All primitives also clip
+ * to [0, fb_width) × [0, fb_height) so off-screen geometry
+ * (e.g. a window that scrolls partly past the right edge) can't
+ * corrupt memory past the framebuffer. */
+static int view_x = 0;
+static int view_y = 0;
+
+void video_set_viewport(int x, int y) { view_x = x; view_y = y; }
+int  video_viewport_x(void) { return view_x; }
+int  video_viewport_y(void) { return view_y; }
+
 void fill_rect(int x, int y, int w, int h, unsigned int color)
 {
     if (!fb_ready) return;
+
+    int sx = x - view_x;
+    int sy = y - view_y;
+    if (sx < 0) { w += sx; sx = 0; }
+    if (sy < 0) { h += sy; sy = 0; }
+    if (sx + w > (int)fb_width)  w = (int)fb_width  - sx;
+    if (sy + h > (int)fb_height) h = (int)fb_height - sy;
+    if (w <= 0 || h <= 0) return;
+
     for (int dy = 0; dy < h; dy++) {
         unsigned int *row =
-            (unsigned int *)(fb_base + (y + dy) * fb_pitch + x * 4);
+            (unsigned int *)(fb_base + (sy + dy) * fb_pitch + sx * 4);
         for (int dx = 0; dx < w; dx++) row[dx] = color;
     }
 }
 
 void draw_rect(int x, int y, int w, int h, unsigned int color)
 {
-    if (!fb_ready) return;
-    /* top + bottom edges */
-    unsigned int *top =
-        (unsigned int *)(fb_base + y * fb_pitch + x * 4);
-    unsigned int *bot =
-        (unsigned int *)(fb_base + (y + h - 1) * fb_pitch + x * 4);
-    for (int dx = 0; dx < w; dx++) { top[dx] = color; bot[dx] = color; }
-    /* left + right edges */
-    for (int dy = 0; dy < h; dy++) {
-        *(unsigned int *)(fb_base + (y + dy) * fb_pitch + x * 4)           = color;
-        *(unsigned int *)(fb_base + (y + dy) * fb_pitch + (x + w - 1) * 4) = color;
-    }
+    /* Express the four edges as 1-px-thick fill_rects — they
+     * already handle viewport + clipping uniformly. */
+    fill_rect(x,         y,         w, 1, color);   /* top    */
+    fill_rect(x,         y + h - 1, w, 1, color);   /* bottom */
+    fill_rect(x,         y,         1, h, color);   /* left   */
+    fill_rect(x + w - 1, y,         1, h, color);   /* right  */
 }
 
 void draw_glyph_at(int px, int py, char c,
@@ -230,12 +245,23 @@ void draw_glyph_at(int px, int py, char c,
     unsigned char ci = (unsigned char)c;
     if (ci < 0x20 || ci > 0x7F) ci = '?';
     const unsigned char *glyph = font8x8[ci - 0x20];
+
+    int sx = px - view_x;
+    int sy = py - view_y;
+    /* Trivial reject if the entire glyph cell is off-screen. */
+    if (sx >= (int)fb_width || sy >= (int)fb_height) return;
+    if (sx + FONT_WIDTH <= 0 || sy + FONT_HEIGHT <= 0) return;
+
     for (int gy = 0; gy < FONT_HEIGHT; gy++) {
+        int rsy = sy + gy;
+        if (rsy < 0 || rsy >= (int)fb_height) continue;
         unsigned char bits = glyph[gy];
         unsigned int *line =
-            (unsigned int *)(fb_base + (py + gy) * fb_pitch + px * 4);
+            (unsigned int *)(fb_base + rsy * fb_pitch);
         for (int gx = 0; gx < FONT_WIDTH; gx++) {
-            line[gx] = (bits & (0x80 >> gx)) ? fg : bg;
+            int rsx = sx + gx;
+            if (rsx < 0 || rsx >= (int)fb_width) continue;
+            line[rsx] = (bits & (0x80 >> gx)) ? fg : bg;
         }
     }
 }

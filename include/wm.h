@@ -47,4 +47,32 @@ void wm_add(window_t *w);
  * returns — callers should have finished bootstrapping. */
 void wm_run(void);
 
+/* Register a function to be called at the top of every wm_run
+ * iteration, before window repainting.  Used by shellwin to drive
+ * the non-blocking REPL on each frame.  Pass NULL to detach. */
+void wm_set_tick(void (*fn)(void));
+
+/* Move / hide the on-screen mouse cursor overlay.  Painted by
+ * wm_run() after all windows so it stays on top.  Visible=0 hides
+ * the cursor entirely.  Caller chooses screen-space pixel coords. */
+void wm_cursor_set(int x, int y, int visible);
+
+/* Virtual desktop is WM_DESKTOP_W × WM_DESKTOP_H.  Viewport (the
+ * camera onto the desktop) is the size of the physical screen.
+ * wm_pan(dx, dy) shifts the viewport by (dx, dy) pixels, clamping
+ * so the viewport never leaves the desktop.  wm_set_viewport()
+ * is the absolute version. */
+#define WM_DESKTOP_W   1280
+#define WM_DESKTOP_H    960
+
+void wm_pan(int dx, int dy);
+void wm_set_viewport(int x, int y);
+int  wm_view_x(void);
+int  wm_view_y(void);
+
+/* Toggle the slow auto-pan demo (used until USB keyboard / mouse
+ * scroll is wired).  On by default at boot so the user can see
+ * the larger desktop scroll without any input.  Pass 0 to stop. */
+void wm_set_autopan(int on);
+
 #endif /* XINU_RPI5_WM_H */

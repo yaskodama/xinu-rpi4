@@ -45,7 +45,11 @@ OBJCOPY  = $(GCCPATH)/bin/$(CROSS)objcopy
 
 # ----- source discovery -----------------------------------------------
 COMPONENTS = loader mem system shell fs \
-             device/uart device/mbox device/video device/sd
+             device/uart device/mbox device/video device/sd device/usb \
+             device/usb/xhci device/gic device/timer
+# extern/uspi/lib disabled — USPi only drives DWC2 (Pi 4 USB-C OTG).
+# Pi 4 USB-A keyboards / mice route through VL805 PCIe xHCI, which
+# needs a hand-rolled driver under device/usb/xhci/.
 
 C_SRCS := $(foreach d,$(COMPONENTS),$(wildcard ../$(d)/*.c))
 S_SRCS := $(foreach d,$(COMPONENTS),$(wildcard ../$(d)/*.S))
@@ -84,6 +88,9 @@ PI4_CFLAGS  = $(COMMON) -mcpu=cortex-a72 \
               -DUART0_BASE=0xFE201000UL \
               -DMBOX_BASE=0xFE00B880UL \
               -DSD_BASE=0xFE340000UL \
+              -DUSB_BASE=0xFE980000UL \
+              -DGIC_BASE=0xFF840000UL \
+              -DPCIE_BASE=0xFD500000UL \
               -DHEAP_END=0x40000000UL \
               -DBOARD_NAME=\"Pi4\" \
               -DSOC_NAME=\"BCM2711\" \

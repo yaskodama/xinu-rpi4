@@ -21,6 +21,11 @@ void uart_puts(const char *s);
 /* Blocking read of one byte from RX FIFO. */
 char uart_getc(void);
 
+/* Non-blocking peek of the RX FIFO.  Returns -1 if no byte is
+ * available, 0..255 otherwise.  Used by the wm shell window to
+ * drive the REPL from the frame loop without blocking. */
+int  uart_poll_char(void);
+
 /* Read a line into `buf` up to `max - 1` chars.  Echoes characters
  * back to the terminal so the user can see what they typed; handles
  * backspace (0x08) and DEL (0x7F).  Returns the number of bytes

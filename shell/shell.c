@@ -44,6 +44,9 @@
 #include "shell.h"
 #include "memory.h"
 #include "proc.h"
+#include "usb.h"
+#include "timer.h"
+#include "wm.h"
 
 /* Linker-script symbols (from kernel/link.ld). */
 extern unsigned long __bss_start;
@@ -471,6 +474,95 @@ static int cmd_ps(int argc, char **argv)
     return 0;
 }
 
+static int cmd_pan(int argc, char **argv)
+{
+    if (argc < 3) {
+        uart_puts("usage: pan <dx> <dy>  (signed decimal pixels)\n");
+        uart_puts("       e.g. `pan 320 0` scrolls one viewport-width right\n");
+        return 0;
+    }
+    /* tiny signed-decimal parser */
+    int dx = 0, dy = 0;
+    int neg = 0;
+    const char *p = argv[1];
+    if (*p == '-') { neg = 1; p++; }
+    while (*p >= '0' && *p <= '9') { dx = dx * 10 + (*p - '0'); p++; }
+    if (neg) dx = -dx;
+    neg = 0; p = argv[2];
+    if (*p == '-') { neg = 1; p++; }
+    while (*p >= '0' && *p <= '9') { dy = dy * 10 + (*p - '0'); p++; }
+    if (neg) dy = -dy;
+    wm_set_autopan(0);
+    wm_pan(dx, dy);
+    uart_puts("pan: viewport now ("); puts_dec(wm_view_x());
+    uart_puts(", "); puts_dec(wm_view_y()); uart_puts(")\n");
+    return 0;
+}
+
+static int cmd_view(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    uart_puts("viewport: ("); puts_dec(wm_view_x()); uart_puts(", ");
+    puts_dec(wm_view_y()); uart_puts(")  desktop 1280x960  screen 640x480\n");
+    return 0;
+}
+
+static int cmd_autopan(int argc, char **argv)
+{
+    int on = 1;
+    if (argc >= 2 && (argv[1][0] == '0' || argv[1][0] == 'f')) on = 0;
+    wm_set_autopan(on);
+    uart_puts("autopan: "); uart_puts(on ? "on\n" : "off\n");
+    return 0;
+}
+
+static int cmd_ticks(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    unsigned long t = timer_ticks();
+    uart_puts("ticks: ");
+    puts_hex((unsigned long)t);
+    uart_puts("  (");
+    /* dec */
+    if (t == 0) uart_putc('0');
+    else {
+        char buf[24]; int n = 0;
+        while (t > 0) { buf[n++] = (char)('0' + (t % 10)); t /= 10; }
+        while (n--) uart_putc(buf[n]);
+    }
+    uart_puts(" @ 100 Hz)\n");
+    return 0;
+}
+
+static int cmd_usb(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    if (!usb_present()) {
+        uart_puts("usb: no DWC2 USB controller on this board\n");
+        uart_puts("     (Pi 5 routes USB through RP1; QEMU virt has no DWC2)\n");
+        return 0;
+    }
+    unsigned int id = usb_synopsys_id();
+    uart_puts("DWC2 GSNPSID = ");
+    puts_hex((unsigned long)id);
+    uart_puts("\n");
+    if ((id & 0xFFFF0000u) == 0x4F540000u) {
+        uart_puts("  signature : OK (Synopsys 'OT' = 0x4F54)\n");
+        uart_puts("  core rel  : 0x");
+        for (int i = 3; i >= 0; i--) {
+            unsigned int nyb = (id >> (i * 4)) & 0xF;
+            uart_putc((char)(nyb < 10 ? '0' + nyb : 'a' + (nyb - 10)));
+        }
+        uart_puts("\n");
+        uart_puts("  init      : ");
+        uart_puts(usb_last_init_ok() ? "ok\n" : "saw mismatch at boot\n");
+    } else {
+        uart_puts("  signature : MISMATCH — controller absent or unpowered\n");
+        uart_puts("              (expected upper 16 bits == 0x4F54)\n");
+    }
+    return 0;
+}
+
 static int cmd_halt(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -509,6 +601,11 @@ static const struct centry commandtab[] = {
     { "halt",     "PSCI SYSTEM_OFF + WFE park",            cmd_halt     },
     { "pingpong", "2-actor cooperative PingPong [rounds]", cmd_pingpong },
     { "procdemo", "real 2-process ctxsw demo [iters]",     cmd_procdemo },
+    { "usb",      "DWC2 USB HCD diagnostics (Pi 4 only)",  cmd_usb      },
+    { "ticks",    "show 100 Hz timer tick counter",        cmd_ticks    },
+    { "pan",      "pan <dx> <dy>  scroll viewport",        cmd_pan      },
+    { "view",     "show viewport / desktop sizes",         cmd_view     },
+    { "autopan",  "autopan [on|off]  toggle demo scroll",  cmd_autopan  },
     { "reboot",   "stub — spins until power-cycle",        cmd_reboot   },
     { "?",      "alias for help",                          cmd_help   },
     { 0, 0, 0 }
@@ -532,10 +629,28 @@ static int tokenise(char *line, char **tok)
     return n;
 }
 
+int shell_dispatch_line(char *line)
+{
+    static char *tok[SHELL_MAXTOK];
+    int ntok = tokenise(line, tok);
+    if (ntok == 0) return 0;
+
+    const struct centry *e;
+    for (e = commandtab; e->name; e++) {
+        if (str_eq(tok[0], e->name)) {
+            e->fn(ntok, tok);
+            return 0;
+        }
+    }
+    uart_puts("?command-not-found: ");
+    uart_puts(tok[0]);
+    uart_puts(" (try `help`)\n");
+    return 0;
+}
+
 void shell_main(void)
 {
     static char line[SHELL_BUFLEN];
-    static char *tok[SHELL_MAXTOK];
 
     uart_puts("type `help` for the command list.\n");
 
@@ -543,20 +658,6 @@ void shell_main(void)
         uart_puts("xinu-pi5$ ");
         int n = uart_getline(line, SHELL_BUFLEN);
         if (n <= 0) continue;
-
-        int ntok = tokenise(line, tok);
-        if (ntok == 0) continue;
-
-        const struct centry *e;
-        for (e = commandtab; e->name; e++) {
-            if (str_eq(tok[0], e->name)) {
-                e->fn(ntok, tok);
-                goto next;
-            }
-        }
-        uart_puts("?command-not-found: ");
-        uart_puts(tok[0]);
-        uart_puts(" (try `help`)\n");
-    next: ;
+        shell_dispatch_line(line);
     }
 }

@@ -45,6 +45,19 @@ extern const unsigned char font8x8[96][8];
 unsigned int video_screen_width(void);
 unsigned int video_screen_height(void);
 
+/* Viewport (camera) on a larger virtual desktop.  All drawing
+ * primitives below (fill_rect / draw_rect / draw_string_at /
+ * draw_glyph_at) accept *virtual* desktop coordinates and apply
+ * this offset + clip-to-physical-screen before writing pixels.
+ *
+ * The default offset is (0, 0) — when nothing scrolls, virtual
+ * coords map 1:1 to screen coords.  wm.c owns the panning logic;
+ * direct callers (e.g. wm's cursor overlay) reset the offset to
+ * (0, 0) briefly when they need screen-space drawing. */
+void video_set_viewport(int x, int y);
+int  video_viewport_x(void);
+int  video_viewport_y(void);
+
 /* Solid fill / outline rectangle at pixel (x,y), dimensions w×h. */
 void fill_rect(int x, int y, int w, int h, unsigned int color);
 void draw_rect(int x, int y, int w, int h, unsigned int color);
