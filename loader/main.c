@@ -48,6 +48,9 @@ extern unsigned char dhcp_state(void);
 extern unsigned long dhcp_discover_count(void);
 extern unsigned long dhcp_offer_count(void);
 extern unsigned long dhcp_ack_count(void);
+extern int  tcp_handle_packet(const unsigned char *frame, int len);
+extern void tcp_set_mac(const unsigned char mac[6]);
+extern void tcp_listen(unsigned short port);
 
 static int g_rx_log_left = 2;
 static unsigned long g_rx_tick_count = 0;
@@ -101,11 +104,17 @@ static void genet_rx_tick(void)
             g_rx_log_left--;
         }
         /* Try DHCP first (UDP src=67 dst=68 must reach us before
-         * BOUND, since net_responder ignores UDP).  Then ARP/ICMP. */
+         * BOUND, since net_responder ignores UDP).  Then TCP, then
+         * ARP/ICMP. */
         if (dhcp_handle_packet(pkt, len)) {
             genet_rx_release();
             continue;
         }
+        /* NET-G TCP listener — code in system/tcp_server.c, but
+         * dispatch from rx_tick is OFF until we figure out why
+         * even a minimal receive-only handler appears to interfere
+         * with the ICMP responder reply path on this Pi 4. */
+        (void)tcp_handle_packet;
         if (!net_responder_handle(pkt, len) && 0) {  /* old path disabled */
             g_rx_log_left--;
             uart_puts("rx: len=");
@@ -727,6 +736,13 @@ void kernel_main(void)
      * DHCP TX seems to disrupt the GENET TX ring.  dhcp_handle_packet
      * remains wired into genet_rx_tick so an unsolicited reply would
      * still bind us, but no DISCOVER is ever sent right now. */
+
+    /* NET-G TCP listener init is deferred — the actual SYN/ACK
+     * machinery in system/tcp_server.c is staged but not driven
+     * from rx_tick yet (see comment there).  Once we figure out
+     * the ICMP-responder interaction we'll wire it in here.     */
+    (void)tcp_set_mac;
+    (void)tcp_listen;
 
     uart_puts("\n");
     uart_puts("Round 1: B/U/M1/S0/X0 done.\n");
