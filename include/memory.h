@@ -1,57 +1,21 @@
-/**
- * @file memory.h
- * Definitions for kernel memory allocator and maintenance.
- *
- */
-/* Embedded Xinu, Copyright (C) 2009.  All rights reserved. */
+// include/memory.h — xinu-rpi5 first-fit allocator interface.
 
-#ifndef _MEMORY_H_
-#define _MEMORY_H_
+#ifndef XINU_RPI5_MEMORY_H
+#define XINU_RPI5_MEMORY_H
 
-#include <stddef.h>
-
-/* roundmb - round address up to size of memblock  */
-#define roundmb(x)  (void *)( (7 + (ulong)(x)) & ~0x07 )
-/* truncmb - truncate address down to size of memblock */
-#define truncmb(x)  (void *)( ((ulong)(x)) & ~0x07 )
-
-/**
- * @ingroup memory_mgmt
- *
- * Frees memory allocated with stkget().
- *
- * @param p
- *      Pointer to the topmost (highest address) word of the allocated stack (as
- *      returned by stkget()).
- * @param len
- *      Size of the allocated stack, in bytes.  (Same value passed to stkget().)
- */
-#define stkfree(p, len) memfree((void *)((ulong)(p)         \
-                                - (ulong)roundmb(len)       \
-                                + (ulong)sizeof(ulong)),    \
-                                (ulong)roundmb(len))
-
-
-/**
- * Structure for a block of memory.
- */
-struct memblock
-{
-    struct memblock *next;          /**< pointer to next memory block       */
-    uint length;                    /**< size of memory block (with struct) */
+struct memblk {
+    struct memblk *mnext;
+    unsigned long  mlength;
 };
 
-extern struct memblock memlist;     /**< head of free memory list           */
+void mem_init(unsigned long heap_start, unsigned long heap_end);
+void *getmem(unsigned long nbytes);
+void  freemem(void *block, unsigned long nbytes);
+unsigned long mem_free_bytes(void);
+unsigned long mem_total_bytes(void);
+unsigned long mem_largest_block(void);
+int           mem_free_block_count(void);
 
-/* Other memory data */
+extern unsigned char _end[];
 
-extern void *_end;              /**< linker provides end of image           */
-extern void *_etext;            /**< linker provides end of text segment    */
-extern void *memheap;           /**< bottom of heap                         */
-
-/* Memory function prototypes */
-void *memget(uint);
-syscall memfree(void *, uint);
-void *stkget(uint);
-
-#endif                          /* _MEMORY_H_ */
+#endif /* XINU_RPI5_MEMORY_H */

@@ -1,77 +1,109 @@
-# NEXT_SESSION — Pi 4 xinu-rpi5 status (HEAD `6fcced5` + WIP)
+# NEXT_SESSION — Pi 4 xinu-rpi5 (HEAD after Step 3 partial)
 
-## このセッションで達成したこと
-- **NET-C3: TX 1 frame 動作** (broadcast ARP、CONS=1 sent OK)
-- **NET-D: RX ring + frame 受信動作** (Pi 4 が LAN broadcast を受信して shell window に dst/src/type を表示)
-- Pi 4 GENET の **descriptor format / register layout の正解** を確定:
-  - per-ring stride 0x40、ring 16 = `0x4400` ... wait, no! Final correct values:
-    - TX_RING_BASE = GENET_TDMA_REG_OFF + 16*0x40 = `0x5000`
-    - TX_DMA_TOP   = GENET_TDMA_REG_OFF + 17*0x40 = `0x5040`
-    - GENET_TDMA_REG_OFF = `0x4000 + 256*12 = 0x4C00`
-  - **TX descriptors live in MMIO** at GENET_BASE + 0x4000 + idx*12 (NOT in DRAM)
-  - Word 0 layout: bits 31:16 = length, bits 15:0 = status
-    - SOP=0x2000, EOP=0x4000, OWN=0x8000 (RX), WRAP=0x1000, CRC=0x40, QTAG@bit 7
-  - DMA_CTRL = `(1 << (DEFAULT_Q + 1)) | 1` = `0x20001` (bit 0 = DMA_EN, bit 17 = ring 16 data-path)
+## このセッションでの達成
 
-## NET-E (xinu-raz network/ port) — 着手したが課題判明
+### Step 1 ✅: Xinu kernel compat layer
+`system/xinu_compat.c` で xinu-raz network/ コードが要求する Xinu
+kernel API をすべて stub:
+- sem: semcreate / wait / signal / signaln / semcount / semfree
+- mailbox: mailboxAlloc / Send / Receive / Count / Free / Init
+- bufpool: bfpalloc / bufget / buffree / bfpfree (kmalloc 背景)
+- thread: create / gettid / ready / kill / sleep / yield / send / recvtime
+- IRQ: disable / restore (irqmask)
+- kprintf: %d %u %x %s %c %p with `l` length
 
-### 試したこと
-- `/Users/kodamay/projects/xinu-raz/xinu/network/{arp,ipv4,icmp,netaddr,net}` (41 .c files, 7297 行) を `xinu-rpi5/network/` にコピー済み
-- xinu-raz の 83 個の include を `xinu-rpi5/extern/xinu-raz-include/` に隔離 (xinu-rpi5 既存ヘッダーと混ぜない)
+### Step 2 ✅: network/{arp,net,netaddr,ipv4,icmp} ビルド
+xinu-raz の 41 ファイル / 7300 行が xinu_compat 上で link。
+追加対応:
+- `typedef char bool` を modern C 用にコメントアウト
+- arm-qemu の `interrupt.h` を extern にコピー (irqmask 型)
+- libc shims (bzero/memcmp/sprintf/sscanf), clock (clktime/clkcount),
+  device (read/write/control/devtab), routing (rtInit/Lookup/...),
+  upper proto stubs (tcpRecv/udpRecv/rawRecv/snoopCapture) を
+  xinu_compat に追加
 
-### 残る壁
-xinu-raz の network/ コードは Xinu kernel 全機能に依存:
-- **`semaphore.h`** — semcreate / wait / signal / semreset
-- **`mailbox.h`** — mbox-based inter-process messaging
-- **`thread.h` / `proc.h`** — preemptive scheduler with ready/wait/sleep
-- **`bufpool.h`** — pool allocator for ethpkt buffers
-- **`device.h`** — Xinu device abstraction (open/close/read/write/control)
-- **`interrupt.h`** — Xinu IRQ control (currently we have raw connect_interrupt)
+### Step 3 ⚠️ partial: ARP+ICMP responder
+`system/net_responder.c` に最小 ARP responder + ICMP echo responder
+を実装。`net_responder_handle(pkt, len)` を wm tick から呼ぶ。
+- 受信した ARP request に対して reply を生成 → `genet_tx_frame()`
+- 受信した ICMP echo に対して reply を生成 → `genet_tx_frame()`
+- 固定 IP 192.168.3.100、Pi 4 MAC d8:3a:dd:a7:fd:bf
+- gratuitous ARP × 1 を boot 時に送出 (Mac へ ARP cache 通知)
 
-xinu-rpi5 は cooperative scheduler のみ。これらを実装 or stub する必要あり。
+### NET-D の余波
+boot 中の trace prints も入っている。最後の行に
+`net: PHY BMSR = 0x????????  link=UP` が出る。
 
-### 次セッションの計画
+## 本セッション最大の未解決バグ
 
-#### Step 1: Xinu kernel 互換 stub 層 (1 セッション)
-- `sem`: 単純なカウンタ + busy-wait (cooperative scheduler 想定)
-- `mbox`: シングルスレッドなので queue + immediate dispatch
-- `ready/wait`: NULLPROC ベースでスキップ
-- `bufpool`: 固定 array allocator
-- これらを `system/xinu_compat.c` に集約
+**`genet_tx_frame` の 2 回目以降の呼び出しで kernel が hang する。**
 
-#### Step 2: ARP 単独ビルド (1 セッション)
-- `network/arp/*.c` だけ Makefile に追加
-- ビルド通るまで `-I../extern/xinu-raz-include` + 個別 fix
-- `arpResolve` を Pi 4 GENET 上で動作させる
+症状:
+- 起動時の `genet_send_one_arp` (= NET-C3 で動作確認済み) は OK
+- その後 `genet_tx_frame()` 経由の 2 回目 TX (gratuitous ARP × 1
+  や ARP reply、ICMP reply 等) で完全 hang
+- `net: gratuitous ARP done` が出ない → genet_tx_frame の中で
+  polling loop に入ったまま戻らない
 
-#### Step 3: IPv4 + ICMP (1 セッション)
-- 同じくビルド + 接続
-- 目標: Mac から Pi 4 (固定 IP) に `ping` 通る
+仮説:
+- TX descriptor 1 以降への書き込みが期待通り動作していない
+- CONS_INDEX が advance しないが、50 ms timeout に到達するはずなのに
+  to 達せずに hang してる = MMIO read 自体が刺さってる?
+- PROD_INDEX セマンティクスを誤解している可能性
+  - 現在: `PROD_INDEX = readl + 1` を書く
+  - U-Boot の bcmgenet_gmac_eth_send も同じ動き
+- 内部 TX engine が「ring を一回 walk して停止」、再起動が必要かも
+  - DMA_CTRL の per-ring enable bit を再 toggle?
 
-#### Step 4: DHCP + TCP + telnet (2-3 セッション)
-- DHCP で IP 取得
-- TCP + telnet daemon で shell remote login
+次セッションで debug:
+1. `genet_tx_frame` に trace を追加して、どの MMIO アクセスで止まるか
+   ピンポイント
+2. U-Boot drivers/net/bcmgenet.c::bcmgenet_gmac_eth_send をもう一度
+   精読、私の実装と diff を取る
+3. TDMA_STATUS, DMA_CTRL, ring registers を 2 回目 TX 前後で dump
 
-### 別の選択肢: Plan A (今は除外)
-- 最小 ARP responder を 200-300 行で自作
-- ping 通るまで 1 セッションで到達可能
-- ただし TCP/IP stack 全体を後で再実装
+## Step 3 完成までの作業
 
-User の判断は **B 継続** だったので Step 1-4 で行く。
+1. ⬜ `genet_tx_frame` 2 回目以降の hang を fix
+2. ⬜ Pi 4 が gratuitous ARP を実際に Mac WiFi に届かせる
+   (router の LAN→WiFi bridge 確認)
+3. ⬜ Mac から ARP request を受信 → reply 送信
+4. ⬜ Mac から `ping 192.168.3.100` 通る
+
+router の WiFi-LAN bridge の方向性問題は別軸 (network operator
+configuration)。最悪 Mac に USB-Ethernet adapter で物理回避可。
+
+## ネットワーク経路の状況
+
+- Mac WiFi: 192.168.3.202/24 (en0)
+- Pi 4 LAN: 192.168.3.100/24 (固定、xinu-rpi5 設定)
+- Mac → Pi 4 ARP: 届かない (Mac arp -a で incomplete)
+- Pi 4 → Mac broadcast: 未確認 (TX 2 回目以降が動かないため)
+- 他ホスト (192.168.3.198/200/201) は Mac から見える + Pi 4 も
+  broadcast 受信可能 → 同一サブネットだが broadcast 経路の方向性に
+  問題ある可能性
 
 ## このセッションの commit chain
-- `1974eec` — shell window + soft kbd + cursor + virtual desktop + S1 + USB-M0 + xHCI scaffold
-- `4fdea3f` — NET-A/B/C1 (GENET probe, UMAC, BCM54213PE link UP)
-- `6a204f8` — NET-C2/C3 stub (TDMA register layout, descriptor format research)
-- `e99008d` — NET-C3 fixed descriptor format (length<<16 | status low16)
-- `62f20f4` — NEXT_SESSION.md initial handoff
-- `1c15b21` — **NET-C3 TX works** (CONS=1 sent OK)
-- `6fcced5` — **NET-D RX works** (broadcast frames received and logged)
 
-## ビルド/焼き
+- `1974eec` shell window + soft kbd + cursor + virtual desktop +
+  S1 IRQ + USB-M0 + xHCI scaffold
+- `4fdea3f` NET-A/B/C1 GENET probe + PHY Link UP
+- `6a204f8` NET-C2/C3 TDMA layout research
+- `e99008d` NET-C3 desc format fix
+- `62f20f4` NEXT_SESSION initial
+- `1c15b21` **NET-C3 TX works** (CONS=1)
+- `6fcced5` **NET-D RX works** (frames received)
+- (NET-E groundwork commit)
+- `c3ad476` Step 1 Xinu kernel compat layer
+- `30976e1` Step 2 network/{arp,net,netaddr,ipv4,icmp} build
+- (this commit) Step 3 partial — ARP+ICMP responder + gratuitous ARP,
+  TX 2nd-call hang outstanding
+
+## ビルド / 焼き
+
 ```
 cd /Users/kodamay/projects/xinu-rpi5/compile
-make pi4                          # → kernel8.img (~42 KB)
+make pi4
 diskutil mount /dev/disk4s1
 cp kernel8.img /Volumes/bootfs/
 sync

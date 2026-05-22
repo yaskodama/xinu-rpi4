@@ -657,4 +657,70 @@ void genet_rx_release(void)
 unsigned long genet_rx_packet_count(void) { return g_rx_packets; }
 unsigned long genet_rx_byte_count(void)   { return g_rx_bytes;   }
 
+unsigned int genet_phy_bmsr(void)
+{
+    int v = mdio_read(PHY_ID_BCM54213PE, MII_BMSR);
+    return (v < 0) ? 0xFFFFFFFFu : (unsigned int)v;
+}
+
+int genet_link_up(void)
+{
+    unsigned int b = genet_phy_bmsr();
+    if (b == 0xFFFFFFFFu) return 0;
+    return (b & BMSR_LSTATUS) ? 1 : 0;
+}
+
+/* Track TX descriptor index across calls so subsequent TX frames
+ * use a fresh descriptor slot. */
+static unsigned int g_tx_index_sw;
+static int          g_tx_inited;
+static unsigned char __attribute__((aligned(64))) tx_buf_pool[1518];
+
+int genet_tx_frame(const unsigned char *frame, int length)
+{
+    if (length <= 0 || length > 1518) return -1;
+
+    /* Copy caller's frame into the DMA-aligned buffer. */
+    for (int i = 0; i < length; i++) tx_buf_pool[i] = frame[i];
+
+    if (!g_tx_inited) {
+        /* First TX after boot — the original genet_init() already
+         * configured the ring during genet_send_one_arp; just pick
+         * up where it left off. */
+        g_tx_inited = 1;
+        g_tx_index_sw = GENET_REG(TX_RING_BASE + TDMA_CONS_INDEX) & 0xFF;
+    }
+
+    /* Build descriptor in MMIO at the current tx_index slot. */
+    unsigned int idx       = g_tx_index_sw % TX_DESCS;
+    unsigned int desc_off  = GENET_TX_OFF + idx * DMA_DESC_SIZE;
+    unsigned long buf_pa   = (unsigned long)tx_buf_pool;
+    unsigned int len_stat  = ((unsigned int)length << DMA_BUFLENGTH_SHIFT)
+                           | (DMA_TX_DEFAULT_QTAG << DMA_TX_QTAG_SHIFT)
+                           | DMA_TX_APPEND_CRC | DMA_SOP | DMA_EOP;
+    GENET_REG(desc_off + DMA_DESC_ADDRESS_LO)    = (unsigned int)(buf_pa & 0xFFFFFFFFu);
+    GENET_REG(desc_off + DMA_DESC_ADDRESS_HI)    = (unsigned int)((buf_pa >> 32) & 0xFFFFFFFFu);
+    GENET_REG(desc_off + DMA_DESC_LENGTH_STATUS) = len_stat;
+    __asm__ volatile ("dsb sy" ::: "memory");
+
+    /* Bump PROD_INDEX */
+    unsigned int prod = GENET_REG(TX_RING_BASE + TDMA_PROD_INDEX) + 1;
+    GENET_REG(TX_RING_BASE + TDMA_PROD_INDEX) = prod;
+    g_tx_index_sw = (g_tx_index_sw + 1) & 0xFFFF;
+    __asm__ volatile ("dsb sy" ::: "memory");
+
+    /* Poll for completion (50 ms timeout) */
+    unsigned long freq;
+    __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
+    unsigned long target = (freq / 1000UL) * 50UL;
+    unsigned long t0, tn;
+    __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(t0));
+    while (1) {
+        unsigned int cons = GENET_REG(TX_RING_BASE + TDMA_CONS_INDEX) & 0xFFFF;
+        if (cons == (prod & 0xFFFF)) return 0;
+        __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(tn));
+        if (tn - t0 >= target) return -1;
+    }
+}
+
 #endif /* GENET_BASE */

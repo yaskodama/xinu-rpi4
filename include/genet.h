@@ -42,6 +42,16 @@ void genet_rx_release(void);
 unsigned long genet_rx_packet_count(void);
 unsigned long genet_rx_byte_count(void);
 
+/* Step 3 — send an arbitrary Ethernet frame (buf, len) on TDMA ring 16.
+ * Returns 0 on success, -1 on TX timeout / not initialised. */
+int genet_tx_frame(const unsigned char *frame, int length);
+
+/* Re-read BMSR and report link status — used by main.c to show
+ * the link state at boot end (after the shell ring scrolls past
+ * the original PHY-init log). */
+int  genet_link_up(void);
+unsigned int genet_phy_bmsr(void);
+
 #else  /* GENET_BASE not defined */
 
 static inline void         genet_init(void)            {}

@@ -39,13 +39,17 @@ static void puts_kb(unsigned long bytes);
 /* Auto-poll RX once per wm frame.  Print a one-line summary of
  * any received frame and release the descriptor so HW can reuse
  * the buffer.  Rate-cap at 5 messages so broadcasts don't flood. */
+extern int net_responder_handle(const unsigned char *frame, int len);
+
 static int g_rx_log_left = 5;
 static void genet_rx_tick(void)
 {
     unsigned char *pkt;
     int len;
     while ((len = genet_rx_poll(&pkt)) > 0) {
-        if (g_rx_log_left > 0) {
+        /* Try the ARP/ICMP responder first.  If it consumed the
+         * frame (returned non-zero), don't bother logging it. */
+        if (!net_responder_handle(pkt, len) && g_rx_log_left > 0) {
             g_rx_log_left--;
             uart_puts("rx: len=");
             puts_kb((unsigned long)len);
@@ -628,6 +632,38 @@ void kernel_main(void)
      * if SYS_REV_CTRL responds with a sane value (expected to be
      * ~0x06000000 on Pi 4) so we know the controller is powered. */
     genet_init();
+
+    /* Pass our MAC to the responder so ARP replies carry the
+     * right source MAC.  d8:3a:dd:a7:fd:bf — confirmed from
+     * pre-reset UMAC read on this Pi 4. */
+    {
+        extern void net_responder_set_mac(const unsigned char mac[6]);
+        unsigned char mymac[6] = { 0xd8, 0x3a, 0xdd, 0xa7, 0xfd, 0xbf };
+        net_responder_set_mac(mymac);
+    }
+    uart_puts("net: ARP+ICMP responder armed; static IP 192.168.3.100\n");
+    /* Re-read link status here so it shows up at the *end* of the
+     * boot log (after the shell-window ring has scrolled past the
+     * original PHY-init lines). */
+    {
+        unsigned int b = genet_phy_bmsr();
+        uart_puts("net: PHY BMSR = ");
+        for (int i = 7; i >= 0; i--) {
+            unsigned int n = (b >> (i * 4)) & 0xF;
+            uart_putc((char)(n < 10 ? '0' + n : 'a' + n - 10));
+        }
+        uart_puts(genet_link_up() ? "  link=UP\n" : "  link=DOWN\n");
+    }
+
+    /* Send a single gratuitous ARP (5-shot loop hung earlier;
+     * one shot lets us see whether the router forwards Pi-4
+     * LAN broadcast to Mac WiFi at all). */
+    {
+        extern void net_responder_send_gratuitous_arp(void);
+        uart_puts("net: sending one gratuitous ARP ...\n");
+        net_responder_send_gratuitous_arp();
+        uart_puts("net: gratuitous ARP done\n");
+    }
 
     uart_puts("\n");
     uart_puts("Round 1: B/U/M1/S0/X0 done.\n");
