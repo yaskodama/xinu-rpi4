@@ -41,15 +41,54 @@ static void puts_kb(unsigned long bytes);
  * the buffer.  Rate-cap at 5 messages so broadcasts don't flood. */
 extern int net_responder_handle(const unsigned char *frame, int len);
 
-static int g_rx_log_left = 5;
+static int g_rx_log_left = 2;
 static void genet_rx_tick(void)
 {
     unsigned char *pkt;
     int len;
     while ((len = genet_rx_poll(&pkt)) > 0) {
+        if (g_rx_log_left > 0) {
+            /* Show buffer address + 64-byte hex dump in 16-byte rows.
+             * This lets us see if real Ethernet header is hiding past
+             * a 32-byte or 64-byte status block prepend. */
+            uart_puts("rx@");
+            {
+                unsigned long a = (unsigned long)pkt;
+                for (int i = 7; i >= 0; i--) {
+                    unsigned int n = (a >> (i * 4)) & 0xF;
+                    uart_putc((char)(n < 10 ? '0' + n : 'a' + n - 10));
+                }
+            }
+            uart_puts(" len=");
+            {
+                int v = len; char b[8]; int n = 0;
+                if (v == 0) uart_putc('0');
+                else { while (v) { b[n++] = (char)('0' + v%10); v /= 10; }
+                       while (n--) uart_putc(b[n]); }
+            }
+            uart_puts("\n");
+            int dump_n = len < 80 ? len : 80;
+            for (int row = 0; row < dump_n; row += 16) {
+                uart_puts("  +");
+                {
+                    unsigned int n = (unsigned int)row;
+                    uart_putc("0123456789abcdef"[(n >> 4) & 0xF]);
+                    uart_putc("0123456789abcdef"[ n       & 0xF]);
+                }
+                uart_puts(": ");
+                for (int i = 0; i < 16 && row + i < dump_n; i++) {
+                    unsigned char b = pkt[row + i];
+                    uart_putc("0123456789abcdef"[(b >> 4) & 0xF]);
+                    uart_putc("0123456789abcdef"[ b       & 0xF]);
+                    if (i == 7) uart_putc(' ');
+                }
+                uart_puts("\n");
+            }
+            g_rx_log_left--;
+        }
         /* Try the ARP/ICMP responder first.  If it consumed the
          * frame (returned non-zero), don't bother logging it. */
-        if (!net_responder_handle(pkt, len) && g_rx_log_left > 0) {
+        if (!net_responder_handle(pkt, len) && 0) {  /* old path disabled */
             g_rx_log_left--;
             uart_puts("rx: len=");
             puts_kb((unsigned long)len);

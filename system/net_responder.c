@@ -54,29 +54,48 @@ void net_responder_set_mac(const unsigned char mac[6])
  * direction only (LAN → WiFi but not the reverse). */
 void net_responder_send_gratuitous_arp(void)
 {
-    static unsigned char frame[60];
+    uart_puts("garp: G1 enter\n");
+    /* `volatile` is critical: with MMU off, all DRAM is Device-
+     * nGnRnE on AArch64.  GCC merges adjacent byte stores into
+     * stp/strh which fault on Device memory at non-aligned offsets
+     * (e.g. stp at offset 12 needs 8-byte alignment).  volatile
+     * forces strict 1-byte stores. */
+    static volatile unsigned char __attribute__((aligned(16))) frame[60];
+    uart_puts("garp: G2 zeroing\n");
     for (int i = 0; i < 60; i++) frame[i] = 0;
-    /* dst = broadcast */
+    uart_puts("garp: G3 setting dst broadcast\n");
     for (int i = 0; i < 6; i++) frame[i] = 0xFF;
-    /* src = my MAC */
+    uart_puts("garp: G4 setting src MAC\n");
     for (int i = 0; i < 6; i++) frame[6 + i] = g_my_mac[i];
-    frame[12] = 0x08; frame[13] = 0x06;            /* ARP */
-    frame[14] = 0x00; frame[15] = 0x01;            /* HTYPE Ethernet */
-    frame[16] = 0x08; frame[17] = 0x00;            /* PTYPE IPv4 */
+    frame[12] = 0x08; frame[13] = 0x06;
+    frame[14] = 0x00; frame[15] = 0x01;
+    frame[16] = 0x08; frame[17] = 0x00;
     frame[18] = 6;
     frame[19] = 4;
-    frame[20] = 0x00; frame[21] = 0x01;            /* OPER = request */
-    for (int i = 0; i < 6; i++) frame[22 + i] = g_my_mac[i];   /* SHA */
+    frame[20] = 0x00; frame[21] = 0x01;
+    for (int i = 0; i < 6; i++) frame[22 + i] = g_my_mac[i];
     frame[28] = g_my_ip[0]; frame[29] = g_my_ip[1];
-    frame[30] = g_my_ip[2]; frame[31] = g_my_ip[3];/* SPA = my IP */
-    /* THA = 00s (already) */
+    frame[30] = g_my_ip[2]; frame[31] = g_my_ip[3];
     frame[38] = g_my_ip[0]; frame[39] = g_my_ip[1];
-    frame[40] = g_my_ip[2]; frame[41] = g_my_ip[3];/* TPA = my IP */
-    genet_tx_frame(frame, 60);
+    frame[40] = g_my_ip[2]; frame[41] = g_my_ip[3];
+    uart_puts("garp: G5 calling genet_tx_frame\n");
+    int rc = genet_tx_frame(frame, 60);
+    uart_puts("garp: G6 returned rc=");
+    if (rc < 0) uart_putc('-');
+    {
+        char b[8]; int n = 0; int v = rc < 0 ? -rc : rc;
+        if (v == 0) uart_putc('0');
+        else { while (v) { b[n++] = (char)('0' + v%10); v /= 10; }
+               while (n--) uart_putc(b[n]); }
+    }
+    uart_puts("\n");
 }
 
-/* Outgoing frame buffer (alignment matches genet's tx_buf) */
-static unsigned char __attribute__((aligned(64))) tx_reply[1518];
+/* Outgoing frame buffer.  `volatile` prevents GCC from merging
+ * adjacent byte stores into unaligned stp/strh — these trap on
+ * Device-nGnRnE DRAM when the MMU is off (see gratuitous-ARP
+ * frame[] for the same fix). */
+static volatile unsigned char __attribute__((aligned(64))) tx_reply[1518];
 
 static void mac_copy(unsigned char *d, const unsigned char *s)
 {

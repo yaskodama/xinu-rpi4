@@ -45,6 +45,13 @@
 
 #define CMD_TX_EN              (1u << 0)
 #define CMD_RX_EN              (1u << 1)
+#define CMD_SPEED_SHIFT        2
+#define CMD_SPEED_10           (0u << CMD_SPEED_SHIFT)
+#define CMD_SPEED_100          (1u << CMD_SPEED_SHIFT)
+#define CMD_SPEED_1000         (2u << CMD_SPEED_SHIFT)
+#define CMD_PROMISC            (1u << 4)
+#define CMD_PAD_EN             (1u << 5)
+#define CMD_CRC_FWD            (1u << 6)
 #define CMD_LCL_LOOP_EN        (1u << 15)
 #define CMD_SW_RESET           (1u << 13)
 #define RBUF_CTRL              0x300
@@ -118,6 +125,18 @@
 /* EXT block (offset 0x80) — RGMII out-of-band control. */
 #define GENET_EXT_OFF               0x80
 #define EXT_RGMII_OOB_CTRL          (GENET_EXT_OFF + 0x0C)
+
+/* Speed bits in UMAC_CMD (bits 3:2), updated from PHY AUX_STAT
+ * after auto-negotiation completes.  Default 1000 Mbps. */
+static unsigned int g_umac_speed_bits = CMD_SPEED_1000;
+
+/* Diagnostic snapshot taken during init — replayed on first RX
+ * event so we can see them even if the boot lines scrolled off
+ * the shell window. */
+static unsigned int g_diag_rgmii_before;
+static unsigned int g_diag_rgmii_after;
+static unsigned int g_diag_aux_stat;
+static unsigned int g_diag_umac_cmd;
 #define EXT_OOB_DISABLE             (1u << 5)
 #define EXT_RGMII_MODE_EN           (1u << 6)
 #define EXT_ID_MODE_DIS             (1u << 16)
@@ -418,6 +437,36 @@ void genet_init(void)
         return;
     }
 
+    /* Read BCM54213PE Auxiliary Status Summary (MII reg 0x19) to
+     * find out what speed/duplex the PHY actually negotiated with
+     * the link partner.  Bits 10:8 (HCD = Highest Common Denominator):
+     *   001 = 10BASE-T HD     010 = 10BASE-T FD
+     *   011 = 100BASE-TX HD   100 = 100BASE-TX FD
+     *   110 = 1000BASE-T HD   111 = 1000BASE-T FD                     */
+    int aux = mdio_read(PHY_ID_BCM54213PE, 0x19);
+    g_diag_aux_stat = (unsigned)aux;
+    uart_puts("genet/phy: AUX_STAT(0x19) = ");
+    puts_hex32((unsigned)aux);
+    uart_puts("\n");
+    unsigned int umac_speed = CMD_SPEED_1000;
+    if (aux >= 0) {
+        unsigned hcd = ((unsigned)aux >> 8) & 0x7;
+        uart_puts("genet/phy: HCD = ");
+        uart_putc((char)('0' + hcd));
+        uart_puts(" (");
+        switch (hcd) {
+        case 1: uart_puts("10BT-HD");      umac_speed = CMD_SPEED_10; break;
+        case 2: uart_puts("10BT-FD");      umac_speed = CMD_SPEED_10; break;
+        case 3: uart_puts("100BTX-HD");    umac_speed = CMD_SPEED_100; break;
+        case 4: uart_puts("100BTX-FD");    umac_speed = CMD_SPEED_100; break;
+        case 6: uart_puts("1000BT-HD");    umac_speed = CMD_SPEED_1000; break;
+        case 7: uart_puts("1000BT-FD");    umac_speed = CMD_SPEED_1000; break;
+        default: uart_puts("unknown");     break;
+        }
+        uart_puts(")\n");
+    }
+    g_umac_speed_bits = umac_speed;
+
     /* ====================================================== *
      * NET-C3 — send one broadcast ARP frame via TDMA ring 16 *
      * ====================================================== */
@@ -481,10 +530,30 @@ static void genet_send_one_arp(const unsigned char src_mac[6])
     GENET_REG(SYS_RBUF_FLUSH_CTRL) = 0;
     GENET_REG(SYS_TBUF_FLUSH_CTRL) = 0;
     unsigned int ext = GENET_REG(EXT_RGMII_OOB_CTRL);
-    ext |= EXT_RGMII_MODE_EN | EXT_ID_MODE_DIS;
+    g_diag_rgmii_before = ext;
+    uart_puts("genet/ext: RGMII_OOB before = "); puts_hex32(ext); uart_puts("\n");
+    ext |= EXT_RGMII_MODE_EN | EXT_ID_MODE_DIS | EXT_RGMII_LINK;
     ext &= ~EXT_OOB_DISABLE;
     GENET_REG(EXT_RGMII_OOB_CTRL)  = ext;
-    GENET_REG(UMAC_CMD)            = CMD_TX_EN | CMD_RX_EN;
+    __asm__ volatile ("dsb sy" ::: "memory");
+    g_diag_rgmii_after = GENET_REG(EXT_RGMII_OOB_CTRL);
+    uart_puts("genet/ext: RGMII_OOB after  = "); puts_hex32(g_diag_rgmii_after); uart_puts("\n");
+    /* UMAC speed must match the negotiated PHY link speed.  Pi 4
+     * with the integrated BCM54213PE PHY auto-negotiates to 1000
+     * Mbps full-duplex when connected to a gigabit switch.  If the
+     * speed bits are 0 (10 Mbps) but the line is 1000 Mbps, every
+     * received frame is reported with CRC/LG/RXER errors. */
+    /* Add PROMISC so we receive every frame on the wire (helps
+     * diagnose whether HW filter is rejecting our intended traffic)
+     * and PAD_EN+CRC_FWD so short and CRC-carrying frames don't get
+     * dropped silently. */
+    unsigned int cmd_val = CMD_TX_EN | CMD_RX_EN | g_umac_speed_bits
+                         | CMD_PROMISC | CMD_PAD_EN | CMD_CRC_FWD;
+    GENET_REG(UMAC_CMD)            = cmd_val;
+    g_diag_umac_cmd = cmd_val;
+    uart_puts("genet/umac: UMAC_CMD = ");
+    puts_hex32(cmd_val);
+    uart_puts(" (PROMISC|PAD|CRC_FWD|speed_bits)\n");
     __asm__ volatile ("dsb sy" ::: "memory");
     uart_puts("genet/tx: UMAC_CMD = "); puts_hex32(GENET_REG(UMAC_CMD)); uart_puts("\n");
 
@@ -571,6 +640,38 @@ static void genet_send_one_arp(const unsigned char src_mac[6])
 static void genet_init_rx(void)
 {
     uart_puts("genet/rx: trace A (entering init_rx)\n");
+
+    /* Fill rx_bufs with 0xAA so we can tell whether HW actually
+     * writes received frames here.  If the dump shows 0xAA bytes
+     * later, HW didn't DMA to our buffer. */
+    for (int i = 0; i < RX_RING_DESCS; i++) {
+        for (int j = 0; j < 32; j++) rx_bufs[i][j] = 0xAA;
+    }
+    __asm__ volatile ("dsb sy" ::: "memory");
+    uart_puts("genet/rx: rx_bufs[0]@");
+    {
+        unsigned long a = (unsigned long)&rx_bufs[0][0];
+        for (int i = 7; i >= 0; i--) {
+            unsigned int n = (a >> (i * 4)) & 0xF;
+            uart_putc((char)(n < 10 ? '0' + n : 'a' + n - 10));
+        }
+    }
+    uart_puts(" first=");
+    for (int j = 0; j < 4; j++) {
+        unsigned char b = rx_bufs[0][j];
+        uart_putc("0123456789abcdef"[(b >> 4) & 0xF]);
+        uart_putc("0123456789abcdef"[ b       & 0xF]);
+    }
+    uart_puts(" (expect aaaaaaaa)\n");
+
+    /* Make sure RBUF doesn't prepend extra bytes (RBUF_ALIGN_2B
+     * or BRCM tag) and that UMAC RX path isn't stuck flushed. */
+    uart_puts("genet/rx: RBUF_CTRL before = ");
+    puts_hex32(GENET_REG(RBUF_CTRL));
+    uart_puts("\n");
+    GENET_REG(RBUF_CTRL) = 0;
+    __asm__ volatile ("dsb sy" ::: "memory");
+
     /* 1. Populate RX descriptors.  Each descriptor points to its
      * own buffer in rx_bufs[].  RX descriptors need DMA_OWN set
      * so HW knows they're available to receive into. */
@@ -617,6 +718,20 @@ static void genet_init_rx(void)
 
     g_rx_inited = 1;
     uart_puts("genet/rx: NET-D RX ring armed (16 descs, 32 KB buffer pool)\n");
+
+    /* After ring enabled, dump descriptor 0's state to verify we
+     * wrote the right address.  If desc0.ADDRESS_LO != rx_bufs[0]
+     * address, our writes are landing somewhere else. */
+    {
+        unsigned int ls  = GENET_REG(GENET_RX_OFF + 0 * DMA_DESC_SIZE + DMA_DESC_LENGTH_STATUS);
+        unsigned int alo = GENET_REG(GENET_RX_OFF + 0 * DMA_DESC_SIZE + DMA_DESC_ADDRESS_LO);
+        unsigned int ahi = GENET_REG(GENET_RX_OFF + 0 * DMA_DESC_SIZE + DMA_DESC_ADDRESS_HI);
+        uart_puts("genet/rx: desc0 len_stat=");
+        puts_hex32(ls);
+        uart_puts(" addr=");
+        puts_hex32(ahi); puts_hex32(alo);
+        uart_puts("\n");
+    }
 }
 
 int genet_rx_poll(unsigned char **out_pkt)
@@ -632,6 +747,33 @@ int genet_rx_poll(unsigned char **out_pkt)
     unsigned int len_stat  = GENET_REG(desc_off + DMA_DESC_LENGTH_STATUS);
     unsigned int length    = (len_stat >> DMA_BUFLENGTH_SHIFT) & 0x0FFF;
 
+    /* (Diagnostic freeze block was here during NET-E debug — kept
+     * removed so ping keeps working.  The bit pattern previously
+     * mistaken for "CRC|RXER|NO|LG" errors was actually the normal
+     * RX checksum status + MULT/BRDCAST flags.) */
+
+    /* Diagnostic: log full descriptor state so we can verify HW
+     * is updating it.  Throttle so we don't flood. */
+    static int diag_left = 2;
+    if (diag_left > 0) {
+        unsigned int alo = GENET_REG(desc_off + DMA_DESC_ADDRESS_LO);
+        unsigned int ahi = GENET_REG(desc_off + DMA_DESC_ADDRESS_HI);
+        uart_puts("rxd[");
+        uart_putc("0123456789abcdef"[idx >> 4]);
+        uart_putc("0123456789abcdef"[idx & 0xF]);
+        uart_puts("] ls=");
+        puts_hex32(len_stat);
+        uart_puts(" prod=");
+        puts_hex32(prod);
+        uart_puts(" addr=");
+        puts_hex32(ahi); puts_hex32(alo);
+        uart_puts("\n");
+        diag_left--;
+    }
+
+    /* Pass through raw RX buffer pointer; offset (RBUF_ALIGN_2B
+     * vs BRCM tag) is unclear, so let the caller see all 0..N
+     * bytes for hex-dump diagnosis. */
     if (out_pkt) *out_pkt = rx_bufs[idx];
     g_rx_packets++;
     g_rx_bytes += length;
@@ -678,48 +820,72 @@ static unsigned char __attribute__((aligned(64))) tx_buf_pool[1518];
 
 int genet_tx_frame(const unsigned char *frame, int length)
 {
+    uart_puts("tx_frame: T1 enter\n");
     if (length <= 0 || length > 1518) return -1;
 
     /* Copy caller's frame into the DMA-aligned buffer. */
     for (int i = 0; i < length; i++) tx_buf_pool[i] = frame[i];
+    uart_puts("tx_frame: T2 copied\n");
 
     if (!g_tx_inited) {
-        /* First TX after boot — the original genet_init() already
-         * configured the ring during genet_send_one_arp; just pick
-         * up where it left off. */
         g_tx_inited = 1;
-        g_tx_index_sw = GENET_REG(TX_RING_BASE + TDMA_CONS_INDEX) & 0xFF;
+        unsigned int c = GENET_REG(TX_RING_BASE + TDMA_CONS_INDEX);
+        g_tx_index_sw = c & 0xFF;
+        uart_puts("tx_frame: T3 first call, CONS=");
+        puts_hex32(c);
+        uart_puts("\n");
     }
+    uart_puts("tx_frame: T4 g_tx_index_sw=");
+    puts_hex32(g_tx_index_sw);
+    uart_puts("\n");
 
-    /* Build descriptor in MMIO at the current tx_index slot. */
     unsigned int idx       = g_tx_index_sw % TX_DESCS;
     unsigned int desc_off  = GENET_TX_OFF + idx * DMA_DESC_SIZE;
     unsigned long buf_pa   = (unsigned long)tx_buf_pool;
     unsigned int len_stat  = ((unsigned int)length << DMA_BUFLENGTH_SHIFT)
                            | (DMA_TX_DEFAULT_QTAG << DMA_TX_QTAG_SHIFT)
                            | DMA_TX_APPEND_CRC | DMA_SOP | DMA_EOP;
+    uart_puts("tx_frame: T5 writing desc[lo]\n");
     GENET_REG(desc_off + DMA_DESC_ADDRESS_LO)    = (unsigned int)(buf_pa & 0xFFFFFFFFu);
+    uart_puts("tx_frame: T6 writing desc[hi]\n");
     GENET_REG(desc_off + DMA_DESC_ADDRESS_HI)    = (unsigned int)((buf_pa >> 32) & 0xFFFFFFFFu);
+    uart_puts("tx_frame: T7 writing desc[len_stat]\n");
     GENET_REG(desc_off + DMA_DESC_LENGTH_STATUS) = len_stat;
     __asm__ volatile ("dsb sy" ::: "memory");
-
-    /* Bump PROD_INDEX */
+    uart_puts("tx_frame: T8 reading PROD\n");
     unsigned int prod = GENET_REG(TX_RING_BASE + TDMA_PROD_INDEX) + 1;
+    uart_puts("tx_frame: T9 writing PROD=");
+    puts_hex32(prod);
+    uart_puts("\n");
     GENET_REG(TX_RING_BASE + TDMA_PROD_INDEX) = prod;
     g_tx_index_sw = (g_tx_index_sw + 1) & 0xFFFF;
     __asm__ volatile ("dsb sy" ::: "memory");
+    uart_puts("tx_frame: T10 polling CONS\n");
 
-    /* Poll for completion (50 ms timeout) */
     unsigned long freq;
     __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
     unsigned long target = (freq / 1000UL) * 50UL;
     unsigned long t0, tn;
     __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(t0));
+    int spin = 0;
     while (1) {
         unsigned int cons = GENET_REG(TX_RING_BASE + TDMA_CONS_INDEX) & 0xFFFF;
-        if (cons == (prod & 0xFFFF)) return 0;
+        if (cons == (prod & 0xFFFF)) {
+            uart_puts("tx_frame: T11 done CONS=");
+            puts_hex32(cons);
+            uart_puts("\n");
+            return 0;
+        }
         __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(tn));
-        if (tn - t0 >= target) return -1;
+        if (tn - t0 >= target) {
+            uart_puts("tx_frame: T12 TIMEOUT CONS=");
+            puts_hex32(cons);
+            uart_puts(" PROD=");
+            puts_hex32(prod);
+            uart_puts("\n");
+            return -1;
+        }
+        spin++;
     }
 }
 
