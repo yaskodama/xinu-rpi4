@@ -40,10 +40,62 @@ static void puts_kb(unsigned long bytes);
  * any received frame and release the descriptor so HW can reuse
  * the buffer.  Rate-cap at 5 messages so broadcasts don't flood. */
 extern int net_responder_handle(const unsigned char *frame, int len);
+extern int dhcp_handle_packet(const unsigned char *frame, int len);
+extern void dhcp_set_mac(const unsigned char mac[6]);
+extern void dhcp_send_discover(void);
+extern int  dhcp_is_bound(void);
+extern unsigned char dhcp_state(void);
+extern unsigned long dhcp_discover_count(void);
+extern unsigned long dhcp_offer_count(void);
+extern unsigned long dhcp_ack_count(void);
 
 static int g_rx_log_left = 2;
+static unsigned long g_rx_tick_count = 0;
 static void genet_rx_tick(void)
 {
+    /* First tick: print a header so we KNOW genet_rx_tick is wired.
+     * Periodic DHCP retry — every 100 ticks (~5 s at 20 fps wm). */
+    g_rx_tick_count++;
+    if (g_rx_tick_count == 1) {
+        uart_puts("rx_tick: first call (genet_rx_tick is hooked up)\n");
+    }
+    if (g_rx_tick_count == 40) {
+        /* Force a visible DHCP retry at 2 seconds into runtime so we
+         * see it before ICMP traffic floods the shell window. */
+        uart_puts(">>>DHCP @t=2s retry<<<\n");
+        if (!dhcp_is_bound()) dhcp_send_discover();
+    }
+    if ((g_rx_tick_count % 100) == 0) {
+        uart_puts("dhcp: state=");
+        uart_putc((char)('0' + dhcp_state()));
+        uart_puts(" disc=");
+        {
+            unsigned long v = dhcp_discover_count();
+            char b[12]; int n = 0;
+            if (!v) uart_putc('0');
+            else { while (v) { b[n++] = (char)('0' + v % 10); v /= 10; }
+                   while (n--) uart_putc(b[n]); }
+        }
+        uart_puts(" offer=");
+        {
+            unsigned long v = dhcp_offer_count();
+            char b[12]; int n = 0;
+            if (!v) uart_putc('0');
+            else { while (v) { b[n++] = (char)('0' + v % 10); v /= 10; }
+                   while (n--) uart_putc(b[n]); }
+        }
+        uart_puts(" ack=");
+        {
+            unsigned long v = dhcp_ack_count();
+            char b[12]; int n = 0;
+            if (!v) uart_putc('0');
+            else { while (v) { b[n++] = (char)('0' + v % 10); v /= 10; }
+                   while (n--) uart_putc(b[n]); }
+        }
+        uart_puts("\n");
+        if (!dhcp_is_bound()) dhcp_send_discover();
+    }
+
     unsigned char *pkt;
     int len;
     while ((len = genet_rx_poll(&pkt)) > 0) {
@@ -86,8 +138,12 @@ static void genet_rx_tick(void)
             }
             g_rx_log_left--;
         }
-        /* Try the ARP/ICMP responder first.  If it consumed the
-         * frame (returned non-zero), don't bother logging it. */
+        /* Try DHCP first (UDP src=67 dst=68 must reach us before
+         * BOUND, since net_responder ignores UDP).  Then ARP/ICMP. */
+        if (dhcp_handle_packet(pkt, len)) {
+            genet_rx_release();
+            continue;
+        }
         if (!net_responder_handle(pkt, len) && 0) {  /* old path disabled */
             g_rx_log_left--;
             uart_puts("rx: len=");
@@ -702,6 +758,15 @@ void kernel_main(void)
         uart_puts("net: sending one gratuitous ARP ...\n");
         net_responder_send_gratuitous_arp();
         uart_puts("net: gratuitous ARP done\n");
+    }
+
+    /* NET-F: kick off DHCP DISCOVER once link is up.  Replies land
+     * via genet_rx_tick → dhcp_handle_packet.  Static IP above is
+     * kept as a fallback until BOUND. */
+    {
+        unsigned char mymac[6] = { 0xd8, 0x3a, 0xdd, 0xa7, 0xfd, 0xbf };
+        dhcp_set_mac(mymac);
+        dhcp_send_discover();
     }
 
     uart_puts("\n");

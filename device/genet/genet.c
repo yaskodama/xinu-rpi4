@@ -820,24 +820,16 @@ static unsigned char __attribute__((aligned(64))) tx_buf_pool[1518];
 
 int genet_tx_frame(const unsigned char *frame, int length)
 {
-    uart_puts("tx_frame: T1 enter\n");
     if (length <= 0 || length > 1518) return -1;
 
     /* Copy caller's frame into the DMA-aligned buffer. */
     for (int i = 0; i < length; i++) tx_buf_pool[i] = frame[i];
-    uart_puts("tx_frame: T2 copied\n");
 
     if (!g_tx_inited) {
         g_tx_inited = 1;
         unsigned int c = GENET_REG(TX_RING_BASE + TDMA_CONS_INDEX);
         g_tx_index_sw = c & 0xFF;
-        uart_puts("tx_frame: T3 first call, CONS=");
-        puts_hex32(c);
-        uart_puts("\n");
     }
-    uart_puts("tx_frame: T4 g_tx_index_sw=");
-    puts_hex32(g_tx_index_sw);
-    uart_puts("\n");
 
     unsigned int idx       = g_tx_index_sw % TX_DESCS;
     unsigned int desc_off  = GENET_TX_OFF + idx * DMA_DESC_SIZE;
@@ -845,47 +837,30 @@ int genet_tx_frame(const unsigned char *frame, int length)
     unsigned int len_stat  = ((unsigned int)length << DMA_BUFLENGTH_SHIFT)
                            | (DMA_TX_DEFAULT_QTAG << DMA_TX_QTAG_SHIFT)
                            | DMA_TX_APPEND_CRC | DMA_SOP | DMA_EOP;
-    uart_puts("tx_frame: T5 writing desc[lo]\n");
     GENET_REG(desc_off + DMA_DESC_ADDRESS_LO)    = (unsigned int)(buf_pa & 0xFFFFFFFFu);
-    uart_puts("tx_frame: T6 writing desc[hi]\n");
     GENET_REG(desc_off + DMA_DESC_ADDRESS_HI)    = (unsigned int)((buf_pa >> 32) & 0xFFFFFFFFu);
-    uart_puts("tx_frame: T7 writing desc[len_stat]\n");
     GENET_REG(desc_off + DMA_DESC_LENGTH_STATUS) = len_stat;
     __asm__ volatile ("dsb sy" ::: "memory");
-    uart_puts("tx_frame: T8 reading PROD\n");
     unsigned int prod = GENET_REG(TX_RING_BASE + TDMA_PROD_INDEX) + 1;
-    uart_puts("tx_frame: T9 writing PROD=");
-    puts_hex32(prod);
-    uart_puts("\n");
     GENET_REG(TX_RING_BASE + TDMA_PROD_INDEX) = prod;
     g_tx_index_sw = (g_tx_index_sw + 1) & 0xFFFF;
     __asm__ volatile ("dsb sy" ::: "memory");
-    uart_puts("tx_frame: T10 polling CONS\n");
 
     unsigned long freq;
     __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
     unsigned long target = (freq / 1000UL) * 50UL;
     unsigned long t0, tn;
     __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(t0));
-    int spin = 0;
     while (1) {
         unsigned int cons = GENET_REG(TX_RING_BASE + TDMA_CONS_INDEX) & 0xFFFF;
-        if (cons == (prod & 0xFFFF)) {
-            uart_puts("tx_frame: T11 done CONS=");
-            puts_hex32(cons);
-            uart_puts("\n");
-            return 0;
-        }
+        if (cons == (prod & 0xFFFF)) return 0;
         __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(tn));
         if (tn - t0 >= target) {
-            uart_puts("tx_frame: T12 TIMEOUT CONS=");
-            puts_hex32(cons);
-            uart_puts(" PROD=");
-            puts_hex32(prod);
+            uart_puts("tx_frame: TIMEOUT CONS=");
+            puts_hex32(cons); uart_puts(" PROD="); puts_hex32(prod);
             uart_puts("\n");
             return -1;
         }
-        spin++;
     }
 }
 
