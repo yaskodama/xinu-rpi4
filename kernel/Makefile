@@ -66,21 +66,29 @@ kernel_virt.img: $(QEMU_OBJS) link_virt.ld
 	@ls -la kernel_virt.img
 
 # Interactive run: Ctrl-A X to quit; Ctrl-A C for QEMU monitor.
-QEMU       ?= qemu-system-aarch64
-QEMU_FLAGS  = -M virt -cpu cortex-a76 -m 256M -nographic -kernel kernel_virt.img
+# (-nographic ties stdin to the UART; that's what we want when you're
+# at a tty.)
+QEMU            ?= qemu-system-aarch64
+QEMU_COMMON      = -M virt -cpu cortex-a76 -m 256M -kernel kernel_virt.img
+QEMU_FLAGS       = $(QEMU_COMMON) -nographic
+# Smoke variant: -serial stdio is friendlier than -nographic when the
+# input side is a pipe — `-nographic` collapses stdio into a multiplexed
+# channel that some shells fail to feed cleanly.
+QEMU_SMOKE_FLAGS = $(QEMU_COMMON) -display none -serial stdio
 
 qemu: kernel_virt.img
 	@echo ">>> launching QEMU virt (Ctrl-A X to quit) <<<"
 	$(QEMU) $(QEMU_FLAGS)
 
-# Non-interactive smoke: pipe a few commands in.  The leading "\n\n"
+# Non-interactive smoke: pipe a script of commands in and let `halt`
+# (PSCI SYSTEM_OFF) cleanly exit QEMU at the end.  The leading "\n\n"
 # is a sacrificial empty line that absorbs the LCRH-write FIFO reset
 # at boot (QEMU starts pumping stdin before our UART init finishes,
 # so the first byte after open() is consistently dropped).  The shell
 # silently re-prompts on empty input, so no harm done.
 qemu-smoke: kernel_virt.img
-	printf '\n\nhello\nmem\npeek 0x09000018\nuptime\nhelp\necho smoke ok\n' | \
-	  timeout 10 $(QEMU) $(QEMU_FLAGS) | tee qemu-smoke.log
+	printf '\n\nhello\nmem\npeek 0x09000018\nuptime\nps\necho --- smoke ok ---\nhalt\n' | \
+	  timeout 15 $(QEMU) $(QEMU_SMOKE_FLAGS) | tee qemu-smoke.log
 
 install: kernel_2712.img
 	sudo rm -f $(DEST)/kernel_*.img

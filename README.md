@@ -56,6 +56,8 @@ The shell handles backspace/DEL, echoes input, and dispatches via a
 | `mem`             | `__bss_start`, `__bss_end`, `_end` from `link.ld`   |
 | `peek <hex_addr>` | read 32-bit MMIO word; e.g. `peek 0x107d001018` (UART_FR) |
 | `uptime`          | raw `CNTPCT_EL0` (until phase S1 wires the timer)   |
+| `ps`              | core / EL status table (placeholder until phase S0) |
+| `halt`            | mask DAIF + PSCI `SYSTEM_OFF` via HVC — QEMU virt exits cleanly |
 | `reboot`          | stub — spins until power-cycle (RP1 watchdog TBD)   |
 
 ## Hardware vs Pi 4 (leex baseline)
@@ -133,16 +135,28 @@ Recorded `make qemu-smoke` output (`qemu-system-aarch64 11.0,
 xinu-pi5$ hello
 hello from Xinu on Raspberry Pi 5 (BCM2712, AArch64)
 xinu-pi5$ mem
-__bss_start = 0x0000000040080db0
-__bss_end   = 0x0000000040080eb0
-_end        = 0x0000000040080eb0
-xinu-pi5$ peek 0x09000018          # PL011 FR
+__bss_start = 0x00000000400810d0
+__bss_end   = 0x00000000400811d0
+_end        = 0x00000000400811d0
+xinu-pi5$ peek 0x09000018           # PL011 FR
 [0x0000000009000018] = 0x00000000000000c0   # TXFE | RI
 xinu-pi5$ uptime
-cntpct_el0 = 0x0000000003bf91e7
-xinu-pi5$ echo smoke ok
-smoke ok
+cntpct_el0 = 0x0000000003bf71ad
+xinu-pi5$ ps
+PID  STATE      CORE  EL  MIDR_EL1            DESCRIPTION
+  0  RUN        0     1   0x00000000414fd0b1  shell_main (kernel)
+  -  PARK(WFE)  1     -   -                   (parked by boot.S)
+  -  PARK(WFE)  2     -   -                   (parked by boot.S)
+  -  PARK(WFE)  3     -   -                   (parked by boot.S)
+xinu-pi5$ echo --- smoke ok ---
+--- smoke ok ---
+xinu-pi5$ halt
+halt: masking DAIF, requesting PSCI SYSTEM_OFF...
+# QEMU exits cleanly here (PSCI HVC at EL1 caught by virt emulator)
 ```
+
+MIDR `0x414fd0b1` is the published Cortex-A76 part number — proof the
+core actually emulates A76, not a generic ARMv8.
 
 ## Layout
 

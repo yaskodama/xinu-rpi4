@@ -21,6 +21,14 @@
 //                        BCM2712 — try `peek 0x107d001018` for UART_FR)
 //   uptime               printed since this is bare metal: stub "?", later
 //                        bound to the generic timer in phase S1
+//   ps                   tiny core-status table (the scheduler isn't
+//                        up until phase S0, so we just list MPIDR /
+//                        CurrentEL and mark cores 1-3 as WFE-parked
+//                        per boot.S)
+//   halt                 mask interrupts, ask PSCI SYSTEM_OFF
+//                        (HVC at EL2, SMC at EL1 — QEMU virt
+//                        actually exits; real Pi 5 falls through to
+//                        the WFE park)
 //   reboot               watchdog-driven reset via RP1 (stub — needs
 //                        more work; for now just spins)
 //
@@ -176,6 +184,68 @@ static int cmd_reboot(int argc, char **argv)
     for (;;) __asm__ volatile ("wfe");
 }
 
+static int cmd_ps(int argc, char **argv)
+{
+    unsigned long mpidr, midr, current_el;
+    (void)argc; (void)argv;
+    __asm__ volatile ("mrs %0, mpidr_el1" : "=r"(mpidr));
+    __asm__ volatile ("mrs %0, midr_el1"  : "=r"(midr));
+    __asm__ volatile ("mrs %0, currentel" : "=r"(current_el));
+    current_el = (current_el >> 2) & 3;
+
+    uart_puts("PID  STATE      CORE  EL  MIDR_EL1            DESCRIPTION\n");
+
+    /* The single execution context that exists today: us. */
+    uart_puts("  0  RUN        ");
+    uart_putc((char)('0' + (mpidr & 0xFF)));
+    uart_puts("     ");
+    uart_putc((char)('0' + current_el));
+    uart_puts("   ");
+    puts_hex(midr);
+    uart_puts("  shell_main (kernel)\n");
+
+    /* boot.S parks every other core in WFE until phase S0/S1
+     * brings up the GIC + cross-core IPIs.  Quad-A76 is the only
+     * topology we target. */
+    int i;
+    for (i = 1; i < 4; i++) {
+        uart_puts("  -  PARK(WFE)  ");
+        uart_putc((char)('0' + i));
+        uart_puts("     -   -                   (parked by boot.S)\n");
+    }
+
+    uart_puts("\n[scheduler not yet active — phase S0 will populate ");
+    uart_puts("this table]\n");
+    return 0;
+}
+
+static int cmd_halt(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+
+    uart_puts("halt: masking DAIF, requesting PSCI SYSTEM_OFF...\n");
+
+    /* Mask debug / SError / IRQ / FIQ so nothing wakes us up after
+     * the WFE fallback below. */
+    __asm__ volatile ("msr daifset, #0xf" ::: "memory");
+
+    /* PSCI v0.2+ SYSTEM_OFF: function id 0x84000008, no arguments.
+     *
+     * QEMU virt's PSCI conduit is HVC even when the guest is at EL1
+     * (the emulator catches the call regardless of EL3 presence).
+     * Real Pi 5 firmware may or may not implement PSCI — we fall
+     * through to WFE if HVC returns at all.
+     *
+     * We can't try SMC as a fallback first: with no exception
+     * vectors installed an unrouted SMC at EL1 traps recursively
+     * to the same EL and we'd execute garbage at the vector base. */
+    register unsigned long x0 __asm__("x0") = 0x84000008UL;
+    __asm__ volatile ("hvc #0" : "+r"(x0) :: "x1","x2","x3","memory");
+
+    uart_puts("halt: PSCI returned — WFE forever.\n");
+    for (;;) __asm__ volatile ("wfe");
+}
+
 static const struct centry commandtab[] = {
     { "help",   "list the commands",                       cmd_help   },
     { "echo",   "echo the remaining words back",           cmd_echo   },
@@ -183,6 +253,8 @@ static const struct centry commandtab[] = {
     { "mem",    "show __bss_start / __bss_end / _end",     cmd_mem    },
     { "peek",   "peek <hex_addr> — read 32-bit MMIO word", cmd_peek   },
     { "uptime", "raw CNTPCT_EL0 (generic timer)",          cmd_uptime },
+    { "ps",     "core / EL status (no scheduler yet)",     cmd_ps     },
+    { "halt",   "PSCI SYSTEM_OFF + WFE park",              cmd_halt   },
     { "reboot", "stub — spins until power-cycle",          cmd_reboot },
     { "?",      "alias for help",                          cmd_help   },
     { 0, 0, 0 }
