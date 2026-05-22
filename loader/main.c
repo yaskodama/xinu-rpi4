@@ -16,6 +16,7 @@
 #include "memory.h"
 #include "proc.h"
 #include "video.h"
+#include "early_diag.h"
 
 extern unsigned char _end[];   /* set by link.ld — top of static image */
 
@@ -41,6 +42,19 @@ void kernel_main(void)
 {
     unsigned long heap_start;
     int video_rc;
+
+    /* ---------- AGGRESSIVE LIVENESS DIAGNOSTIC --------------------
+     * Paint distinctive 256x256 colour blocks at six candidate
+     * framebuffer addresses BEFORE anything else.  If the kernel
+     * is running at all, at least one of those blocks will land
+     * on (or near) the firmware's framebuffer and visibly stamp
+     * over the rainbow boot pattern — telling us simultaneously
+     * "the kernel runs" and "the framebuffer lives around HERE".
+     * Safe on Pi 5 because all candidate addresses are within
+     * mapped low-4-GiB RAM; QEMU virt only has 256 MiB so the
+     * higher candidates fault, but with -DSKIP_MBOX we don't run
+     * this in QEMU at all. */
+    early_paint_diagnostic();
 
     uart_init();
 

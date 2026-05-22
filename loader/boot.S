@@ -19,6 +19,7 @@
 
 .section ".text.boot"
 .global _start
+.global dtb_addr
 
 _start:
     // ---- (1) pin secondary cores ---------------------------------
@@ -30,8 +31,14 @@ _start:
     b       1b
 
     // ---- (2) primary core: set up stack -------------------------
+    //
+    // Stash x0 (firmware-provided DTB phys addr) on the stack
+    // across BSS clear, then write it back into the .data global
+    // `dtb_addr` so kernel_main can use it to find the
+    // simple-framebuffer node etc.
 2:  ldr     x1, =_start
     mov     sp, x1
+    stp     x0, xzr, [sp, #-16]!     // preserve x0 across bss clear
 
     // ---- (3) zero BSS  (8 bytes per iter, __bss_size is in dwords)
     ldr     x1, =__bss_start
@@ -41,6 +48,17 @@ _start:
     sub     w2, w2, #1
     cbnz    w2, 3b
 
-    // ---- (4) jump to C ------------------------------------------
-4:  bl      kernel_main
+4:  ldp     x0, xzr, [sp], #16       // restore x0
+    ldr     x1, =dtb_addr
+    str     x0, [x1]
+
+    // ---- (5) jump to C ------------------------------------------
+    bl      kernel_main
     b       1b
+
+// .data so we don't get wiped by the BSS-clear loop.  Initialised
+// to zero — boot.S writes the real value after BSS clear.
+.section ".data"
+.align 3
+dtb_addr:
+    .quad   0
