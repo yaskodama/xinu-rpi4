@@ -18,6 +18,8 @@
 #include "video.h"
 #include "early_diag.h"
 #include "wm.h"
+#include "kmalloc.h"
+#include "vfs.h"
 
 extern unsigned char _end[];   /* set by link.ld — top of static image */
 
@@ -199,11 +201,151 @@ static void win_anim(window_t *self, unsigned int frame)
     fill_rect(ax + px, ay + py, box, box, color);
 }
 
+/* ---- VFS demo: populate a small tree at boot ------------------- */
+static void vfs_populate_demo(void)
+{
+    vfs_node_t *r = vfs_root();
+    vfs_node_t *etc  = vfs_mkdir(r, "etc");
+    vfs_node_t *proc = vfs_mkdir(r, "proc");
+    vfs_node_t *home = vfs_mkdir(r, "home");
+
+    if (etc) {
+        vfs_node_t *f;
+        f = vfs_create_file(etc,  "hostname"); vfs_write_str(f, "xinu-" BOARD_NAME);
+        f = vfs_create_file(etc,  "version");  vfs_write_str(f, "Xinu Round 1 / " SOC_NAME);
+        f = vfs_create_file(etc,  "kernel");   vfs_write_str(f, KERNEL_NAME);
+    }
+    if (proc) {
+        char buf[24];
+        unsigned long midr;
+        __asm__ volatile ("mrs %0, midr_el1" : "=r"(midr));
+        /* simple hex of MIDR for the file contents */
+        buf[0] = '0'; buf[1] = 'x';
+        for (int i = 0; i < 16; i++) {
+            unsigned long nyb = (midr >> ((15 - i) * 4)) & 0xF;
+            buf[2 + i] = (char)(nyb < 10 ? '0' + nyb : 'a' + (nyb - 10));
+        }
+        buf[18] = 0;
+        vfs_node_t *f = vfs_create_file(proc, "self.midr"); vfs_write_str(f, buf);
+        f = vfs_create_file(proc, "self.el");    vfs_write_str(f, "EL1");
+        vfs_mkdir(proc, "1");  /* placeholder dir for "process 1" */
+        vfs_mkdir(proc, "2");
+    }
+    if (home) {
+        vfs_node_t *user = vfs_mkdir(home, "user");
+        if (user) {
+            vfs_node_t *f;
+            f = vfs_create_file(user, "readme.txt");
+            vfs_write_str(f, "Welcome to the Xinu Window System on Pi 4.");
+            f = vfs_create_file(user, "notes.txt");
+            vfs_write_str(f, "kmalloc-backed tmpfs, no input yet.");
+        }
+    }
+}
+
+/* ---- File-tree window ------------------------------------------- */
+struct ftree_ctx {
+    int x, y;          /* cursor inside content area in PIXEL coords */
+    int max_y;
+    unsigned int fg;
+    unsigned int bg;
+    unsigned int dir_fg;
+};
+
+static int simple_strlen(const char *s) { int n = 0; while (s[n]) n++; return n; }
+
+static void ftree_visit_safe(int depth, vfs_node_t *node, void *vctx)
+{
+    struct ftree_ctx *c = (struct ftree_ctx *)vctx;
+    if (c->y > c->max_y) return;
+    int xb = c->x + depth * 16;
+    if (depth > 0) draw_string_at(xb - 14, c->y, "|-", c->fg, c->bg);
+    const char *nm = (depth == 0) ? "/" : node->name;
+    unsigned int colour = (node->kind == VFS_DIR) ? c->dir_fg : c->fg;
+    draw_string_at(xb, c->y, nm, colour, c->bg);
+    if (node->kind == VFS_DIR) {
+        draw_string_at(xb + 8 * simple_strlen(nm), c->y, "/", colour, c->bg);
+    }
+    c->y += 10;
+}
+
+static void win_ftree(window_t *self, unsigned int frame)
+{
+    (void)frame;
+    /* Clear content (chrome was just redrawn so content_bg is fresh) */
+    struct ftree_ctx ctx = {
+        .x      = self->x + 8,
+        .y     = self->y + WM_TITLEBAR_H + 6,
+        .max_y = self->y + self->height - 12,
+        .fg    = 0xFFCCCCCCU,
+        .bg    = self->content_bg,
+        .dir_fg= 0xFF60D0FFU
+    };
+    vfs_walk(vfs_root(), 0, ftree_visit_safe, &ctx);
+}
+
+/* ---- Memory window ---------------------------------------------- */
+static void win_mem(window_t *self, unsigned int frame)
+{
+    (void)frame;
+    char tmp[24];
+    unsigned int fg = 0xFFFFFFFFU;
+    unsigned int hi = 0xFFFFD060U;
+    unsigned int bg = self->content_bg;
+    int xb = self->x + 8;
+    int yb = self->y + WM_TITLEBAR_H + 6;
+    int line = 0;
+
+    draw_string_at(xb, yb + (line++) * 10, "Heap (getmem)",   hi, bg);
+    char *p;
+    p = u_to_dec(mem_total_bytes() >> 10, tmp, sizeof tmp);
+    draw_string_at(xb, yb + line * 10, "  total:", fg, bg);
+    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+
+    p = u_to_dec(mem_free_bytes() >> 10, tmp, sizeof tmp);
+    draw_string_at(xb, yb + line * 10, "  free :", fg, bg);
+    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+
+    p = u_to_dec(mem_largest_block() >> 10, tmp, sizeof tmp);
+    draw_string_at(xb, yb + line * 10, "  larg :", fg, bg);
+    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+
+    line++;
+    draw_string_at(xb, yb + (line++) * 10, "kmalloc",         hi, bg);
+    p = u_to_dec(kmalloc_live_blocks(), tmp, sizeof tmp);
+    draw_string_at(xb, yb + line * 10, "  live :", fg, bg);
+    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+
+    p = u_to_dec(kmalloc_live_bytes(), tmp, sizeof tmp);
+    draw_string_at(xb, yb + line * 10, "  bytes:", fg, bg);
+    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+
+    p = u_to_dec(kmalloc_total_allocs(), tmp, sizeof tmp);
+    draw_string_at(xb, yb + line * 10, "  allocs:", fg, bg);
+    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+
+    p = u_to_dec(kmalloc_total_frees(), tmp, sizeof tmp);
+    draw_string_at(xb, yb + line * 10, "  frees:", fg, bg);
+    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+
+    line++;
+    draw_string_at(xb, yb + (line++) * 10, "VFS",              hi, bg);
+    p = u_to_dec(vfs_node_count(), tmp, sizeof tmp);
+    draw_string_at(xb, yb + line * 10, "  nodes:", fg, bg);
+    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+
+    p = u_to_dec(vfs_total_file_bytes(), tmp, sizeof tmp);
+    draw_string_at(xb, yb + line * 10, "  bytes:", fg, bg);
+    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+}
+
 /* Static window descriptors — laid out after video_init() picks the
  * actual screen dimensions in kernel_main(). */
 static window_t banner_win;
 static window_t status_win;
 static window_t anim_win;
+static window_t ftree_win;
+static window_t mem_win;
 
 void kernel_main(void)
 {
@@ -274,6 +416,23 @@ void kernel_main(void)
     proc_init();
     uart_puts("sched: cooperative ctxsw ready (NULLPROC = shell)\n");
 
+    /* M1.5 — populate a small in-memory hierarchical filesystem so
+     *        the file-tree window has something interesting to show
+     *        and the kmalloc/VFS counters in the memory window are
+     *        non-zero at boot. */
+    vfs_populate_demo();
+    {
+        /* Print node count via the existing puts_kb (which shifts
+         * right by 10), pre-shift left so the displayed number is
+         * the actual node count. */
+        unsigned long count = vfs_node_count();
+        uart_puts("vfs: tmpfs populated (");
+        puts_kb(count << 10);
+        uart_puts(" nodes, ");
+        puts_kb(vfs_total_file_bytes() << 10);
+        uart_puts(" file bytes)\n");
+    }
+
     uart_puts("\n");
     uart_puts("Round 1: B/U/M1/S0/X0 done.\n");
 
@@ -287,11 +446,17 @@ void kernel_main(void)
         unsigned int sw = video_screen_width();
         /* unsigned int sh = video_screen_height(); -- not needed */
 
-        /* Title-bar window: full width, 56 px tall, top of screen. */
+        /* 5-window layout (640x480):
+         *   +--- title 640x40 -----------------+
+         *   | status 320x200 | animation 316x200 |
+         *   | ftree  320x200 | memory   316x200 |
+         */
+
+        /* Title-bar window: full width, 40 px tall. */
         banner_win.x = 0;
         banner_win.y = 0;
         banner_win.width  = (int)sw;
-        banner_win.height = 56;
+        banner_win.height = 44;
         const char *bt = "Xinu " BOARD_NAME " on " SOC_NAME;
         for (int i = 0; i < WM_TITLE_MAX && bt[i]; i++) banner_win.title[i] = bt[i];
         banner_win.chrome_color = 0xFFAACCEEU;
@@ -301,9 +466,9 @@ void kernel_main(void)
         banner_win.draw_content = win_banner;
         wm_add(&banner_win);
 
-        /* Status window: left half, below the title bar. */
+        /* Status window: top-left, below title bar. */
         status_win.x = 0;
-        status_win.y = 60;
+        status_win.y = 48;
         status_win.width  = 320;
         status_win.height = 200;
         const char *st = "System status";
@@ -315,9 +480,9 @@ void kernel_main(void)
         status_win.draw_content = win_status;
         wm_add(&status_win);
 
-        /* Animation window: right of status, same vertical band. */
+        /* Animation window: top-right. */
         anim_win.x = 324;
-        anim_win.y = 60;
+        anim_win.y = 48;
         anim_win.width  = (int)sw - 324;
         anim_win.height = 200;
         const char *an = "Animation";
@@ -328,6 +493,34 @@ void kernel_main(void)
         anim_win.content_bg   = 0xFF000000U;
         anim_win.draw_content = win_anim;
         wm_add(&anim_win);
+
+        /* File-tree window: bottom-left. */
+        ftree_win.x = 0;
+        ftree_win.y = 252;
+        ftree_win.width  = 320;
+        ftree_win.height = 220;
+        const char *ft = "VFS tree";
+        for (int i = 0; i < WM_TITLE_MAX && ft[i]; i++) ftree_win.title[i] = ft[i];
+        ftree_win.chrome_color = 0xFF60D0FFU;
+        ftree_win.title_bg     = 0xFF205070U;
+        ftree_win.title_fg     = 0xFFFFFFFFU;
+        ftree_win.content_bg   = 0xFF101418U;
+        ftree_win.draw_content = win_ftree;
+        wm_add(&ftree_win);
+
+        /* Memory window: bottom-right. */
+        mem_win.x = 324;
+        mem_win.y = 252;
+        mem_win.width  = (int)sw - 324;
+        mem_win.height = 220;
+        const char *mt = "Memory";
+        for (int i = 0; i < WM_TITLE_MAX && mt[i]; i++) mem_win.title[i] = mt[i];
+        mem_win.chrome_color = 0xFFFFE060U;
+        mem_win.title_bg     = 0xFF604020U;
+        mem_win.title_fg     = 0xFFFFFFFFU;
+        mem_win.content_bg   = 0xFF181410U;
+        mem_win.draw_content = win_mem;
+        wm_add(&mem_win);
 
         wm_run();   /* never returns */
     }

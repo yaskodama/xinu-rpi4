@@ -44,7 +44,8 @@ LD       = $(GCCPATH)/bin/$(CROSS)ld
 OBJCOPY  = $(GCCPATH)/bin/$(CROSS)objcopy
 
 # ----- source discovery -----------------------------------------------
-COMPONENTS = loader mem system shell device/uart device/mbox device/video
+COMPONENTS = loader mem system shell fs \
+             device/uart device/mbox device/video
 
 C_SRCS := $(foreach d,$(COMPONENTS),$(wildcard ../$(d)/*.c))
 S_SRCS := $(foreach d,$(COMPONENTS),$(wildcard ../$(d)/*.S))
