@@ -1,39 +1,45 @@
-# sdcard/config.txt — Raspberry Pi 5 firmware configuration for Xinu.
+# config.txt — Pi 5 firmware → Xinu kernel handoff (v2).
 #
-# Place this in the FAT32 bootfs partition alongside kernel_2712.img.
-#
-# Notes:
-#   - Pi 5 firmware uses kernel_2712.img specifically; other names
-#     (kernel8.img, kernel.img, kernel7l.img) are silently ignored.
-#   - arm_64bit=1 is implicit on Pi 5 (AArch64 only) but we set it
-#     explicitly for clarity.
-#   - enable_uart=1 + the dtparam line below clamp the GPIO14/15
-#     pins to PL011 UART0 at the fixed 48 MHz reference clock so
-#     115200 baud is stable.  Without these the firmware would
-#     hand UART0 to Bluetooth and you'd see nothing on the cable.
-#   - kernel_address is the load address; matches kernel/link.ld.
+# Critical change from v1: removed Linux-KMS hints so that firmware
+# allocates a legacy framebuffer and writes its address into the DTB.
+# Our kernel doesn't have a DRM/KMS driver yet, so leaving the
+# firmware in "skip FB setup, the kernel will do it" mode produced
+# a black HDMI screen on hand-off.
 
+# --- preserved Pi OS defaults that don't conflict ---------------------
+camera_auto_detect=0          # don't probe cameras at boot
+display_auto_detect=1
 arm_64bit=1
+disable_overscan=1
+arm_boost=1
+
+# REMOVED — vc4-kms-v3d + max_framebuffers + disable_fw_kms_setup
+# These tell firmware "let the kernel handle framebuffer" which we
+# don't yet do.  Without them, firmware allocates a legacy FB itself.
+
+# --- Xinu overrides --------------------------------------------------
 kernel=kernel_2712.img
 kernel_address=0x80000
 
-# Debug UART via header pins 8 (TXD = GPIO14) and 10 (RXD = GPIO15).
-# Use a 3.3 V FTDI cable, e.g.  screen /dev/tty.usbserial-XXXX 115200
+# UART0 (PL011) on header pins 8/10 so bootloader + kernel logs go
+# out the USB-serial cable.
 enable_uart=1
 uart_2ndstage=1
 dtparam=uart0=on
 
-# Helpful while bringing up: keep the firmware's diagnostic
-# messages on the same UART so kernel output is interleaved with
-# bootrom output for context.
-disable_overscan=1
-
-# HDMI framebuffer.  We ask the firmware to pre-allocate a screen
-# so that our video.c can find a working VC mailbox / framebuffer
-# and write text onto HDMI in parallel with the UART.  Useful as a
-# fallback when the USB-serial cable shows nothing.
+# LEGACY HDMI framebuffer.  Firmware allocates 640x480x32 ARGB at
+# a fixed physical address and writes it into the DTB; our kernel
+# can find it either by parsing DT or — once mailbox works on this
+# Pi 5 board — by querying GET_FRAMEBUFFER_ADDR via VC mailbox.
 hdmi_force_hotplug=1
+hdmi_group=2                    # DMT mode (PC-style timings)
+hdmi_mode=4                     # 640x480 @ 60 Hz
 framebuffer_width=640
 framebuffer_height=480
 framebuffer_depth=32
 framebuffer_ignore_alpha=1
+
+[cm5]
+dtoverlay=dwc2,dr_mode=host
+
+[all]
