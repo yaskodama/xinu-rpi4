@@ -75,16 +75,25 @@ The shell handles backspace/DEL, echoes input, and dispatches via a
 
 ## Build
 
+The repository follows the classic Embedded Xinu / davidxyz/xinuPi
+subsystem layout — sources live in per-area top-level directories
+(`loader/`, `mem/`, `system/`, `shell/`, `device/uart/`) and every
+build artefact lands under `compile/`.
+
 ```sh
-# Mac (Homebrew toolchain):
-brew install --cask gcc-arm-embedded   # ships aarch64-none-elf-gcc
-cd kernel
-make                                    # → kernel/kernel_2712.img
+# Mac (Homebrew toolchain — pick either):
+brew install aarch64-elf-gcc           # gnu cross compiler
+# OR:
+brew install --cask gcc-arm-embedded   # arm-supplied toolchain
+
+cd compile
+make                                    # → compile/kernel_2712.img
 ```
 
 Override the toolchain location if you installed it elsewhere:
 
 ```sh
+cd compile
 make GCCPATH=$HOME/aarch64/arm-gnu-toolchain-14.3.rel1-x86_64-aarch64-none-elf
 ```
 
@@ -94,7 +103,7 @@ Insert a Pi-5 SD card with the FAT32 bootfs partition mounted.  The
 canonical Mac path is `/Volumes/bootfs`:
 
 ```sh
-cd kernel
+cd compile
 make install SDCARD=/Volumes        # copies kernel_2712.img + config.txt
 ```
 
@@ -125,7 +134,7 @@ load address (`0x80000` → `0x40080000`).  Source is shared; only
 `-DUART0_BASE=...` and `link_virt.ld` differ.
 
 ```sh
-cd kernel
+cd compile
 make qemu          # interactive  — Ctrl-A X to quit
 make qemu-smoke    # pipes a canned command list, writes qemu-smoke.log
 ```
@@ -216,27 +225,43 @@ tick.
 
 ## Layout
 
+Xinu-style subsystem dirs (modelled on `github.com/davidxyz/xinuPi`):
+
 ```
 xinu-rpi5/
-├── kernel/
-│   ├── boot.S          # AArch64 entry stub (leex pattern, Pi-5 tuned)
-│   ├── ctxsw.S         # AArch64 callee-saved (x19-x30) save/restore
-│   ├── link.ld         # load address 0x80000 (Pi 5 firmware)
-│   ├── link_virt.ld    # load address 0x40080000 (QEMU virt)
-│   ├── Makefile        # aarch64-elf → kernel_2712.img + kernel_virt.img
-│   ├── main.c          # banner + heap init + proc init + shell handoff
-│   ├── memory.c        # first-fit getmem/freemem (Xinu-style)
+├── compile/                # build directory — run `make` from here
+│   ├── Makefile            # aarch64-elf → kernel_2712.img + kernel_virt.img
+│   ├── link.ld             # load address 0x80000 (Pi 5 firmware)
+│   ├── link_virt.ld        # load address 0x40080000 (QEMU virt)
+│   ├── obj/                # *.o per-source (gitignored)
+│   │   └── qemu/           # QEMU variant objects
+│   └── kernel_*.img        # final flat images (gitignored)
+├── device/
+│   └── uart/
+│       └── uart.c          # PL011 UART0 @ 0x107D001000 + getc/getline
+├── include/                # shared headers (-I../include)
 │   ├── memory.h
-│   ├── proc.c          # proctab + ready list + resched + create/exit
 │   ├── proc.h
-│   ├── shell.c         # bare-metal REPL (davidxyz/xinuPi-style)
 │   ├── shell.h
-│   ├── uart.c          # PL011 UART0 @ 0x107D001000 (+ getc/getline)
 │   └── uart.h
+├── loader/                 # boot path + kernel_main
+│   ├── boot.S              # AArch64 entry stub (leex pattern)
+│   └── main.c              # banner + heap/proc init + shell handoff
+├── mem/                    # memory manager
+│   └── memory.c            # first-fit getmem / freemem (Xinu-style)
+├── shell/                  # bare-metal REPL
+│   └── shell.c             # davidxyz/xinuPi-style centry dispatch
+├── system/                 # core kernel
+│   ├── ctxsw.S             # AArch64 callee-saved save/restore
+│   └── proc.c              # proctab + ready list + resched + create/exit
 ├── sdcard/
-│   └── config.txt      # firmware settings (arm_64bit=1, etc)
+│   └── config.txt          # firmware settings (arm_64bit=1, etc)
 └── README.md
 ```
+
+Subsystem dirs are individually grep-able and a new device just means a
+new directory under `device/`; the `compile/Makefile` picks it up via
+`$(wildcard ../device/*/*.c)`.
 
 ## Roadmap (`AIPL_XinuRPi5_Round1.aice`)
 
