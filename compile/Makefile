@@ -47,6 +47,9 @@ OBJCOPY  = $(GCCPATH)/bin/$(CROSS)objcopy
 COMPONENTS = loader mem system shell fs \
              device/uart device/mbox device/video device/sd device/usb \
              device/usb/xhci device/gic device/timer device/genet
+# network/ subsystem (xinu-raz port) is staged under network/{arp,ipv4,icmp,
+# netaddr,net} but NOT built yet — depends on porting Xinu sem/mbox/ready/
+# wait kernel APIs to xinu-rpi5's cooperative scheduler.  See NEXT_SESSION.md.
 # extern/uspi/lib disabled — USPi only drives DWC2 (Pi 4 USB-C OTG).
 # Pi 4 USB-A keyboards / mice route through VL805 PCIe xHCI, which
 # needs a hand-rolled driver under device/usb/xhci/.

@@ -1,56 +1,79 @@
-# NEXT_SESSION — Pi 4 GENET TX bring-up
+# NEXT_SESSION — Pi 4 xinu-rpi5 status (HEAD `6fcced5` + WIP)
 
-## ここまでで動いていること (HEAD `e99008d`)
-- BCM2711 GENET v5 controller alive (SYS_REV_CTRL = 0x06000000)
-- UMAC enabled: UMAC_CMD = 0x00000003 (TX_EN | RX_EN) reads back OK
-- BCM54213PE PHY (PHYSID1=0x600D, PHYSID2=0x84A2), link UP
-- TDMA register layout 確定 (stride 0x40, ring 16 = 0x4400, top = 0x4440)
-- TX descriptor word 0 = 0x003CD07F (length 60 in bits 31:16, SOP|EOP|OW|CRC|QTAG in bits 15:0)
-- TDMA_RING_CFG bit 16 enabled, UMAC TX+RX enabled
-- shell window + soft keyboard + cursor + 1280×960 virtual desktop も完成
+## このセッションで達成したこと
+- **NET-C3: TX 1 frame 動作** (broadcast ARP、CONS=1 sent OK)
+- **NET-D: RX ring + frame 受信動作** (Pi 4 が LAN broadcast を受信して shell window に dst/src/type を表示)
+- Pi 4 GENET の **descriptor format / register layout の正解** を確定:
+  - per-ring stride 0x40、ring 16 = `0x4400` ... wait, no! Final correct values:
+    - TX_RING_BASE = GENET_TDMA_REG_OFF + 16*0x40 = `0x5000`
+    - TX_DMA_TOP   = GENET_TDMA_REG_OFF + 17*0x40 = `0x5040`
+    - GENET_TDMA_REG_OFF = `0x4000 + 256*12 = 0x4C00`
+  - **TX descriptors live in MMIO** at GENET_BASE + 0x4000 + idx*12 (NOT in DRAM)
+  - Word 0 layout: bits 31:16 = length, bits 15:0 = status
+    - SOP=0x2000, EOP=0x4000, OWN=0x8000 (RX), WRAP=0x1000, CRC=0x40, QTAG@bit 7
+  - DMA_CTRL = `(1 << (DEFAULT_Q + 1)) | 1` = `0x20001` (bit 0 = DMA_EN, bit 17 = ring 16 data-path)
 
-## 動かない: CONS_INDEX が advance しない
-症状:
-- PROD_INDEX = 1 を書いても CONS_INDEX = 0 のまま
-- DMA_STATUS = 0
-- TDMA_CTRL を `0x20001` (bit 0 + bit 17) に書くと、HW は `0x21000` (bit 12 + bit 17) を返す
-  - bit 0 (我々の DMA_EN) が即クリアされる
-  - bit 12 が HW 由来で立っている
-- Mac 側 tcpdump で broadcast ARP が一切観測されない
+## NET-E (xinu-raz network/ port) — 着手したが課題判明
 
-## 次セッションでやること
+### 試したこと
+- `/Users/kodamay/projects/xinu-raz/xinu/network/{arp,ipv4,icmp,netaddr,net}` (41 .c files, 7297 行) を `xinu-rpi5/network/` にコピー済み
+- xinu-raz の 83 個の include を `xinu-rpi5/extern/xinu-raz-include/` に隔離 (xinu-rpi5 既存ヘッダーと混ぜない)
 
-### 1. Linux source 精読
-`drivers/net/ethernet/broadcom/genet/bcmgenet.c` を以下の順で読み:
+### 残る壁
+xinu-raz の network/ コードは Xinu kernel 全機能に依存:
+- **`semaphore.h`** — semcreate / wait / signal / semreset
+- **`mailbox.h`** — mbox-based inter-process messaging
+- **`thread.h` / `proc.h`** — preemptive scheduler with ready/wait/sleep
+- **`bufpool.h`** — pool allocator for ethpkt buffers
+- **`device.h`** — Xinu device abstraction (open/close/read/write/control)
+- **`interrupt.h`** — Xinu IRQ control (currently we have raw connect_interrupt)
 
-- `bcmgenet_init_dma()` (DMA bring-up シーケンス)
-- `bcmgenet_enable_dma()` (DMA_CTRL の bit 構成と書き方)
-- `bcmgenet_init_tx_ring()` (ring register 設定順序)
-- `bcmgenet_xmit()` (実際の TX path — descriptor + PROD_INDEX bump)
+xinu-rpi5 は cooperative scheduler のみ。これらを実装 or stub する必要あり。
 
-特に確認したい:
-- `DMA_EN` bit 位置 (GENET v5 でも本当に bit 0 か?)
-- per-ring data path enable の shift (`DMA_RING_BUF_EN_SHIFT`)
-- ring 16 (DESC_INDEX) の特殊扱いの有無
-- TDMA_CTRL の `0x21000` の bit 12 が何を意味するか
+### 次セッションの計画
 
-### 2. 可能性が高い missing piece
-- **GENET_INTRL2_0/1 mask register クリア** — IRQ 経路を mask しないと DMA も止まる可能性
-- **TBUF_CTRL** programming — TX buffer ring の独立設定
-- **TX BURST size** (TDMA_SCB_BURST_SIZE) が 8 で正しいか
-- **RGMII RXC/TXC delay** が EXT_RGMII_OOB_CTRL の他 bit で必要
-- **memory cache coherency** — MMU off だが Device-nGnRnE 属性で writeはバッファされ得る
+#### Step 1: Xinu kernel 互換 stub 層 (1 セッション)
+- `sem`: 単純なカウンタ + busy-wait (cooperative scheduler 想定)
+- `mbox`: シングルスレッドなので queue + immediate dispatch
+- `ready/wait`: NULLPROC ベースでスキップ
+- `bufpool`: 固定 array allocator
+- これらを `system/xinu_compat.c` に集約
 
-### 3. ハードリセット試行
-SYS_RBUF/TBUF_FLUSH_CTRL に **1 を書いてから 0 に戻す** (パルスでリセット)
-が必要かもしれない。我々は 0 のままにしているだけ。
+#### Step 2: ARP 単独ビルド (1 セッション)
+- `network/arp/*.c` だけ Makefile に追加
+- ビルド通るまで `-I../extern/xinu-raz-include` + 個別 fix
+- `arpResolve` を Pi 4 GENET 上で動作させる
 
-### 4. 並行調査
-- U-Boot for Pi 4 (`drivers/net/bcmgenet.c`) も別実装として参考
-- circle/lib/bcmgenet.cpp (rsta2/circle、Pi 4 サポート) も参考
-- Raspberry Pi firmware ブートローダのソース (公開分)
+#### Step 3: IPv4 + ICMP (1 セッション)
+- 同じくビルド + 接続
+- 目標: Mac から Pi 4 (固定 IP) に `ping` 通る
 
-## 次セッション目標
-1. TX 1 frame 送信成功 (Mac tcpdump で broadcast ARP 確認)
-2. NET-D: RX 1 frame 受信
-3. NET-E: ARP responder (xinu-raz のコード移植 or 自作)
+#### Step 4: DHCP + TCP + telnet (2-3 セッション)
+- DHCP で IP 取得
+- TCP + telnet daemon で shell remote login
+
+### 別の選択肢: Plan A (今は除外)
+- 最小 ARP responder を 200-300 行で自作
+- ping 通るまで 1 セッションで到達可能
+- ただし TCP/IP stack 全体を後で再実装
+
+User の判断は **B 継続** だったので Step 1-4 で行く。
+
+## このセッションの commit chain
+- `1974eec` — shell window + soft kbd + cursor + virtual desktop + S1 + USB-M0 + xHCI scaffold
+- `4fdea3f` — NET-A/B/C1 (GENET probe, UMAC, BCM54213PE link UP)
+- `6a204f8` — NET-C2/C3 stub (TDMA register layout, descriptor format research)
+- `e99008d` — NET-C3 fixed descriptor format (length<<16 | status low16)
+- `62f20f4` — NEXT_SESSION.md initial handoff
+- `1c15b21` — **NET-C3 TX works** (CONS=1 sent OK)
+- `6fcced5` — **NET-D RX works** (broadcast frames received and logged)
+
+## ビルド/焼き
+```
+cd /Users/kodamay/projects/xinu-rpi5/compile
+make pi4                          # → kernel8.img (~42 KB)
+diskutil mount /dev/disk4s1
+cp kernel8.img /Volumes/bootfs/
+sync
+diskutil eject /Volumes/bootfs
+```
