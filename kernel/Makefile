@@ -87,7 +87,7 @@ qemu: kernel_virt.img
 # so the first byte after open() is consistently dropped).  The shell
 # silently re-prompts on empty input, so no harm done.
 qemu-smoke: kernel_virt.img
-	printf '\n\nhello\nmem\npeek 0x09000018\nuptime\nps\necho --- smoke ok ---\nhalt\n' | \
+	printf '\n\nhello\nmem\npeek 0x09000018\nuptime\nps\npingpong 3\necho --- smoke ok ---\nhalt\n' | \
 	  timeout 15 $(QEMU) $(QEMU_SMOKE_FLAGS) | tee qemu-smoke.log
 
 install: kernel_2712.img

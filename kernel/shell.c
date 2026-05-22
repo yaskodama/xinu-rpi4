@@ -29,6 +29,11 @@
 //                        (HVC at EL2, SMC at EL1 — QEMU virt
 //                        actually exits; real Pi 5 falls through to
 //                        the WFE park)
+//   pingpong [N]         run a 2-actor AIPL-style PingPong: two
+//                        cooperative "processes" exchange messages
+//                        through 1-slot inboxes for N rounds (default
+//                        5, capped at 50) then self-terminate when
+//                        both stop sending and the inboxes drain
 //   reboot               watchdog-driven reset via RP1 (stub — needs
 //                        more work; for now just spins)
 //
@@ -56,6 +61,17 @@ static int str_len(const char *s)
     int n = 0;
     while (s[n]) n++;
     return n;
+}
+
+/* Render a non-negative integer in base 10. */
+static void puts_dec(int v)
+{
+    char buf[12];
+    int n = 0;
+    if (v < 0) { uart_putc('-'); v = -v; }
+    if (v == 0) { uart_putc('0'); return; }
+    while (v > 0) { buf[n++] = (char)('0' + (v % 10)); v /= 10; }
+    while (n--) uart_putc(buf[n]);
 }
 
 /* Render an unsigned long in hex (0x… prefix, lowercase). */
@@ -176,6 +192,115 @@ static int cmd_uptime(int argc, char **argv)
     return 0;
 }
 
+/* ---------- pingpong (cooperative 2-actor demo) ---------- */
+/*
+ * Stand-in for an AIPL Ping/Pong actor pair until phase S0 brings up
+ * the real scheduler.  Each actor owns a single-slot inbox and a tiny
+ * step() that consumes a message, logs it, and (unless its send budget
+ * is exhausted) posts a reply to the peer's inbox.  The dispatcher is
+ * the outer while loop in cmd_pingpong — it picks whichever inbox is
+ * non-empty and runs that actor's step.  No threads, no preemption,
+ * but the visible behaviour matches what AIPL emits on a real runtime.
+ */
+
+#define PP_DEFAULT_ROUNDS  5
+#define PP_MAX_ROUNDS      50
+#define PP_INBOX_LEN       32
+
+typedef struct pp_actor {
+    const char *name;        /* "Ping" / "Pong" */
+    const char *outgoing;    /* the word this actor always sends */
+    char        inbox[PP_INBOX_LEN];
+    int         has_msg;
+    int         sent;
+    int         recv;
+} pp_actor_t;
+
+static pp_actor_t pp_ping = { "Ping", "ping", {0}, 0, 0, 0 };
+static pp_actor_t pp_pong = { "Pong", "pong", {0}, 0, 0, 0 };
+
+static void pp_copy(char *dst, const char *src, int max)
+{
+    int i = 0;
+    while (i < max - 1 && src[i]) { dst[i] = src[i]; i++; }
+    dst[i] = 0;
+}
+
+static void pp_post(pp_actor_t *dest, const char *msg)
+{
+    pp_copy(dest->inbox, msg, PP_INBOX_LEN);
+    dest->has_msg = 1;
+}
+
+static void pp_step(pp_actor_t *self, pp_actor_t *peer, int max_sends)
+{
+    self->recv++;
+    uart_puts("  ["); uart_puts(self->name);
+    uart_puts("] recv '"); uart_puts(self->inbox);
+    uart_puts("' (msg #"); puts_dec(self->recv); uart_puts(")\n");
+    self->has_msg = 0;
+
+    if (self->sent >= max_sends) {
+        uart_puts("  ["); uart_puts(self->name);
+        uart_puts("] budget exhausted (sent ");
+        puts_dec(self->sent); uart_puts(") — no reply\n");
+        return;
+    }
+
+    pp_post(peer, self->outgoing);
+    self->sent++;
+    uart_puts("  ["); uart_puts(self->name);
+    uart_puts("] send '"); uart_puts(self->outgoing);
+    uart_puts("' -> "); uart_puts(peer->name); uart_puts("\n");
+}
+
+static int cmd_pingpong(int argc, char **argv)
+{
+    int rounds = PP_DEFAULT_ROUNDS;
+
+    if (argc >= 2) {
+        int v = 0;
+        const char *s = argv[1];
+        while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; }
+        if (*s != 0 || v < 1) {
+            uart_puts("usage: pingpong [N]   (1..");
+            puts_dec(PP_MAX_ROUNDS); uart_puts(", default ");
+            puts_dec(PP_DEFAULT_ROUNDS); uart_puts(")\n");
+            return 1;
+        }
+        if (v > PP_MAX_ROUNDS) v = PP_MAX_ROUNDS;
+        rounds = v;
+    }
+
+    /* Reset actor state — safe to re-run the command. */
+    pp_ping.has_msg = 0; pp_ping.sent = 0; pp_ping.recv = 0;
+    pp_pong.has_msg = 0; pp_pong.sent = 0; pp_pong.recv = 0;
+
+    uart_puts("pingpong: spawning Ping + Pong, rounds=");
+    puts_dec(rounds); uart_puts("\n");
+    uart_puts("---------------------------------------------\n");
+
+    /* Bootstrap: Ping sends the first message itself. */
+    pp_post(&pp_pong, pp_ping.outgoing);
+    pp_ping.sent = 1;
+    uart_puts("  [Ping] send 'ping' -> Pong   (bootstrap)\n");
+
+    /* Cooperative dispatcher: drain whichever inbox has a message. */
+    while (pp_ping.has_msg || pp_pong.has_msg) {
+        if (pp_pong.has_msg) pp_step(&pp_pong, &pp_ping, rounds);
+        else if (pp_ping.has_msg) pp_step(&pp_ping, &pp_pong, rounds);
+    }
+
+    uart_puts("---------------------------------------------\n");
+    uart_puts("pingpong: done.  Ping  sent=");
+    puts_dec(pp_ping.sent); uart_puts(" recv=");
+    puts_dec(pp_ping.recv); uart_puts("\n");
+    uart_puts("                 Pong  sent=");
+    puts_dec(pp_pong.sent); uart_puts(" recv=");
+    puts_dec(pp_pong.recv); uart_puts("\n");
+    return 0;
+}
+
 static int cmd_reboot(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -253,9 +378,10 @@ static const struct centry commandtab[] = {
     { "mem",    "show __bss_start / __bss_end / _end",     cmd_mem    },
     { "peek",   "peek <hex_addr> — read 32-bit MMIO word", cmd_peek   },
     { "uptime", "raw CNTPCT_EL0 (generic timer)",          cmd_uptime },
-    { "ps",     "core / EL status (no scheduler yet)",     cmd_ps     },
-    { "halt",   "PSCI SYSTEM_OFF + WFE park",              cmd_halt   },
-    { "reboot", "stub — spins until power-cycle",          cmd_reboot },
+    { "ps",       "core / EL status (no scheduler yet)",   cmd_ps       },
+    { "halt",     "PSCI SYSTEM_OFF + WFE park",            cmd_halt     },
+    { "pingpong", "2-actor cooperative PingPong [rounds]", cmd_pingpong },
+    { "reboot",   "stub — spins until power-cycle",        cmd_reboot   },
     { "?",      "alias for help",                          cmd_help   },
     { 0, 0, 0 }
 };

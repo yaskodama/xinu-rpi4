@@ -58,6 +58,7 @@ The shell handles backspace/DEL, echoes input, and dispatches via a
 | `uptime`          | raw `CNTPCT_EL0` (until phase S1 wires the timer)   |
 | `ps`              | core / EL status table (placeholder until phase S0) |
 | `halt`            | mask DAIF + PSCI `SYSTEM_OFF` via HVC — QEMU virt exits cleanly |
+| `pingpong [N]`    | 2-actor AIPL-style PingPong, cooperative dispatch, N rounds (1..50, default 5), auto-terminates |
 | `reboot`          | stub — spins until power-cycle (RP1 watchdog TBD)   |
 
 ## Hardware vs Pi 4 (leex baseline)
@@ -148,8 +149,19 @@ PID  STATE      CORE  EL  MIDR_EL1            DESCRIPTION
   -  PARK(WFE)  1     -   -                   (parked by boot.S)
   -  PARK(WFE)  2     -   -                   (parked by boot.S)
   -  PARK(WFE)  3     -   -                   (parked by boot.S)
-xinu-pi5$ echo --- smoke ok ---
---- smoke ok ---
+xinu-pi5$ pingpong 3
+pingpong: spawning Ping + Pong, rounds=3
+---------------------------------------------
+  [Ping] send 'ping' -> Pong   (bootstrap)
+  [Pong] recv 'ping' (msg #1)
+  [Pong] send 'pong' -> Ping
+  [Ping] recv 'pong' (msg #1)
+  [Ping] send 'ping' -> Pong
+  ...
+  [Ping] budget exhausted (sent 3) — no reply
+---------------------------------------------
+pingpong: done.  Ping  sent=3 recv=3
+                 Pong  sent=3 recv=3
 xinu-pi5$ halt
 halt: masking DAIF, requesting PSCI SYSTEM_OFF...
 # QEMU exits cleanly here (PSCI HVC at EL1 caught by virt emulator)
@@ -157,6 +169,15 @@ halt: masking DAIF, requesting PSCI SYSTEM_OFF...
 
 MIDR `0x414fd0b1` is the published Cortex-A76 part number — proof the
 core actually emulates A76, not a generic ARMv8.
+
+**pingpong is the AIPL Ping/Pong actor pair, ported to the bare-metal
+shell** until phase S0 lands a real scheduler.  Two static `pp_actor_t`
+structs (`Ping`, `Pong`) each own a 1-slot inbox; the outer dispatcher
+in `cmd_pingpong` just drains whichever inbox is non-empty.  Each
+actor stops sending once its `sent` budget hits the round count, so
+the run self-terminates the moment both inboxes go empty — no
+preemption, no scheduler, but the trace matches what AIPL emits on
+the Python and OCaml runtimes.  Argument is clamped to `[1, 50]`.
 
 ## Layout
 
