@@ -20,6 +20,8 @@
 #include "wm.h"
 #include "kmalloc.h"
 #include "vfs.h"
+#include "sd.h"
+#include "fat32.h"
 
 extern unsigned char _end[];   /* set by link.ld — top of static image */
 
@@ -199,6 +201,77 @@ static void win_anim(window_t *self, unsigned int frame)
     }
 
     fill_rect(ax + px, ay + py, box, box, color);
+}
+
+/* ---- FAT32 → VFS bridge ----------------------------------------
+ *
+ * The visitor inserts each non-pseudo directory entry into the VFS
+ * subtree we're building under /sd.  Directory recursion is one
+ * level deep by default (depth budget) to keep boot time bounded —
+ * a SD card with hundreds of overlays could easily produce 500+
+ * entries otherwise.  Files do NOT have their contents copied yet;
+ * the VFS node's size matches the on-disk size, but the data
+ * buffer stays empty.  Reading contents on demand requires a
+ * vfs_node_t open() hook which we can add later.
+ */
+#define SD_MAX_DEPTH        2     /* root + 1 level (0..2 inclusive)  */
+#define SD_MAX_DIR_ENTRIES  256   /* per-directory entry cap          */
+
+struct sd_walk_ctx {
+    fat32_t      *fs;
+    vfs_node_t   *parent[8];      /* parent VFS node per depth level  */
+    int           remaining[8];   /* per-level entry budget           */
+};
+
+static void sd_visit(const char *name, int is_dir, unsigned long size,
+                     unsigned int first_cluster, int depth, void *vctx)
+{
+    struct sd_walk_ctx *c = (struct sd_walk_ctx *)vctx;
+    if (depth < 0 || depth >= 8)              return;
+    if (c->parent[depth] == 0)                return;
+    if (c->remaining[depth] <= 0)             return;
+    c->remaining[depth]--;
+
+    vfs_node_t *node;
+    if (is_dir) {
+        node = vfs_mkdir(c->parent[depth], name);
+        if (node && depth + 1 < SD_MAX_DEPTH && depth + 1 < 8) {
+            /* Recurse one cluster-chain deep.  Set up the next-level
+             * context fields first so the recursive sd_visit calls
+             * land in this newly-created VFS subdir. */
+            c->parent[depth + 1]    = node;
+            c->remaining[depth + 1] = SD_MAX_DIR_ENTRIES;
+            fat32_walk_dir(c->fs, first_cluster, depth + 1, sd_visit, c);
+            c->parent[depth + 1] = 0;
+        }
+    } else {
+        node = vfs_create_file(c->parent[depth], name);
+        if (node) {
+            /* Record the real on-disk size without copying contents. */
+            node->size = size;
+        }
+    }
+}
+
+/* Mount real SD-card FAT32 partition under /sd/.  No-op (graceful
+ * fallback) if the controller fails to init or the partition isn't
+ * FAT32; that lets the QEMU / Pi 5 builds compile and run identically
+ * to before. */
+static void vfs_mount_sd(void)
+{
+    vfs_node_t *sd = vfs_mkdir(vfs_root(), "sd");
+    if (sd == 0) return;
+
+    if (sd_init() != 0) return;
+
+    fat32_t fs;
+    if (fat32_mount(&fs) != 0) return;
+
+    struct sd_walk_ctx ctx = {0};
+    ctx.fs           = &fs;
+    ctx.parent[0]    = sd;
+    ctx.remaining[0] = SD_MAX_DIR_ENTRIES;
+    fat32_walk_dir(&fs, fs.root_cluster, 0, sd_visit, &ctx);
 }
 
 /* ---- VFS demo: populate a small tree at boot ------------------- */
@@ -422,15 +495,23 @@ void kernel_main(void)
      *        non-zero at boot. */
     vfs_populate_demo();
     {
-        /* Print node count via the existing puts_kb (which shifts
-         * right by 10), pre-shift left so the displayed number is
-         * the actual node count. */
         unsigned long count = vfs_node_count();
         uart_puts("vfs: tmpfs populated (");
         puts_kb(count << 10);
         uart_puts(" nodes, ");
         puts_kb(vfs_total_file_bytes() << 10);
         uart_puts(" file bytes)\n");
+    }
+
+    /* Mount the SD card's FAT32 partition under /sd/.  Silently
+     * skipped on builds where SD_BASE isn't defined (Pi 5 / QEMU) —
+     * the /sd directory will simply not appear in the VFS tree. */
+    vfs_mount_sd();
+    {
+        unsigned long count = vfs_node_count();
+        uart_puts("sd: total VFS now ");
+        puts_kb(count << 10);
+        uart_puts(" nodes\n");
     }
 
     uart_puts("\n");

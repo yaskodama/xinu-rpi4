@@ -45,7 +45,7 @@ OBJCOPY  = $(GCCPATH)/bin/$(CROSS)objcopy
 
 # ----- source discovery -----------------------------------------------
 COMPONENTS = loader mem system shell fs \
-             device/uart device/mbox device/video
+             device/uart device/mbox device/video device/sd
 
 C_SRCS := $(foreach d,$(COMPONENTS),$(wildcard ../$(d)/*.c))
 S_SRCS := $(foreach d,$(COMPONENTS),$(wildcard ../$(d)/*.S))
@@ -83,6 +83,7 @@ PI5_CFLAGS  = $(COMMON) -mcpu=cortex-a76 \
 PI4_CFLAGS  = $(COMMON) -mcpu=cortex-a72 \
               -DUART0_BASE=0xFE201000UL \
               -DMBOX_BASE=0xFE00B880UL \
+              -DSD_BASE=0xFE340000UL \
               -DHEAP_END=0x40000000UL \
               -DBOARD_NAME=\"Pi4\" \
               -DSOC_NAME=\"BCM2711\" \

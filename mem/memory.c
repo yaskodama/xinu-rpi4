@@ -127,3 +127,28 @@ int mem_free_block_count(void)
     while (curr != 0) { n++; curr = curr->mnext; }
     return n;
 }
+
+/* ===================================================================
+ * Bare-metal libc-ish helpers.
+ *
+ * GCC silently lowers things like `= {0}` struct-initialisers and
+ * pass-by-value struct returns into memset / memcpy calls — and we
+ * don't link a standard library.  Providing these tiny versions here
+ * keeps the linker quiet without bringing in newlib.  Names are
+ * the standard ones so the compiler's implicit calls resolve.
+ * =================================================================== */
+void *memset(void *dst, int c, unsigned long n)
+{
+    unsigned char  v = (unsigned char)c;
+    unsigned char *p = (unsigned char *)dst;
+    for (unsigned long i = 0; i < n; i++) p[i] = v;
+    return dst;
+}
+
+void *memcpy(void *dst, const void *src, unsigned long n)
+{
+    unsigned char       *d = (unsigned char *)dst;
+    const unsigned char *s = (const unsigned char *)src;
+    for (unsigned long i = 0; i < n; i++) d[i] = s[i];
+    return dst;
+}
