@@ -14,6 +14,7 @@
 
 #include "uart.h"
 #include "genet.h"
+#include "actor.h"
 
 extern int genet_tx_frame(const unsigned char *frame, int length);
 
@@ -218,6 +219,136 @@ static int tcp_send(unsigned char flags, const char *payload, int payload_len)
     return genet_tx_frame((const unsigned char *)tx_frame, send_len);
 }
 
+/* =====================================================================
+ * Minimal HTTP/1.0 layer (Phase H1/B1).
+ *
+ * On an ESTABLISHED connection the first data segment is treated as an
+ * HTTP request.  We route the GET path to the actor layer and reply
+ * with a small JSON (or HTML) body, then close.  No libc, so tiny
+ * string helpers are inlined.  Routes:
+ *   GET /                         -> text status
+ *   GET /api/actors               -> JSON actor list
+ *   GET /send?to=N&m=METHOD&arg=X -> deliver msg to actor N, JSON result
+ * =================================================================== */
+
+static int s_put(char *b, int pos, const char *s)
+{
+    while (*s) b[pos++] = *s++;
+    return pos;
+}
+
+static int s_putdec(char *b, int pos, long v)
+{
+    char t[16]; int n = 0;
+    if (v < 0) { b[pos++] = '-'; v = -v; }
+    if (v == 0) { b[pos++] = '0'; return pos; }
+    while (v) { t[n++] = (char)('0' + (v % 10)); v /= 10; }
+    while (n--) b[pos++] = t[n];
+    return pos;
+}
+
+/* Locate "key=" in NUL-terminated `req` and copy its value (up to the
+ * next '&', ' ' or end) into out[0..max-1].  Returns 1 if found. */
+static int q_param(const char *req, const char *key, char *out, int max)
+{
+    for (const char *p = req; *p; p++) {
+        const char *k = key; const char *q = p;
+        while (*k && *q == *k) { q++; k++; }
+        if (*k == 0 && *q == '=') {       /* matched "key=" */
+            q++;
+            int i = 0;
+            while (*q && *q != '&' && *q != ' ' && i < max - 1)
+                out[i++] = *q++;
+            out[i] = 0;
+            return 1;
+        }
+    }
+    out[0] = 0;
+    return 0;
+}
+
+static int q_int(const char *req, const char *key, int dflt)
+{
+    char v[16];
+    if (!q_param(req, key, v, sizeof v)) return dflt;
+    int neg = 0, i = 0, n = 0;
+    if (v[0] == '-') { neg = 1; i = 1; }
+    for (; v[i] >= '0' && v[i] <= '9'; i++) n = n * 10 + (v[i] - '0');
+    return neg ? -n : n;
+}
+
+/* Path begins right after "GET " and runs to the next space. */
+static int path_eq(const char *req, const char *lit)
+{
+    if (req[0]!='G'||req[1]!='E'||req[2]!='T'||req[3]!=' ') return 0;
+    const char *p = req + 4;
+    while (*lit && *p == *lit) { p++; lit++; }
+    return *lit == 0 && (*p == ' ' || *p == '?');
+}
+
+/* Build the HTTP response for NUL-terminated request `req` into `out`
+ * (capacity `max`).  Returns the byte length. */
+static int http_build(const char *req, char *out, int max)
+{
+    char body[640];
+    int  bl = 0;
+    const char *ctype = "application/json";
+    (void)max;
+
+    if (path_eq(req, "/send")) {
+        int  to  = q_int(req, "to", -1);
+        int  arg = q_int(req, "arg", 0);
+        char method[ACTOR_NAMELEN];
+        if (!q_param(req, "m", method, sizeof method)) method[0] = 0;
+        int result = 0;
+        int rc = actor_message(to, method, arg, &result);
+        bl = s_put(body, bl, "{\"ok\":");
+        bl = s_putdec(body, bl, rc == 0 ? 1 : 0);
+        bl = s_put(body, bl, ",\"actor\":");
+        bl = s_putdec(body, bl, to);
+        bl = s_put(body, bl, ",\"method\":\"");
+        bl = s_put(body, bl, method);
+        bl = s_put(body, bl, "\",\"result\":");
+        bl = s_putdec(body, bl, result);
+        bl = s_put(body, bl, "}\n");
+    } else if (path_eq(req, "/api/actors")) {
+        int n = actor_count();
+        bl = s_put(body, bl, "{\"actors\":[");
+        for (int i = 0; i < n; i++) {
+            if (i) bl = s_put(body, bl, ",");
+            bl = s_put(body, bl, "{\"id\":");
+            bl = s_putdec(body, bl, i);
+            bl = s_put(body, bl, ",\"name\":\"");
+            bl = s_put(body, bl, actor_name(i));
+            bl = s_put(body, bl, "\",\"value\":");
+            bl = s_putdec(body, bl, actor_field(i, 0));
+            bl = s_put(body, bl, ",\"msgs\":");
+            bl = s_putdec(body, bl, actor_field(i, 1));
+            bl = s_put(body, bl, "}");
+        }
+        bl = s_put(body, bl, "]}\n");
+    } else if (path_eq(req, "/")) {
+        ctype = "text/plain";
+        bl = s_put(body, bl, "xinu-rpi5 (Pi 4) actor HTTP gateway\n"
+                             "GET /api/actors\n"
+                             "GET /send?to=<id>&m=<bump|add|set|get|reset>&arg=<n>\n");
+    } else {
+        ctype = "text/plain";
+        bl = s_put(body, bl, "404 not found\n");
+    }
+    body[bl] = 0;
+
+    /* Headers + body. */
+    int p = 0;
+    p = s_put(out, p, "HTTP/1.0 200 OK\r\nContent-Type: ");
+    p = s_put(out, p, ctype);
+    p = s_put(out, p, "\r\nConnection: close\r\nContent-Length: ");
+    p = s_putdec(out, p, bl);
+    p = s_put(out, p, "\r\n\r\n");
+    for (int i = 0; i < bl; i++) out[p++] = body[i];
+    return p;
+}
+
 /* Handle one received Ethernet frame.  Returns 1 if it was TCP-for-us
  * (consumed), 0 otherwise. */
 int tcp_handle_packet(const unsigned char *frame, int len)
@@ -308,16 +439,9 @@ int tcp_handle_packet(const unsigned char *frame, int len)
         if ((flags & TCP_FLAG_ACK) && ack == g_conn.my_seq) {
             g_conn.state = TCP_ESTABLISHED;
             g_estab++;
-            uart_puts("tcp: ESTABLISHED\n");
-            if (!g_conn.greeted) {
-                static const char hello[] =
-                    "Hello from xinu-rpi5 (Pi 4, BCM2711)!\r\n"
-                    "Type ENTER to close.\r\n";
-                int n = (int)(sizeof(hello) - 1);
-                tcp_send(TCP_FLAG_PSH | TCP_FLAG_ACK, hello, n);
-                g_conn.my_seq += n;
-                g_conn.greeted = 1;
-            }
+            uart_puts("tcp: ESTABLISHED (await HTTP request)\n");
+            /* HTTP: the client sends the request first; we reply when
+             * its data arrives (see the ESTABLISHED data path). */
             return 1;
         }
         return 1;
@@ -330,24 +454,27 @@ int tcp_handle_packet(const unsigned char *frame, int len)
             return 1;
         }
         if (data_len > 0) {
-            /* Echo characters back, advance peer_seq, ACK. */
-            char echo[80];
-            int n = data_len < (int)sizeof(echo) ? data_len : (int)sizeof(echo);
-            for (int i = 0; i < n; i++) echo[i] = (char)data[i];
-            g_conn.peer_seq = seq + data_len;
-            tcp_send(TCP_FLAG_PSH | TCP_FLAG_ACK, echo, n);
-            g_conn.my_seq += n;
+            /* Treat the first data segment as an HTTP request: copy it
+             * out of the (volatile) rx buffer, route it through the
+             * actor layer, send the response, then close.  A simple GET
+             * fits in one segment, which is all we handle here. */
+            static char http_req[600];
+            static char http_resp[1400];
+            int n = data_len < (int)sizeof(http_req) - 1
+                  ? data_len : (int)sizeof(http_req) - 1;
+            for (int i = 0; i < n; i++) http_req[i] = (char)data[i];
+            http_req[n] = 0;
+            g_conn.peer_seq = seq + data_len;     /* ack the whole request */
 
-            /* If we saw a newline, close the connection. */
-            for (int i = 0; i < n; i++) {
-                if (echo[i] == '\r' || echo[i] == '\n') {
-                    tcp_send(TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0);
-                    g_conn.my_seq += 1;
-                    g_conn.state = TCP_FIN_WAIT_1;
-                    uart_puts("tcp: FIN sent (got newline)\n");
-                    break;
-                }
-            }
+            int rlen = http_build(http_req, http_resp, (int)sizeof http_resp);
+            tcp_send(TCP_FLAG_PSH | TCP_FLAG_ACK, http_resp, rlen);
+            g_conn.my_seq += rlen;
+
+            /* Close immediately (HTTP/1.0 Connection: close). */
+            tcp_send(TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0);
+            g_conn.my_seq += 1;
+            g_conn.state = TCP_FIN_WAIT_1;
+            uart_puts("http: served request, FIN sent\n");
             return 1;
         }
         if (flags & TCP_FLAG_FIN) {

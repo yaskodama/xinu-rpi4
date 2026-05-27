@@ -45,6 +45,15 @@ extern const unsigned char font8x8[96][8];
 unsigned int video_screen_width(void);
 unsigned int video_screen_height(void);
 
+/* Double buffering (anti-flicker).  video_enable_backbuffer() allocates
+ * an off-screen render target the size of the framebuffer and points all
+ * drawing primitives at it (returns 1 on success, 0 if no memory — in
+ * which case drawing stays direct).  video_present() copies the finished
+ * off-screen frame to the visible framebuffer in one pass.  Call
+ * enable once, then present() at the end of every rendered frame. */
+int  video_enable_backbuffer(void);
+void video_present(void);
+
 /* Viewport (camera) on a larger virtual desktop.  All drawing
  * primitives below (fill_rect / draw_rect / draw_string_at /
  * draw_glyph_at) accept *virtual* desktop coordinates and apply

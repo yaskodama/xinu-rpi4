@@ -799,11 +799,15 @@ void kernel_main(void)
      * handshake, prints a greeting, echoes keystrokes, and closes on
      * the first newline.  Dispatch is wired in genet_rx_tick(). */
     {
+        extern void actor_init(void);
         unsigned char mymac[6] = { 0xd8, 0x3a, 0xdd, 0xa7, 0xfd, 0xbf };
+        actor_init();          /* demo actors: 0=counter, 1=store */
         tcp_set_mac(mymac);
-        tcp_listen(8023);   /* high port — telnet/23 is often firewalled */
+        tcp_listen(80);        /* HTTP actor gateway */
     }
-    uart_puts("net: TCP listener on port 8023 — `nc 192.168.3.100 8023`\n");
+    uart_puts("net: HTTP actor gateway on port 80\n");
+    uart_puts("     curl http://192.168.3.100/api/actors\n");
+    uart_puts("     curl 'http://192.168.3.100/send?to=0&m=bump'\n");
 
     uart_puts("\n");
     uart_puts("Round 1: B/U/M1/S0/X0 done.\n");

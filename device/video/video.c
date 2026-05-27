@@ -2,13 +2,16 @@
 
 #include "video.h"
 #include "mbox.h"
+#include "memory.h"   /* getmem() for the optional double-buffer */
 
 /* 16-byte aligned request buffer for the framebuffer-allocation
  * property tag sequence.  The exact tag IDs and layout are the
  * standard VC mailbox property interface, unchanged from Pi 2/3/4. */
 static volatile unsigned int __attribute__((aligned(16))) mbox_buf[36];
 
-static volatile unsigned char *fb_base;
+static volatile unsigned char *fb_base;     /* visible HDMI framebuffer  */
+static volatile unsigned char *fb_draw;     /* current render target     */
+static volatile unsigned char *fb_back;     /* off-screen buffer (or 0)  */
 static unsigned int            fb_pitch;
 static unsigned int            fb_width;
 static unsigned int            fb_height;
@@ -95,6 +98,8 @@ int video_init(void)
     if (pitch_idx == 0) return -1;
 
     fb_base   = (volatile unsigned char *)(unsigned long)fb_addr;
+    fb_draw   = fb_base;        /* draw direct until a back buffer is set */
+    fb_back   = 0;
     fb_pitch  = mbox_buf[pitch_idx];
     fb_width  = SCREEN_WIDTH;
     fb_height = SCREEN_HEIGHT;
@@ -123,7 +128,7 @@ static void draw_glyph(int col, int row, char c)
     for (int gy = 0; gy < FONT_HEIGHT; gy++) {
         unsigned char bits = glyph[gy];
         unsigned int *line =
-            (unsigned int *)(fb_base + (py + gy) * fb_pitch + px * 4);
+            (unsigned int *)(fb_draw + (py + gy) * fb_pitch + px * 4);
         for (int gx = 0; gx < FONT_WIDTH; gx++) {
             line[gx] = (bits & (0x80 >> gx)) ? color_fg : color_bg;
         }
@@ -134,13 +139,13 @@ static void scroll_one_row(void)
 {
     /* Move every row up by FONT_HEIGHT pixels, then clear the bottom. */
     for (unsigned int y = 0; y < fb_height - FONT_HEIGHT; y++) {
-        unsigned int *dst = (unsigned int *)(fb_base + y * fb_pitch);
+        unsigned int *dst = (unsigned int *)(fb_draw + y * fb_pitch);
         unsigned int *src =
-            (unsigned int *)(fb_base + (y + FONT_HEIGHT) * fb_pitch);
+            (unsigned int *)(fb_draw + (y + FONT_HEIGHT) * fb_pitch);
         for (unsigned int x = 0; x < fb_width; x++) dst[x] = src[x];
     }
     for (unsigned int y = fb_height - FONT_HEIGHT; y < fb_height; y++) {
-        unsigned int *row = (unsigned int *)(fb_base + y * fb_pitch);
+        unsigned int *row = (unsigned int *)(fb_draw + y * fb_pitch);
         for (unsigned int x = 0; x < fb_width; x++) row[x] = color_bg;
     }
 }
@@ -197,6 +202,34 @@ void screen_puts(const char *s)
 unsigned int video_screen_width(void)  { return fb_width;  }
 unsigned int video_screen_height(void) { return fb_height; }
 
+/* ---- double buffering (anti-flicker) ----
+ * The window manager redraws the whole screen every frame, including a
+ * full background wipe.  Drawing that straight to the visible HDMI
+ * framebuffer makes the "wipe then redraw" visible as flicker.  Instead
+ * we allocate an off-screen buffer the size of the framebuffer, point
+ * all rendering at it, and copy the finished frame to the visible
+ * buffer in one pass via video_present().  If the allocation fails we
+ * just keep drawing direct (unchanged behaviour, still flickers). */
+int video_enable_backbuffer(void)
+{
+    if (!fb_ready) return 0;
+    if (fb_back)   { fb_draw = fb_back; return 1; }   /* already enabled */
+    void *p = getmem((unsigned long)fb_height * fb_pitch);
+    if (!p) return 0;                  /* no memory — draw direct */
+    fb_back = (volatile unsigned char *)p;
+    fb_draw = fb_back;
+    return 1;
+}
+
+void video_present(void)
+{
+    if (!fb_ready || fb_draw == fb_base) return;   /* nothing to flip */
+    volatile unsigned int *dst = (volatile unsigned int *)fb_base;
+    volatile unsigned int *src = (volatile unsigned int *)fb_draw;
+    unsigned int n = (fb_height * fb_pitch) / 4;
+    for (unsigned int i = 0; i < n; i++) dst[i] = src[i];
+}
+
 /* Viewport offset: subtracted from every virtual-coord input
  * before it touches the framebuffer.  All primitives also clip
  * to [0, fb_width) × [0, fb_height) so off-screen geometry
@@ -223,7 +256,7 @@ void fill_rect(int x, int y, int w, int h, unsigned int color)
 
     for (int dy = 0; dy < h; dy++) {
         unsigned int *row =
-            (unsigned int *)(fb_base + (sy + dy) * fb_pitch + sx * 4);
+            (unsigned int *)(fb_draw + (sy + dy) * fb_pitch + sx * 4);
         for (int dx = 0; dx < w; dx++) row[dx] = color;
     }
 }
@@ -257,7 +290,7 @@ void draw_glyph_at(int px, int py, char c,
         if (rsy < 0 || rsy >= (int)fb_height) continue;
         unsigned char bits = glyph[gy];
         unsigned int *line =
-            (unsigned int *)(fb_base + rsy * fb_pitch);
+            (unsigned int *)(fb_draw + rsy * fb_pitch);
         for (int gx = 0; gx < FONT_WIDTH; gx++) {
             int rsx = sx + gx;
             if (rsx < 0 || rsx >= (int)fb_width) continue;

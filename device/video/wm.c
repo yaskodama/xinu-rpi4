@@ -146,6 +146,12 @@ void wm_run(void)
     int sw = (int)video_screen_width();
     int sh = (int)video_screen_height();
 
+    /* Render off-screen so the per-frame full-screen wipe + redraw never
+     * shows as flicker; each finished frame is flipped to the visible
+     * framebuffer in one pass via video_present().  Falls back to direct
+     * drawing if the buffer can't be allocated. */
+    video_enable_backbuffer();
+
     /* Initial desktop wipe (screen-space, viewport bypass). */
     video_set_viewport(0, 0);
     fill_rect(0, 0, sw, sh, DESKTOP_BG);
@@ -190,6 +196,7 @@ void wm_run(void)
         }
 
         draw_cursor();   /* screen-space overlay, always on top */
+        video_present(); /* flip the finished off-screen frame to HDMI */
         delay_ms(1000 / DEFAULT_FPS);
         frame++;
     }

@@ -69,8 +69,15 @@ VPATH := $(addprefix ../,$(COMPONENTS))
 
 # ----- flags ----------------------------------------------------------
 INCLUDE = -I../include -I../extern/xinu-raz-include
+# -mstrict-align: the MMU is off, so all DRAM is Device-nGnRnE on AArch64
+# where unaligned accesses fault.  Without this, GCC -O2 happily folds
+# byte loops and byte-OR idioms into wider str/ldr/stp that are only
+# 4-byte aligned and data-abort at runtime (this is what silently hung
+# the box on the first TCP segment, and again inside actor_init()).
+# -mstrict-align makes the compiler never emit an unaligned access, which
+# removes that whole class of landmine kernel-wide.
 COMMON  = -Wall -O2 -ffreestanding -nostdinc -nostdlib -nostartfiles \
-          -mgeneral-regs-only $(INCLUDE)
+          -mgeneral-regs-only -mstrict-align $(INCLUDE)
 
 # Pi 5 (BCM2712, Cortex-A76).  Peripheral base 0x107C000000; PL011 at
 # 0x107D001000; mailbox at 0x107C00B880 (best-effort, unverified on
