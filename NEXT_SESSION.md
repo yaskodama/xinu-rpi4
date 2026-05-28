@@ -1,18 +1,23 @@
 # NEXT_SESSION — xinu-rpi5
 
-## ✅ 2026-05-28 — JIT 暴走ループ保護 (実行予算)
+## ✅ 2026-05-28 — JIT 暴走ループ保護 (★実時間ベース。反復予算版は実機ウェッジで失敗)
 
-ネット公開 `/compile` は任意コードを同期 JIT 実行するので、`while(1){}` が Pi を固める
-リスクがあった。**ループ back-edge に実行予算チェックを挿入**して防止:
-- `cc/cc.c`: `cc_tick()` (予算 `CC_BUDGET=2億`、使い切ると 0 を返し `g_aborted` を立てる)、
-  外部シンボル `__cc_tick` 登録、実行前にリセット、中断時は出力に
-  `cc: aborted (runaway loop budget exhausted)` を注記。
+ネット公開 `/compile` は任意コードを **genet_rx_tick 内で同期 JIT 実行**するので、`while(1){}`
+が Pi を固めるリスク。**ループ back-edge に打ち切りチェックを挿入**して防止:
 - `cc/codegen.c`: while/for の back-edge (`b lbegin` 直前) に `emit_budget_check(lend)`
-  = `bl cc_tick; cbz x0, lend`。予算切れで全ループが脱出し、関数が return して unwind。
-- **QEMU 検証**: `while(i>=0){i=i+1;}` → 中断・注記表示・**シェル生存**、直後の fib=55 正常、
-  AIPL 由来 Summer(while×100)=5050 回帰 OK。3 ターゲット clean build (kernel8.img 101000)。
-- ⚠️ 現 flash 済 de61f41f には未反映 (実機 /compile を守るには要・次回 flash)。
-  ★残: 深い無限再帰はスタックオーバーフローで fault しうる (loop 予算では捕捉外)。
+  = `bl __cc_tick; cbz x0, lend`。打ち切りで全ループが脱出→関数 return で unwind。
+- `cc/cc.c`: `cc_tick()` は **実時間 (CNTPCT_EL0) で `CC_TIMEOUT_MS=100` を超えたら 0 を返す**
+  (`cc_set_deadline()` を実行前に。`g_aborted` 時は出力に注記)。外部シンボル `__cc_tick`。
+- ★★**反復回数ベース (2億) は失敗**: MMU/キャッシュ off で 1 反復が遅く、2億反復が実機で数十秒に。
+  JIT は **genet_rx_tick 内で同期実行**するため、その間ディスパッチが止まり **GENET RX リングが溢れて
+  永続ウェッジ** (実機 ping 100% loss → 要電源再投入)。QEMU はネット無しで露見せず。
+  → **実時間打ち切り (~100ms)** に変更し、キャッシュ速度に依存せずディスパッチ停止を ~100ms に限定。
+- **QEMU 検証 (時間版)**: `while(i>=0){i=i+1;}` → ~100ms で中断・注記・**シェル生存**、fib=55、
+  Summer(while×100)=5050 回帰 OK。kernel8.img md5 `74956e27`。
+- ⚠️ **要・実機 flash + 検証** (反復版 851d2baa が flash 済だが危険なので使わない)。flash 後は
+  実機で while(1) を /compile に投げ、~100ms で aborted + 並行 ping 生存を確認すること。
+- ★残: 深い無限再帰はスタックオーバーフローで fault しうる (loop 打ち切りでは捕捉外)。根本解決は
+  S1 (preemptive timer) で JIT をディスパッチから切り離すこと。
 
 ## ✅ 2026-05-28 — AIPL→C 変換器を /compile 向けに retarget (実機検証済)
 

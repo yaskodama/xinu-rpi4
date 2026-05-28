@@ -93,17 +93,33 @@ static void emit_dec(long v)
 
 /* ---------- runaway-loop guard ---------- */
 /* The compiler injects a call to cc_tick() at every loop back-edge.  It
- * returns 1 while budget remains and 0 once exhausted, which makes the
- * generated code break out of the loop — so a `while(1){}` submitted to
- * /compile cannot hard-hang the device. */
-#define CC_BUDGET 200000000L
-static long g_budget;
-static int  g_aborted;
+ * returns 1 while time remains and 0 once a WALL-CLOCK deadline passes,
+ * which makes the generated code break out of the loop.  Time-based (via
+ * the generic timer) rather than an iteration count, because the MMU/
+ * caches are off so per-iteration speed is unpredictable — and, crucially,
+ * the JIT runs synchronously inside genet_rx_tick, so a runaway must abort
+ * within a few tens of ms or the GENET RX ring overflows and the network
+ * wedges.  CC_TIMEOUT_MS bounds that dispatch stall. */
+#define CC_TIMEOUT_MS 100
+static unsigned long g_deadline;
+static int           g_aborted;
 
+static unsigned long cc_now(void)
+{
+    unsigned long t;
+    __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(t));
+    return t;
+}
+static void cc_set_deadline(void)
+{
+    unsigned long frq;
+    __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(frq));
+    g_deadline = cc_now() + (frq / 1000UL) * CC_TIMEOUT_MS;
+    g_aborted = 0;
+}
 static int cc_tick(void)
 {
-    if (g_budget <= 0) { g_aborted = 1; return 0; }
-    g_budget--;
+    if (cc_now() >= g_deadline) { g_aborted = 1; return 0; }
     return 1;
 }
 
@@ -183,7 +199,7 @@ static int compile_run_core(const char *src, unsigned long n, long *retval)
     if (cc_failed() || len < 0) { if (code) kfree(code); arena_free(); return -1; }
 
     cc_sync_icache(code, (unsigned long)len);
-    g_budget = CC_BUDGET; g_aborted = 0;
+    cc_set_deadline();
     long (*entryfn)(void) = (long (*)(void))(code + entry);
     long rc = entryfn();
     if (retval) *retval = rc;
@@ -202,7 +218,7 @@ int cc_run_source(const char *src, int srclen, char *out, int outcap, long *retv
     int rc = compile_run_core(src, (unsigned long)(srclen < 0 ? 0 : srclen), &rv);
 
     if (rc == 0 && g_aborted && g_cap) {
-        const char *note = "cc: aborted (runaway loop budget exhausted)\n";
+        const char *note = "cc: aborted (ran past the 100ms runaway-loop deadline)\n";
         for (int i = 0; note[i] && g_caplen < g_capcap - 1; i++) g_cap[g_caplen++] = note[i];
     }
     if (g_cap) { g_cap[(g_caplen < g_capcap) ? g_caplen : (g_capcap - 1)] = 0; }
