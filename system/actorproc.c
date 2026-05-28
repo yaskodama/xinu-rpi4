@@ -31,6 +31,15 @@ void ap_set_dispatch(long (*fn)(long, long, long, long, long, long)) { g_actor_d
 
 void ap_reset(void)
 {
+    /* Reap any actors still live from a previous run (e.g. a resident set
+     * loaded via /actor/load).  Without this, a later /compile would only
+     * drop our references (pid=-1) and leak the Xinu process slots; once
+     * NPROC is exhausted, ap_spawn starts returning -1, which the JIT
+     * runtime then uses as a g_obj[] index — corrupting memory and wedging
+     * the box.  /compile and a resident set therefore do not coexist: the
+     * first /compile reaps the residents. */
+    for (int i = 0; i < g_nact; i++)
+        if (g_act[i].pid > 0) proc_kill(g_act[i].pid);
     for (int i = 0; i < AP_NACT; i++) {
         g_act[i].head = g_act[i].tail = 0;
         g_act[i].pid = -1;

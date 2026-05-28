@@ -47,6 +47,28 @@ static struct procent *ready_pop(void)
     return p;
 }
 
+/* Unlink `target` from the ready list if present.  A killed process MUST
+ * leave the ready list: otherwise ready_pop() could later hand back a
+ * PR_FREE slot, and — worse — once that slot is reused (e.g. by a new
+ * actor) the stale link makes ready_push wire the node to itself, so
+ * ready_pop returns the *running* process and proc_block ctxsw()'s into a
+ * frame the process has already overwritten (return address = garbage). */
+static void ready_remove(struct procent *target)
+{
+    struct procent *prev = 0, *curr = ready_head;
+    while (curr) {
+        if (curr == target) {
+            if (prev) prev->next = curr->next;
+            else      ready_head = curr->next;
+            if (ready_tail == curr) ready_tail = prev;
+            curr->next = 0;
+            return;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+}
+
 void proc_init(void)
 {
     int i;
@@ -178,6 +200,7 @@ void proc_kill(int pid)
     if (pid <= 0 || pid >= NPROC || pid == currpid) return;
     struct procent *p = &proctab[pid];
     if (p->state == PR_FREE) return;
+    ready_remove(p);                /* never leave a freed slot on the ready list */
     if (p->stkbase) freemem(p->stkbase, p->stklen);
     p->stkbase = 0;
     p->state   = PR_FREE;
