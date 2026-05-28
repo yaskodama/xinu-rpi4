@@ -372,7 +372,7 @@ static int http_build(const char *req, char *out, int max)
          * plus "=> <return value>".  Source is the POST body, or the
          * url-encoded `src` query param for a GET. */
         ctype = "text/plain";
-        static char src[2048];
+        static char src[7168];
         int slen = 0;
         if (req[0] == 'P') {
             int he = find_header_end(req);
@@ -382,7 +382,7 @@ static int http_build(const char *req, char *out, int max)
                 src[slen] = 0;
             }
         } else {
-            static char enc[2048];
+            static char enc[7168];
             if (q_param(req, "src", enc, sizeof enc)) slen = url_decode(enc, src, sizeof src);
         }
 
@@ -397,7 +397,7 @@ static int http_build(const char *req, char *out, int max)
          * the C source; main() spawns the actors and they stay alive for
          * later /actor/send messages. */
         ctype = "text/plain";
-        static char asrc[2048];
+        static char asrc[7168];
         int aslen = 0;
         if (req[0] == 'P') {
             int he = find_header_end(req);
@@ -407,7 +407,7 @@ static int http_build(const char *req, char *out, int max)
                 asrc[aslen] = 0;
             }
         } else {
-            static char aenc[2048];
+            static char aenc[7168];
             if (q_param(req, "src", aenc, sizeof aenc)) aslen = url_decode(aenc, asrc, sizeof asrc);
         }
         static char ares[1100];
