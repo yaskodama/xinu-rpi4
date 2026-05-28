@@ -1,5 +1,17 @@
 # NEXT_SESSION — xinu-rpi4
 
+## ✅ 2026-05-28 — map/filter 高階関数化 (関数値)
+
+トップレベル `function` を値として扱い `map(l,f)`/`filter(l,p)` を実現。生関数アドレスはオンデバイス cc の
+対応が不明なため、**関数値=int id + JIT 側 `apply(id,x)` ディスパッチャ**(アクター dispatch と同じ登録方式)。
+- cc.c: `g_apply`+`cc_set_apply`、`v_list_map`/`v_list_filter`(新リスト構築、g_apply 経由でコールバック)、
+  extern 登録。両 run パス(compile_run_core/cc_actor_load)で `apply` offset を解決し `cc_set_apply`。
+- translator: トップレベル関数を `fn_<name>` 出力 + id 付与 + `apply(id,x)` 生成。`map`/`filter` の第2引数
+  (関数名 Var)を id に解決。トップレベル関数の直接呼び出し `fn(args)` も対応。構文変更なし。
+- `examples_xinujit/HigherOrder.abcl`(map dbl→[20,40,60,80]、filter>20→[30,40]、dbl(7)=14)。
+  QEMU 全 OK + 回帰(lists/rpc/select/saga/supervised)+ resident後 OK。
+  commit xinu **faa6b60** / abclcp **81b137d**。**未 flash**(現実機 e0fbbf81 は map/filter 未搭載。要再フラッシュ)。
+
 ## ✅ 2026-05-28 — リスト / コレクション型 (value_t)
 
 AIPL の式レベルのリスト構文は最小限(リテラル `[..]` の式規則無し、添字は定数のみ)。共有 parser 拡張は
