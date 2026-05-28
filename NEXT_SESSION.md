@@ -1,5 +1,24 @@
 # NEXT_SESSION — xinu-rpi4
 
+## ✅ 2026-05-28 — オンデバイス LLM（Ollama 風ローダ・極小スケール）
+
+「ローカルモデルを読み込み端末上で推論」を llama2.c 方式で実装。フル Ollama は不可（Go+llama.cpp+GGUF+
+GPU）だが、極小 Llama-2 をカーネルに埋め込んで推論。
+- モデル: Karpathy stories260K（dim64/5層/8head/**GQA** kv4/vocab512/fp32, ~1MB）+ tok512。**legacy
+  llama2.c 形式**（freq_cis 同梱 + GQA + 共有分類器）。`llm/blob.S` が `.incbin` で .rodata 埋め込み
+  （image ~120KB→~1.2MB）。**ネットワーク取得可**（HF）だったので本物を取得・埋め込み。
+- `llm/llm.c`: config/重みローダ、forward(RMSNorm/RoPE/GQA-attn/SwiGLU/logits)、greedy sampler、
+  BPE トークナイザ(encode + `<0xHH>` byte-fallback decode)、`llm [prompt]` シェルコマンド。
+  `-mgeneral-regs-only` 外して FP ビルド(cc.o 同様)。`fsqrt` インライン asm + 自前 `exp`(libm 無し)。
+- **検証**: Python リファレンス(同形式)で coherent TinyStories 確認 → C 移植を QEMU で照合。
+  `llm`→" Anna and Ben are friends. They like to play..."、`llm Lily went to the`→coherent 継続。
+  float/double 丸め差で Python とは別の話になるが両方正しい(forward 正常の証左)。greedy は繰り返す癖。
+- **wedge 対策**: D-cache OFF で推論が遅く、生成中は wm ループ(=genet_rx_tick 駆動)がブロックされる。
+  各層末で RX リングをドレイン(`genet_rx_poll`/`release`、weak シンボルで QEMU/Pi5 は no-op)。HTTP /llm は
+  当面追加せず(アクティブ接続での wedge 回避)。シェル(シリアル)経由のみ。
+- commit xinu **a3a6aeb**(モデル .bin 含む)。**未 flash**。実機初回は**速度未知**(D-cache OFF) — 焼いて
+  トークン速度と wedge 有無を実測する。遅すぎ/wedge なら層内ドレイン頻度↑ or float 最適化 or D-cache 検討。
+
 ## ✅ 2026-05-28 — map/filter 高階関数化 (関数値)
 
 トップレベル `function` を値として扱い `map(l,f)`/`filter(l,p)` を実現。生関数アドレスはオンデバイス cc の
