@@ -661,6 +661,8 @@ extern int cmd_cp(int, char **);
 extern int cmd_mv(int, char **);
 /* C compiler command lives in cc/cc.c. */
 extern int cmd_cc(int, char **);
+/* Virtual-memory translation demo lives in system/mmu.c. */
+extern int cmd_vmtest(int, char **);
 
 static const struct centry commandtab[] = {
     { "help",   "list the commands",                       cmd_help   },
@@ -678,6 +680,7 @@ static const struct centry commandtab[] = {
     { "cp",     "cp <src> <dst> — copy a file",            cmd_cp     },
     { "mv",     "mv <src> <dst> — move/rename a file",     cmd_mv     },
     { "cc",     "cc <file.c> — compile & run a C program", cmd_cc     },
+    { "vmtest", "demo: VA->PA virtual-memory translation",  cmd_vmtest },
     { "echo",   "echo the remaining words back",           cmd_echo   },
     { "hello",  "smoke marker — say hello",                cmd_hello  },
     { "mem",    "show __bss_start / __bss_end / _end",     cmd_mem    },

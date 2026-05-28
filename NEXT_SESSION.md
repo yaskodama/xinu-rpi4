@@ -1,5 +1,25 @@
 # NEXT_SESSION — xinu-rpi5
 
+## 🚧 2026-05-28 — 仮想記憶 (MMU) Stage 1–3 完了 (QEMU検証・実機未flash)
+
+MMU オフだった前提を反転。`system/mmu.c` + `include/mmu.h`、`kernel_main` の
+`exception_init()` 直後に `mmu_init()`。3 ターゲット clean build (kernel8 111048 / 2712 98576 /
+virt 98576)。**全段階 QEMU で検証済 (boot/shell/vfs/net/`cc` fib=55・actor=41、暴走 100ms 中断、vmtest)。**
+- **Stage1 MMU有効化+identity+キャッシュ**: 39-bit VA / 4KiB granule。RAM=Normal WB inner-shareable、
+  他=Device-nGnRnE+XN。MAIR/TCR(T0SZ=25,IPS=40bit,EPD1)/TTBR0 → SCTLR.M/C/I。identity で既存
+  ポインタ不変・キャッシュ有効化(JIT 高速化)。
+- **Stage2 W^X 保護**: 3 レベル(L1 1GiB / L2 2MiB / L3 4KiB)。カーネルの 2MiB をページ細分し
+  `.text`=RO+X / `.rodata`=RO+NX / data・bss=RW+NX / heap=RW+X(JIT 用の例外)。link.ld/link_virt.ld に
+  `_etext`+ページ整列追加。コード上書き不可・データ実行不可で起動&JIT 正常。
+- **Stage3 VA→PA 変換実証**: `mmu_map_window()` が 32GiB の仮想窓 `VMAP_VA=0x800000000` を kmalloc
+  したページにマップ。`vmtest` コマンド: VA に書いて PA から読む(逆も)→一致を確認 (translation works)。
+- ⚠️ **実機未フラッシュ**。★実機ではキャッシュ ON が **GENET DMA / mailbox FB を壊す**恐れ
+  (現状 uncached バスエイリアス前提)。実機投入前に DMA バッファを非キャッシュ領域へマップ
+  or キャッシュメンテ(clean/invalidate)が必要。QEMU は実 DMA 無しで安全。
+- 残/次: (a) 実機 DMA コヒーレンシ対応 → 実機フラッシュ、(b) 保護違反を捕捉する recoverable 例外
+  (現状ハンドラは halt 系)、(c) ファイル: `system/mmu.c` `include/mmu.h` `loader/main.c` `shell/shell.c`
+  `compile/link.ld` `compile/link_virt.ld`。**value_t/文字列対応 (task13/14) も保留中**。
+
 ## ✅ 2026-05-28 — JIT 暴走ループ保護 (★実時間ベース。反復予算版は実機ウェッジで失敗)
 
 ネット公開 `/compile` は任意コードを **genet_rx_tick 内で同期 JIT 実行**するので、`while(1){}`

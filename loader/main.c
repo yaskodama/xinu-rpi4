@@ -26,6 +26,7 @@
 #include "shellwin.h"
 #include "softkbd.h"
 #include "exception.h"
+#include "mmu.h"
 #include "gic.h"
 #include "timer.h"
 #include "irq.h"
@@ -675,6 +676,15 @@ void kernel_main(void)
      *       UART/shell window instead of jumping to address 0 and
      *       silently freezing the kernel. */
     exception_init();
+
+    /* Virtual memory: install an identity-mapped page table and turn on
+     * the MMU + D/I caches.  Done right after the exception vectors so a
+     * misconfiguration is reported rather than hanging silently.  The map
+     * is identity, so every pointer below stays valid — we just gain
+     * caching and the attributes later VM stages build on. */
+    uart_puts("mmu: enabling translation + caches...\n");
+    mmu_init();
+    uart_puts("mmu: on (identity-mapped, caches enabled)\n");
 
     /* Try to bring up the HDMI framebuffer before printing anything,
      * so the banner appears on both UART and the monitor.  Failure

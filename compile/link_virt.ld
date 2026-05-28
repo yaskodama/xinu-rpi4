@@ -14,9 +14,12 @@ SECTIONS
         KEEP(*(.text.boot))
         *(.text .text.* .gnu.linkonce.t*)
     }
+    . = ALIGN(4096);
+    _etext = .;                 /* end of code — page-aligned for W^X */
 
     .rodata : { *(.rodata .rodata.* .gnu.linkonce.r*) }
 
+    . = ALIGN(4096);
     PROVIDE(_data = .);
     .data : { *(.data .data.* .gnu.linkonce.d*) }
 
