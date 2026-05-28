@@ -63,6 +63,16 @@ void proc_preempt(void);
 /* Block the current process (removes it from CURR; resched won't re-ready
  * it) until proc_ready() puts it back.  Used by mailbox receive. */
 void proc_block(void);
+
+/* AIPL vheap mutex (spin-yield): serializes the cc/vheap runtime across
+ * actors / app worker / shell so preemption can't interleave two vheap ops.
+ * Acquire around cc execution bursts; aipl_unlock_all/aipl_relock bracket a
+ * voluntary block (ap_select) so the cooperative pump still runs. */
+void aipl_lock(void);
+void aipl_unlock(void);
+int  aipl_unlock_all(void);   /* release fully; returns depth to restore */
+void aipl_relock(int saved);  /* reacquire to a saved depth after a block */
+void aipl_force_release(void);/* drop the lock unconditionally (fault/reset path) */
 /* Free a blocked/ready process's slot + stack (used to reap actor
  * processes after a one-shot run).  Must not be the current process. */
 void proc_kill(int pid);

@@ -48,6 +48,8 @@ void ap_reset(void)
      * first /compile reaps the residents. */
     for (int i = 0; i < g_nact; i++)
         if (g_act[i].pid > 0) proc_kill(g_act[i].pid);
+    aipl_force_release();   /* a fresh run starts with the heap lock clear,
+                             * defending against any stale owner left behind */
     for (int i = 0; i < AP_NACT; i++) {
         g_act[i].head = g_act[i].tail = 0;
         g_act[i].pid = -1;
@@ -121,7 +123,13 @@ long ap_select(long self, int n, const long *meths, struct ap_msg *out)
                 }
             }
         }
-        g_act[s].waiting = 1; proc_block();        /* nothing matches yet */
+        /* Block for a matching message.  Release the vheap lock first so the
+         * actor that will produce it can run (else deadlock); reacquire on
+         * wake.  No-op when called outside a locked handler. */
+        g_act[s].waiting = 1;
+        int held = aipl_unlock_all();
+        proc_block();                              /* nothing matches yet */
+        aipl_relock(held);
     }
 }
 
@@ -132,8 +140,12 @@ static void actor_proc_main(void)
     int self = (int)(long)proctab[currpid].arg;
     struct ap_msg m;
     for (;;) {
-        ap_recv(self, &m);
+        ap_recv(self, &m);                  /* idle wait: no vheap lock held */
         g_cur_reply[self] = m.reply_to;     /* read in the crash path (m may be clobbered) */
+        /* Hold the vheap lock for the duration of the handler so a preemption
+         * can't interleave another vheap user (it spin-yields to us).  The
+         * net process never takes the lock, so it still preempts us freely. */
+        aipl_lock();
         /* Arm a non-local return so a crash() inside the handler comes back
          * here instead of taking down the process.  __builtin_setjmp returns
          * 0 on the direct path, 1 when ap_crash() longjmps. */
@@ -152,6 +164,7 @@ static void actor_proc_main(void)
             if (g_cur_reply[s] >= 0)
                 ap_post((int)g_cur_reply[s], AP_REPLY, -1, AP_CRASH_REPLY, 0, 0, 0);
         }
+        aipl_unlock_all();                  /* release fully (also covers the crash longjmp) */
     }
 }
 

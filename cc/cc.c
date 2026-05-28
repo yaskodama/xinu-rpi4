@@ -14,6 +14,7 @@
 #include "kmalloc.h"
 #include "actor.h"
 #include "actorproc.h"
+#include "proc.h"        /* aipl_lock/unlock — serialize vheap under preemption */
 
 /* ---------- arena allocator (whole-program lifetime) ---------- */
 
@@ -572,7 +573,9 @@ static int compile_run_core(const char *src, unsigned long n, long *retval)
     ap_set_dispatch(g_active_dispatch);
     cc_set_apply((aoff >= 0) ? (void *)(code + aoff) : 0);
     long (*entryfn)(void) = (long (*)(void))(code + entry);
+    aipl_lock();                /* hold the vheap across main()'s direct vheap use */
     long rc = entryfn();        /* main(): spawn actor processes + send */
+    aipl_unlock();              /* release before ap_run (actors lock individually) */
     ap_run();                   /* drive actor processes until quiescent */
     ap_killall();               /* one-shot: reap the actor processes */
     g_active_dispatch = 0;
@@ -610,6 +613,20 @@ int cc_run_source(const char *src, int srclen, char *out, int outcap, long *retv
         out[p] = 0;
     }
     return rc;
+}
+
+#include "qemu_repro_src.h"   /* TEMPORARY: QEMU repro of the actor+select wedge */
+int cmd_repro(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    static char out[2048];
+    long rv = 0;
+    uart_puts("repro: BEGIN cc_run_source(SelMin)\n");
+    int rc = cc_run_source(SELMIN_SRC, (int)sizeof(SELMIN_SRC) - 1, out, sizeof out, &rv);
+    uart_puts("repro: cc_run_source RETURNED\n");
+    uart_puts(out);
+    uart_puts(rc == 0 ? "\nrepro: OK\n" : "\nrepro: ERR\n");
+    return 0;
 }
 
 int cmd_cc(int argc, char **argv)
@@ -708,7 +725,9 @@ int cc_actor_load(const char *src, int srclen, char *out, int outcap)
     cc_set_apply((aoff >= 0) ? (void *)(code + aoff) : 0);
     g_cap = out; g_capcap = outcap; g_caplen = 0; if (outcap > 0) out[0] = 0;
     long (*mainfn)(void) = (long (*)(void))(code + entry);
+    aipl_lock();                /* hold the vheap across main()'s direct vheap use */
     mainfn();                   /* spawn actor processes + initial sends */
+    aipl_unlock();              /* release before ap_run (actors lock individually) */
     ap_run();                   /* drive them; actors persist (blocked) for /actor/send */
     if (g_cap) g_cap[(g_caplen < g_capcap) ? g_caplen : (g_capcap - 1)] = 0;
     g_cap = 0;
@@ -757,7 +776,9 @@ int cc_actor_send_msg(int actor, const char *method, long arg, char *out, int ou
         return -1;
     }
 
+    aipl_lock();                         /* serialize the direct handler's vheap use */
     long res = g_res_dispatch((long)actor, mid, v_int(arg), v_int(0), v_int(0), v_int(0));
+    aipl_unlock();
 
     /* Drain any asynchronous `send`s the handler triggered (delivered to
      * the resident actor processes). */
@@ -796,7 +817,9 @@ int cc_actor_send_str(int actor, const char *method, const char *strarg, char *o
     int ai = 0; while (strarg && strarg[ai] && ai < (int)sizeof(argbuf) - 1) { argbuf[ai] = strarg[ai]; ai++; }
     argbuf[ai] = 0;
 
+    aipl_lock();                         /* serialize the direct handler's vheap use */
     long res = g_res_dispatch((long)actor, mid, v_str(argbuf), v_int(0), v_int(0), v_int(0));
+    aipl_unlock();
     g_active_dispatch = g_res_dispatch; ap_set_dispatch(g_res_dispatch); ap_run();
 
     char tmp[64];

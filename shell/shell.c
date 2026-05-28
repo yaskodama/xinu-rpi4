@@ -661,6 +661,7 @@ extern int cmd_cp(int, char **);
 extern int cmd_mv(int, char **);
 /* C compiler command lives in cc/cc.c. */
 extern int cmd_cc(int, char **);
+extern int cmd_repro(int, char **);   /* TEMPORARY: QEMU actor+select repro */
 extern int cmd_aload(int, char **);
 extern int cmd_amsg(int, char **);
 /* Virtual-memory translation demo lives in system/mmu.c. */
@@ -689,6 +690,7 @@ static const struct centry commandtab[] = {
     { "cp",     "cp <src> <dst> — copy a file",            cmd_cp     },
     { "mv",     "mv <src> <dst> — move/rename a file",     cmd_mv     },
     { "cc",     "cc <file.c> — compile & run a C program", cmd_cc     },
+    { "repro",  "TEMP: run SelMin (actors+select+vheap)",   cmd_repro  },
     { "aload",  "aload <file.c> — load resident actors",    cmd_aload  },
     { "amsg",   "amsg <actor> <method> [arg] — send msg",   cmd_amsg   },
     { "vmtest", "demo: VA->PA virtual-memory translation",  cmd_vmtest },
