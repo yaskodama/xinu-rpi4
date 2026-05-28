@@ -1,5 +1,23 @@
 # NEXT_SESSION — xinu-rpi4
 
+## ✅ 2026-05-28 — KV キャッシュでチャット高速化 + select 複数 LLM アクター
+
+オススメ順 #1+#2。両方 QEMU 検証済、**未 flash**。
+- **#1 KV キャッシュ会話**: 毎回履歴を再エンコードしてターン毎に遅くなる問題(4.9→26秒)を解消。
+  ステートフルセッション: KV キャッシュ(R.key/value_cache)と位置 `g_sess_pos` をターン跨ぎで保持し、
+  新規メッセージ+生成ぶんだけ処理(~一定コスト)。llm.c に `bpe_encode`(関数化)/`llm_session_reset`/
+  `llm_chat`(※`g_sink=buf_sink` 設定必須=忘れると NULL sink で PC=0 abort、修正済)。cc.c に `cc_chat`
+  組込み(ステートフル、`cc_llm` は従来 one-shot)、`cc_actor_load` でセッション reset。translator `chat()`→
+  `cc_chat`。Chat.abcl は `chat(msg)` に。QEMU: turn1 "little dog"→"Max"命名、turn2/3 が文脈維持。
+- **#2 select 複数 LLM アクター**: `MultiAgent.abcl` — Director が Agent×2 を spawn→各 Agent が独立に
+  `llm()`(one-shot=セッション非共有で安全)→結果送信→Director が **`select`** で両者収集。QEMU: 両
+  fragment 出力 "director: collected 2 fragments"。
+  - 修正A: gexpr の `self` 値渡しが `v_self`(未定義)→**`v_int(self)`**(actor id を value_t 化)。
+  - 修正B: LLM 呼び出しを含むループが 100ms 暴走ガードで中断される→`cc_llm`/`cc_chat` 完了時に
+    `cc_set_deadline()` で締切リセット(LLM 非使用の真の暴走は依然 100ms 検出)。
+- commit xinu **4dd55ea**(KV)/**7761bd7**(deadline) / abclcp **faea02d**(chat)/**5ac14d7**(multiagent+self)。
+  実機手順: Chat を /actor/load→/chat 反復(ターン毎ほぼ一定速度のはず)、MultiAgent は `cc`/HTTP /compile。
+
 ## ✅ 2026-05-28 — LLM と会話するアクター（llm() 組込み + /chat）★実機検証済
 
 LLM をアクターモデルに統合: AIPL に **`llm(prompt)` 組込み**を追加し、メッセージ送信で会話できる
