@@ -268,7 +268,7 @@ static void emit_piece(int prev, int tok)
  * the NIC RX ring between layers (safe from the serial/wm context); pass 0 from
  * the HTTP path, which already runs inside genet_rx_tick (re-entering it would
  * corrupt the RX ring). */
-int llm_generate(const char *prompt, int steps, void (*sink)(char), int drain)
+int llm_generate(const char *prompt, int max_new, void (*sink)(char), int drain, int echo)
 {
     load();
     g_sink = sink;
@@ -300,30 +300,33 @@ int llm_generate(const char *prompt, int steps, void (*sink)(char), int drain)
         nt--;
     }
 
-    if (steps > C.seq_len) steps = C.seq_len;
-    int token = toks[0], pos = 0, produced = 0;
-    while (pos < steps) {
+    int token = toks[0], pos = 0, gen = 0;
+    while (pos < C.seq_len && gen < max_new) {
         float *logits = forward(token, pos);
         int next;
-        if (pos + 1 < nt) next = toks[pos+1];         /* still consuming the prompt */
-        else next = argmax(logits, C.vocab_size);     /* generate */
-        pos++;
-        if (next == 1 || next == 2) break;            /* BOS/EOS -> stop */
-        emit_piece(token, next);                      /* `token` precedes `next` */
-        token = next; produced++;
+        if (pos + 1 < nt) {                           /* still feeding the prompt */
+            next = toks[pos+1];
+            if (echo) emit_piece(token, next);
+        } else {                                      /* generating new tokens */
+            next = argmax(logits, C.vocab_size);
+            if (next == 1 || next == 2) break;        /* BOS/EOS -> stop */
+            emit_piece(token, next);                  /* `token` precedes `next` */
+            gen++;
+        }
+        token = next; pos++;
         if (g_drain) net_drain();                     /* keep the RX ring from overflowing */
     }
-    return produced;
+    return gen;
 }
 
 /* HTTP entry point: generate into `out` (text/plain), no RX draining (we are
  * already inside genet_rx_tick).  Returns tokens produced. */
 static char *g_out; static int g_outcap, g_outlen;
 static void buf_sink(char c) { if (g_outlen < g_outcap - 1) g_out[g_outlen++] = c; }
-int llm_run(const char *prompt, int steps, char *out, int outcap)
+int llm_run(const char *prompt, int max_new, char *out, int outcap, int echo)
 {
     g_out = out; g_outcap = outcap; g_outlen = 0; if (outcap > 0) out[0] = 0;
-    int n = llm_generate(prompt, steps, buf_sink, 0);
+    int n = llm_generate(prompt, max_new, buf_sink, 0, echo);
     g_out[(g_outlen < g_outcap) ? g_outlen : (g_outcap - 1)] = 0;
     g_out = 0;
     return n;
@@ -346,7 +349,7 @@ int cmd_llm(int argc, char **argv)
     char b[12]; int n=0,v=C.dim; if(!v)b[n++]='0'; while(v){b[n++]=(char)('0'+v%10);v/=10;} while(n--)uart_putc(b[n]);
     uart_puts(", "); n=0; v=C.n_layers; if(!v)b[n++]='0'; while(v){b[n++]=(char)('0'+v%10);v/=10;} while(n--)uart_putc(b[n]);
     uart_puts(" layers)\n");
-    llm_generate(p > 0 ? prompt : (const char *)0, 64, uart_sink, 1);
+    llm_generate(p > 0 ? prompt : (const char *)0, 64, uart_sink, 1, 1);  /* echo prompt + 64 new */
     uart_putc('\n');
     return 0;
 }

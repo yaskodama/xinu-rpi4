@@ -147,7 +147,7 @@ static long cc_actor_send(long id, const char *method, long arg)
  * just calls these helpers, so the same compiler handles both plain C and
  * AIPL-generated value_t C. */
 
-static char  g_vheap[8192];
+static char  g_vheap[32768];   /* bigger: holds chat history + LLM replies */
 static int   g_vheaplen;
 static void  vheap_reset(void) { g_vheaplen = 0; }
 static char *vheap_alloc(int n)
@@ -433,6 +433,21 @@ static long cc_saga_failed(void) { return g_saga_failed; }   /* plain 0/1 for ra
 static long cc_crash(void)         { ap_crash(); return v_int(0); }
 static long cc_crashed_value(void) { return AP_CRASH_REPLY; }
 
+/* AIPL builtin llm(prompt): run the baked LLM on `prompt` (a value_t string)
+ * and return the generated text as a value_t string (in the concat heap, so it
+ * persists / can be stored in a field).  Lets an AIPL actor talk to the LLM. */
+extern int llm_run(const char *prompt, int max_new, char *out, int outcap, int echo);
+static long cc_llm(long prompt)
+{
+    char pbuf[1024];
+    const char *src = v_is_str(prompt) ? (const char *)prompt
+                                       : v_render(prompt, pbuf, sizeof pbuf);
+    char *out = vheap_alloc(420);
+    if (!out) return v_str("");
+    llm_run(src, 32, out, 420, 0);       /* 32 new tokens, no prompt echo (chat) */
+    return v_str(out);
+}
+
 unsigned long cc_resolve_extern(const char *name)
 {
     struct { const char *n; void *f; } tab[] = {
@@ -470,6 +485,7 @@ unsigned long cc_resolve_extern(const char *name)
         { "cc_saga_failed", (void *)&cc_saga_failed },
         { "cc_crash",         (void *)&cc_crash         },
         { "cc_crashed_value", (void *)&cc_crashed_value },
+        { "cc_llm",       (void *)&cc_llm       },
         { "v_list_new",    (void *)&v_list_new    },
         { "v_list_push",   (void *)&v_list_push   },
         { "v_list_get",    (void *)&v_list_get    },
@@ -734,6 +750,40 @@ int cc_actor_send_msg(int actor, const char *method, long arg, char *out, int ou
 
     char tmp[64];
     const char *r = v_render(res, tmp, sizeof tmp);
+    int p = 0; while (r[p] && p < outcap - 1) { out[p] = r[p]; p++; } if (outcap) out[p] = 0;
+    return 0;
+}
+
+/* Like cc_actor_send_msg but the argument is a STRING (a value_t string),
+ * and the reply (often a long string, e.g. an LLM turn) is copied whole into
+ * `out`.  Backs /chat: message a resident actor's method to converse. */
+int cc_actor_send_str(int actor, const char *method, const char *strarg, char *out, int outcap)
+{
+    if (!g_res_dispatch || !g_res_methodid) {
+        const char *m = "no resident actor program (POST /actor/load first)\n";
+        int p = 0; while (m[p] && p < outcap - 1) { out[p] = m[p]; p++; } if (outcap) out[p] = 0;
+        return -1;
+    }
+    cc_set_deadline();
+    static char methbuf[64] __attribute__((aligned(16)));
+    int mi = 0; while (method[mi] && mi < (int)sizeof(methbuf) - 1) { methbuf[mi] = method[mi]; mi++; }
+    methbuf[mi] = 0;
+    long mid = v_int_of(g_res_methodid(v_str(methbuf)));
+    if (mid < 0) {
+        const char *m = "unknown method\n";
+        int p = 0; while (m[p] && p < outcap - 1) { out[p] = m[p]; p++; } if (outcap) out[p] = 0;
+        return -1;
+    }
+    /* 8-aligned NUL-terminated copy so v_str() is a valid string value_t */
+    static char argbuf[1024] __attribute__((aligned(16)));
+    int ai = 0; while (strarg && strarg[ai] && ai < (int)sizeof(argbuf) - 1) { argbuf[ai] = strarg[ai]; ai++; }
+    argbuf[ai] = 0;
+
+    long res = g_res_dispatch((long)actor, mid, v_str(argbuf), v_int(0), v_int(0), v_int(0));
+    g_active_dispatch = g_res_dispatch; ap_set_dispatch(g_res_dispatch); ap_run();
+
+    char tmp[64];
+    const char *r = v_render(res, tmp, sizeof tmp);   /* string -> returns the pointer itself */
     int p = 0; while (r[p] && p < outcap - 1) { out[p] = r[p]; p++; } if (outcap) out[p] = 0;
     return 0;
 }

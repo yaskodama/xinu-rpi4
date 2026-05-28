@@ -18,7 +18,9 @@
 #include "cc.h"
 
 /* On-device LLM (llm/llm.c): generate text into `out`, return token count. */
-extern int llm_run(const char *prompt, int steps, char *out, int outcap);
+extern int llm_run(const char *prompt, int max_new, char *out, int outcap, int echo);
+/* Send a STRING message to a resident actor's method; reply -> out (cc/cc.c). */
+extern int cc_actor_send_str(int actor, const char *method, const char *strarg, char *out, int outcap);
 
 extern int genet_tx_frame(const unsigned char *frame, int length);
 
@@ -418,8 +420,29 @@ static int http_build(const char *req, char *out, int max)
             if (v > 0) n = v; } }
         if (n > 96) n = 96;
         static char ltxt[700];
-        llm_run(prompt[0] ? prompt : (const char *)0, n, ltxt, sizeof ltxt);
+        llm_run(prompt[0] ? prompt : (const char *)0, n, ltxt, sizeof ltxt, 1);  /* echo prompt */
         bl = s_put(body, bl, ltxt);
+        bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "POST /chat") || starts_with(req, "GET /chat")) {
+        /* Converse with a resident actor: deliver the message (POST body or
+         * ?m= for GET) as a STRING to actor 0's `say` method and return its
+         * reply.  The actor keeps conversation state across calls; if it calls
+         * llm(), that reply is LLM-generated. */
+        ctype = "text/plain";
+        static char msg[256];
+        int ml = 0;
+        if (req[0] == 'P') {
+            int he = find_header_end(req);
+            if (he >= 0) { const char *b = req + he;
+                while (b[ml] && ml < (int)sizeof(msg)-1) { msg[ml] = b[ml]; ml++; } }
+            msg[ml] = 0;
+        } else {
+            static char enc[256];
+            if (q_param(req, "m", enc, sizeof enc)) url_decode(enc, msg, sizeof msg);
+        }
+        static char creply[700];
+        cc_actor_send_str(0, "say", msg, creply, sizeof creply);
+        bl = s_put(body, bl, creply);
         bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "POST /actor/load") || starts_with(req, "GET /actor/load")) {
         /* Load an AIPL-generated C program as RESIDENT actors: the body is
