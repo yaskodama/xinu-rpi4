@@ -17,6 +17,9 @@
 #include "actor.h"
 #include "cc.h"
 
+/* On-device LLM (llm/llm.c): generate text into `out`, return token count. */
+extern int llm_run(const char *prompt, int steps, char *out, int outcap);
+
 extern int genet_tx_frame(const unsigned char *frame, int length);
 
 /* --- byte/checksum helpers (duplicated, intentionally — keeps
@@ -392,6 +395,32 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, prog);
         if (rc == 0) { bl = s_put(body, bl, "=> "); bl = s_putdec(body, bl, rv); bl = s_put(body, bl, "\n"); }
         else         { bl = s_put(body, bl, "\n"); }
+    } else if (starts_with(req, "POST /llm") || starts_with(req, "GET /llm")) {
+        /* On-device LLM: prompt = POST body (or ?p= for GET), ?n= caps the
+         * token count.  Reply is the generated text.  Generation blocks this
+         * tick (no RX draining here — we are inside genet_rx_tick), so the
+         * token count is capped to bound the stall. */
+        ctype = "text/plain";
+        static char prompt[256];
+        int pl = 0;
+        if (req[0] == 'P') {
+            int he = find_header_end(req);
+            if (he >= 0) { const char *b = req + he;
+                while (b[pl] && pl < (int)sizeof(prompt)-1) { prompt[pl] = b[pl]; pl++; } }
+            prompt[pl] = 0;
+        } else {
+            static char enc[256];
+            if (q_param(req, "p", enc, sizeof enc)) url_decode(enc, prompt, sizeof prompt);
+        }
+        int n = 32;
+        { char nb[12]; if (q_param(req, "n", nb, sizeof nb)) {
+            int v = 0; for (char *s = nb; *s >= '0' && *s <= '9'; s++) v = v*10 + (*s - '0');
+            if (v > 0) n = v; } }
+        if (n > 96) n = 96;
+        static char ltxt[700];
+        llm_run(prompt[0] ? prompt : (const char *)0, n, ltxt, sizeof ltxt);
+        bl = s_put(body, bl, ltxt);
+        bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "POST /actor/load") || starts_with(req, "GET /actor/load")) {
         /* Load an AIPL-generated C program as RESIDENT actors: the body is
          * the C source; main() spawns the actors and they stay alive for

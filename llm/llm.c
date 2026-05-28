@@ -75,6 +75,7 @@ static Config   C;
 static Weights  W;
 static Run      R;
 static int      g_loaded;
+static int      g_drain;       /* drain RX between layers? (serial: yes; HTTP: no — would re-enter genet_rx_tick) */
 static void net_drain(void);   /* fwd: keep the NIC RX ring drained while we compute */
 
 /* tokenizer: vocab pieces + merge scores parsed from tok_data */
@@ -214,7 +215,7 @@ static float *forward(int token, int pos)
         }
         matmul(R.xb, R.hb, W.w2 + (long)l*dim*hidden, hidden, dim);
         for (int i = 0; i < dim; i++) x[i] += R.xb[i];
-        net_drain();   /* bound the un-drained window to one layer of compute */
+        if (g_drain) net_drain();   /* bound the un-drained window to one layer */
     }
     rmsnorm(x, x, W.rms_final, dim);
     matmul(R.logits, x, W.tok_emb, dim, C.vocab_size);   /* shared classifier */
@@ -263,11 +264,15 @@ static void emit_piece(int prev, int tok)
     for (; i < n; i++) g_sink(p[i]);
 }
 
-/* generate up to `steps` tokens from `prompt`; greedy decode. */
-int llm_generate(const char *prompt, int steps, void (*sink)(char))
+/* generate up to `steps` tokens from `prompt`; greedy decode.  `drain`=1 pumps
+ * the NIC RX ring between layers (safe from the serial/wm context); pass 0 from
+ * the HTTP path, which already runs inside genet_rx_tick (re-entering it would
+ * corrupt the RX ring). */
+int llm_generate(const char *prompt, int steps, void (*sink)(char), int drain)
 {
     load();
     g_sink = sink;
+    g_drain = drain;
 
     /* encode: BOS=1, then a leading space + prompt as single chars, then BPE-merge */
     static int toks[256]; int nt = 0;
@@ -306,10 +311,22 @@ int llm_generate(const char *prompt, int steps, void (*sink)(char))
         if (next == 1 || next == 2) break;            /* BOS/EOS -> stop */
         emit_piece(prev, next);
         prev = token; token = next; produced++;
-        net_drain();                                  /* keep the RX ring from overflowing */
+        if (g_drain) net_drain();                     /* keep the RX ring from overflowing */
     }
-    g_sink('\n');
     return produced;
+}
+
+/* HTTP entry point: generate into `out` (text/plain), no RX draining (we are
+ * already inside genet_rx_tick).  Returns tokens produced. */
+static char *g_out; static int g_outcap, g_outlen;
+static void buf_sink(char c) { if (g_outlen < g_outcap - 1) g_out[g_outlen++] = c; }
+int llm_run(const char *prompt, int steps, char *out, int outcap)
+{
+    g_out = out; g_outcap = outcap; g_outlen = 0; if (outcap > 0) out[0] = 0;
+    int n = llm_generate(prompt, steps, buf_sink, 0);
+    g_out[(g_outlen < g_outcap) ? g_outlen : (g_outcap - 1)] = 0;
+    g_out = 0;
+    return n;
 }
 
 /* ---------- shell command: `llm [prompt...]` ---------- */
@@ -329,6 +346,7 @@ int cmd_llm(int argc, char **argv)
     char b[12]; int n=0,v=C.dim; if(!v)b[n++]='0'; while(v){b[n++]=(char)('0'+v%10);v/=10;} while(n--)uart_putc(b[n]);
     uart_puts(", "); n=0; v=C.n_layers; if(!v)b[n++]='0'; while(v){b[n++]=(char)('0'+v%10);v/=10;} while(n--)uart_putc(b[n]);
     uart_puts(" layers)\n");
-    llm_generate(p > 0 ? prompt : (const char *)0, 64, uart_sink);
+    llm_generate(p > 0 ? prompt : (const char *)0, 64, uart_sink, 1);
+    uart_putc('\n');
     return 0;
 }
