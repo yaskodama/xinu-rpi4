@@ -21,6 +21,8 @@
 extern int llm_run(const char *prompt, int max_new, char *out, int outcap, int echo);
 /* Send a STRING message to a resident actor's method; reply -> out (cc/cc.c). */
 extern int cc_actor_send_str(int actor, const char *method, const char *strarg, char *out, int outcap);
+/* 100 Hz IRQ-driven tick counter (device/timer/timer.c) — for /ticks diag. */
+extern unsigned long timer_ticks(void);
 
 extern int genet_tx_frame(const unsigned char *frame, int length);
 
@@ -422,6 +424,18 @@ static int http_build(const char *req, char *out, int max)
         static char ltxt[700];
         llm_run(prompt[0] ? prompt : (const char *)0, n, ltxt, sizeof ltxt, 1);  /* echo prompt */
         bl = s_put(body, bl, ltxt);
+        bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "GET /ticks") || starts_with(req, "POST /ticks")) {
+        /* Diagnostic: is the 100 Hz timer IRQ actually firing?  tick_count is
+         * advanced only by the timer ISR; cntpct is the free-running hardware
+         * counter (always advances).  If ticks stays 0 across calls while
+         * cntpct grows, the timer IRQ is not being delivered. */
+        ctype = "text/plain";
+        unsigned long ct; __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(ct));
+        bl = s_put(body, bl, "ticks=");
+        bl = s_putdec(body, bl, (long)timer_ticks());
+        bl = s_put(body, bl, " cntpct=");
+        bl = s_putdec(body, bl, (long)ct);
         bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "POST /chat") || starts_with(req, "GET /chat")) {
         /* Converse with a resident actor: deliver the message (POST body or
