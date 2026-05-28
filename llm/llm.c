@@ -268,18 +268,15 @@ static void emit_piece(int prev, int tok)
  * the NIC RX ring between layers (safe from the serial/wm context); pass 0 from
  * the HTTP path, which already runs inside genet_rx_tick (re-entering it would
  * corrupt the RX ring). */
-int llm_generate(const char *prompt, int max_new, void (*sink)(char), int drain, int echo)
+/* BPE-encode `prompt`: a leading space + the text as single chars, greedily
+ * merged by score.  Optionally prefixes BOS=1.  Returns the token count. */
+static int bpe_encode(const char *prompt, int *toks, int maxtoks, int with_bos)
 {
-    load();
-    g_sink = sink;
-    g_drain = drain;
-
-    /* encode: BOS=1, then a leading space + prompt as single chars, then BPE-merge */
-    static int toks[256]; int nt = 0;
-    toks[nt++] = 1;                                   /* BOS */
+    int nt = 0;
+    if (with_bos) toks[nt++] = 1;                     /* BOS */
     char tmp[260]; int tn = 0; tmp[tn++] = ' ';
     if (prompt) for (int i = 0; prompt[i] && tn < 256; i++) tmp[tn++] = prompt[i];
-    for (int i = 0; i < tn && nt < 250; i++) {
+    for (int i = 0; i < tn && nt < maxtoks; i++) {
         int id = find_piece(&tmp[i], 1);
         if (id >= 0) toks[nt++] = id;
     }
@@ -299,6 +296,17 @@ int llm_generate(const char *prompt, int max_new, void (*sink)(char), int drain,
         for (int i = bi+1; i < nt-1; i++) toks[i] = toks[i+1];
         nt--;
     }
+    return nt;
+}
+
+int llm_generate(const char *prompt, int max_new, void (*sink)(char), int drain, int echo)
+{
+    load();
+    g_sink = sink;
+    g_drain = drain;
+
+    static int toks[256];
+    int nt = bpe_encode(prompt, toks, 250, 1);        /* with BOS */
 
     int token = toks[0], pos = 0, gen = 0;
     while (pos < C.seq_len && gen < max_new) {
@@ -330,6 +338,48 @@ int llm_run(const char *prompt, int max_new, char *out, int outcap, int echo)
     g_out[(g_outlen < g_outcap) ? g_outlen : (g_outcap - 1)] = 0;
     g_out = 0;
     return n;
+}
+
+/* ---------- stateful chat session ----------
+ * The KV cache (R.key_cache/value_cache) and position persist across turns,
+ * so each turn only processes the new message + the generated tokens — no
+ * re-encoding of the whole conversation.  Cost is ~constant per turn instead
+ * of growing.  llm_session_reset() starts a fresh conversation. */
+static int g_sess_pos;     /* next free position in the KV cache */
+static int g_sess_last;    /* last token fed/generated (for space handling) */
+void llm_session_reset(void) { load(); g_sess_pos = 0; g_sess_last = 1; }
+
+int llm_chat(const char *msg, int max_new, char *out, int outcap)
+{
+    load();
+    g_sink = buf_sink;                   /* emit_piece writes here */
+    g_out = out; g_outcap = outcap; g_outlen = 0; if (outcap > 0) out[0] = 0;
+    g_drain = 0;                         /* runs inside genet_rx_tick */
+
+    float *logits = 0;
+    int prev = g_sess_last;
+    if (g_sess_pos == 0) {               /* new session: feed BOS at pos 0 */
+        logits = forward(1, g_sess_pos); g_sess_pos++; prev = 1;
+    }
+    static int mt[256];
+    int nt = bpe_encode(msg, mt, 250, 0);            /* message tokens, no BOS */
+    for (int i = 0; i < nt && g_sess_pos < C.seq_len; i++) {
+        logits = forward(mt[i], g_sess_pos); g_sess_pos++; prev = mt[i];
+    }
+    if (!logits) { g_out = 0; return 0; }            /* nothing to predict from */
+
+    int gen = 0;
+    while (gen < max_new && g_sess_pos < C.seq_len) {
+        int next = argmax(logits, C.vocab_size);
+        if (next == 1 || next == 2) break;           /* BOS/EOS */
+        emit_piece(prev, next);
+        prev = next; gen++;
+        logits = forward(next, g_sess_pos); g_sess_pos++;
+    }
+    g_sess_last = prev;
+    g_out[(g_outlen < g_outcap) ? g_outlen : (g_outcap - 1)] = 0;
+    g_out = 0;
+    return gen;
 }
 
 /* ---------- shell command: `llm [prompt...]` ---------- */

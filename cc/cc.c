@@ -436,15 +436,27 @@ static long cc_crashed_value(void) { return AP_CRASH_REPLY; }
 /* AIPL builtin llm(prompt): run the baked LLM on `prompt` (a value_t string)
  * and return the generated text as a value_t string (in the concat heap, so it
  * persists / can be stored in a field).  Lets an AIPL actor talk to the LLM. */
-extern int llm_run(const char *prompt, int max_new, char *out, int outcap, int echo);
-static long cc_llm(long prompt)
+extern int  llm_run(const char *prompt, int max_new, char *out, int outcap, int echo);
+extern int  llm_chat(const char *msg, int max_new, char *out, int outcap);
+extern void llm_session_reset(void);
+static long cc_llm(long prompt)          /* one-shot: re-encode `prompt` each call */
 {
     char pbuf[1024];
     const char *src = v_is_str(prompt) ? (const char *)prompt
                                        : v_render(prompt, pbuf, sizeof pbuf);
     char *out = vheap_alloc(420);
     if (!out) return v_str("");
-    llm_run(src, 32, out, 420, 0);       /* 32 new tokens, no prompt echo (chat) */
+    llm_run(src, 32, out, 420, 0);       /* 32 new tokens, no prompt echo */
+    return v_str(out);
+}
+static long cc_chat(long msg)            /* stateful: continues the KV-cache session */
+{
+    char pbuf[1024];
+    const char *src = v_is_str(msg) ? (const char *)msg
+                                    : v_render(msg, pbuf, sizeof pbuf);
+    char *out = vheap_alloc(420);
+    if (!out) return v_str("");
+    llm_chat(src, 32, out, 420);
     return v_str(out);
 }
 
@@ -486,6 +498,7 @@ unsigned long cc_resolve_extern(const char *name)
         { "cc_crash",         (void *)&cc_crash         },
         { "cc_crashed_value", (void *)&cc_crashed_value },
         { "cc_llm",       (void *)&cc_llm       },
+        { "cc_chat",      (void *)&cc_chat      },
         { "v_list_new",    (void *)&v_list_new    },
         { "v_list_push",   (void *)&v_list_push   },
         { "v_list_get",    (void *)&v_list_get    },
@@ -685,6 +698,7 @@ int cc_actor_load(const char *src, int srclen, char *out, int outcap)
     cc_set_deadline();
     vheap_reset();
     lheap_reset();
+    llm_session_reset();        /* a freshly-loaded resident starts a new chat */
     ap_reset();
     g_active_dispatch = (doff >= 0) ? (void *)(code + doff) : 0;
     ap_set_dispatch(g_active_dispatch);
