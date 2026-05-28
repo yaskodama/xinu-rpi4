@@ -25,6 +25,7 @@ enum proc_state {
     PR_FREE = 0,   /* slot unused                                */
     PR_READY,      /* on ready list, waiting for CPU             */
     PR_CURR,       /* currpid points here                        */
+    PR_WAIT,       /* blocked (e.g. on an empty mailbox)         */
     PR_TERM        /* exited, awaiting reaper                    */
 };
 
@@ -36,6 +37,7 @@ struct procent {
     void           *stkbase;
     unsigned long   stklen;
     void           *sp;             /* saved kernel SP            */
+    void           *arg;            /* opaque per-process argument */
     char            name[PROC_NAME_LEN];
     struct procent *next;           /* ready-list link            */
 };
@@ -45,10 +47,16 @@ extern int            currpid;
 
 void proc_init(void);
 int  proc_create(proc_entry_t entry, unsigned long stksize, const char *name);
+/* Like proc_create but stashes `arg` in proctab[pid].arg so the new
+ * process can recover it (e.g. which actor it is) on first run. */
+int  proc_create_arg(proc_entry_t entry, unsigned long stksize, const char *name, void *arg);
 void proc_ready(int pid);
 void proc_resched(void);
 void proc_yield(void);
 void proc_exit(void);
+/* Block the current process (removes it from CURR; resched won't re-ready
+ * it) until proc_ready() puts it back.  Used by mailbox receive. */
+void proc_block(void);
 
 /* AArch64 callee-saved (x19-x30) save / restore.  Implemented in
  * ctxsw.S.  *old_sp receives the SP value to resume `old` later;

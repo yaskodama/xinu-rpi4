@@ -81,6 +81,11 @@ static int alloc_slot(void)
 
 int proc_create(proc_entry_t entry, unsigned long stksize, const char *name)
 {
+    return proc_create_arg(entry, stksize, name, 0);
+}
+
+int proc_create_arg(proc_entry_t entry, unsigned long stksize, const char *name, void *arg)
+{
     int pid = alloc_slot();
     if (pid < 0) return -1;
 
@@ -95,6 +100,7 @@ int proc_create(proc_entry_t entry, unsigned long stksize, const char *name)
     p->prio    = 1;
     p->stkbase = stk;
     p->stklen  = stksize;
+    p->arg     = arg;
     copy_name(p->name, name);
     p->next    = 0;
 
@@ -162,6 +168,25 @@ void proc_resched(void)
 void proc_yield(void)
 {
     proc_resched();
+}
+
+/* Block the current process: it leaves PR_CURR for PR_WAIT (so resched
+ * will not re-ready it) and we switch to the next ready process, or back
+ * to NULLPROC if none is ready.  Returns once proc_ready() re-readies us
+ * and the scheduler picks us again. */
+void proc_block(void)
+{
+    struct procent *oldp = &proctab[currpid];
+    oldp->state = PR_WAIT;
+
+    struct procent *newp = ready_pop();
+    if (newp == 0) newp = &proctab[NULLPROC];
+
+    newp->state = PR_CURR;
+    currpid     = (int)(newp - proctab);
+
+    ctxsw(&oldp->sp, newp->sp);
+    /* Resumes here when we are readied and ctxsw'd back into. */
 }
 
 /* Process voluntarily exits.  Marks slot free, picks next ready

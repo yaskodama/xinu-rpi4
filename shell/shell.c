@@ -665,6 +665,9 @@ extern int cmd_aload(int, char **);
 extern int cmd_amsg(int, char **);
 /* Virtual-memory translation demo lives in system/mmu.c. */
 extern int cmd_vmtest(int, char **);
+/* Actors-as-Xinu-processes demo lives in system/actorproc.c. */
+extern int cmd_actordemo(int, char **);
+extern int cmd_selectdemo(int, char **);
 
 static const struct centry commandtab[] = {
     { "help",   "list the commands",                       cmd_help   },
@@ -685,6 +688,8 @@ static const struct centry commandtab[] = {
     { "aload",  "aload <file.c> — load resident actors",    cmd_aload  },
     { "amsg",   "amsg <actor> <method> [arg] — send msg",   cmd_amsg   },
     { "vmtest", "demo: VA->PA virtual-memory translation",  cmd_vmtest },
+    { "actordemo","actors as Xinu processes (ping-pong)",   cmd_actordemo },
+    { "selectdemo","select: receive a named message first",  cmd_selectdemo },
     { "echo",   "echo the remaining words back",           cmd_echo   },
     { "hello",  "smoke marker — say hello",                cmd_hello  },
     { "mem",    "show __bss_start / __bss_end / _end",     cmd_mem    },
