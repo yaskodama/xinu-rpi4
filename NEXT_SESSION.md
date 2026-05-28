@@ -1,5 +1,14 @@
 # NEXT_SESSION — xinu-rpi5
 
+## ✅ 2026-05-28 — 非同期 mailbox (並行アクター)
+
+AIPL `send obj.m(args)` を fire-and-forget 化。cc.c に FIFO キュー + 外部 `enqueue(to,mid,a0..a3)`
++ `cc_pump()`(g_active_dispatch を FIFO 呼出、runaway deadline で停止)。main()/各 /actor/send の後に
+pump → ハンドラ内 send も連鎖処理。`now` は同期 dispatch のまま。翻訳器 Send→enqueue。QEMU で
+自己送信カスケード(ping 3/2/1)・2アクター ping-pong(hit 4/3/2/1/0) 確認。examples_xinujit/Ping.abcl,
+PingPong.abcl。★`now` 単独文はパースエラー→ドライバは send 推奨。commit xinu ce643f1 / abclcp bda137b。
+**現 flash 1003e5bb には未搭載**(async は次回 flash)。
+
 ## ✅ 2026-05-28 — 常駐 AIPL アクター (load→メッセージ交換) + float 値
 
 **常駐アクター**: `cc_actor_load(src)` が AIPL→C を常駐コンパイル(code+arena 非解放→g_obj/文字列
