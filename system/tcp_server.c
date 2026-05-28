@@ -118,6 +118,30 @@ static volatile unsigned char __attribute__((aligned(64))) tx_frame[1518];
 static char g_httpreq[8192];
 static int  g_httpreqlen;
 
+/* ---------- app-layer handoff (preemptive networking) ----------
+ * The net process must NOT run http_build (cc/llm) inline, or a long
+ * compute stalls RX/ICMP/TCP for everyone.  Instead a complete request is
+ * handed to a dedicated app-worker process via this single-slot mailbox;
+ * the net process keeps draining and later flushes the finished response.
+ * GENET/TCP stays owned by the net process; vheap/cc/llm by the worker.
+ * One in-flight request at a time (matches the single g_conn).
+ *
+ * State is owned by exactly one side at each step, so a plain volatile int
+ * is race-free under preemption: net sets QUEUED (only from IDLE), worker
+ * sets WORKING then DONE, net sets IDLE on flush. */
+enum { APP_IDLE = 0, APP_QUEUED, APP_WORKING, APP_DONE };
+static volatile int g_app_state;
+static char         g_app_req[sizeof g_httpreq];
+static int          g_app_req_len;
+static char         g_app_resp[1500];
+static int          g_app_resp_len;
+static unsigned long g_app_served;     /* responses flushed (diagnostic)     */
+static int          g_net_preempt;     /* preemptive networking on/off        */
+
+/* Preemption control (system/proc.c) — toggled at runtime via /netpreempt
+ * so preemptive networking can be enabled only after correctness is proven. */
+extern void proc_set_preempt(int on);
+
 void tcp_set_mac(const unsigned char mac[6])
 {
     for (int i = 0; i < 6; i++) g_my_mac[i] = mac[i];
@@ -465,6 +489,30 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, "genet_irq=");
         bl = s_putdec(body, bl, (long)genet_irq_count());
         bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "GET /netpreempt") || starts_with(req, "POST /netpreempt")) {
+        /* Toggle preemptive networking: with it ON the timer can preempt the
+         * app-worker (mid cc/llm) to run the net process, so RX/ICMP/TCP stay
+         * low-latency during a long compute.  ?on=1 enable, ?on=0 disable.
+         * Safe because NULLPROC is never preempted and the only other ready
+         * proc is the net process (which never touches vheap). */
+        ctype = "text/plain";
+        static char onbuf[8];
+        if (q_param(req, "on", onbuf, sizeof onbuf)) {
+            g_net_preempt = (onbuf[0] == '1');
+            proc_set_preempt(g_net_preempt);
+        }
+        bl = s_put(body, bl, "net_preempt=");
+        bl = s_put(body, bl, g_net_preempt ? "on" : "off");
+        bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "GET /netstat") || starts_with(req, "POST /netstat")) {
+        /* App-handoff state: IDLE/QUEUED/WORKING/DONE + served count + preempt. */
+        ctype = "text/plain";
+        static const char *st[] = { "IDLE", "QUEUED", "WORKING", "DONE" };
+        int s = g_app_state; if (s < 0 || s > 3) s = 0;
+        bl = s_put(body, bl, "app_state=");  bl = s_put(body, bl, st[s]);
+        bl = s_put(body, bl, " served=");    bl = s_putdec(body, bl, (long)g_app_served);
+        bl = s_put(body, bl, " preempt=");   bl = s_put(body, bl, g_net_preempt ? "on" : "off");
+        bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "POST /chat") || starts_with(req, "GET /chat")) {
         /* Converse with a resident actor: deliver the message (POST body or
          * ?m= for GET) as a STRING to actor 0's `say` method and return its
@@ -576,6 +624,43 @@ static int http_build(const char *req, char *out, int max)
     return p;
 }
 
+/* True when a complete request is queued for the worker (net process polls
+ * this after draining, to wake the worker). */
+int tcp_app_req_pending(void) { return g_app_state == APP_QUEUED; }
+
+/* Run the queued request's app processing (http_build -> cc/llm).  Called
+ * ONLY from the app-worker process, off the net process's stack, so a long
+ * compute doesn't stall RX/ICMP/TCP.  Returns 1 if it produced a response. */
+int tcp_app_work(void)
+{
+    if (g_app_state != APP_QUEUED) return 0;
+    g_app_state = APP_WORKING;
+    g_app_resp_len = http_build(g_app_req, g_app_resp, (int)sizeof g_app_resp);
+    __asm__ volatile ("dsb sy" ::: "memory");   /* resp visible before DONE */
+    g_app_state = APP_DONE;
+    return 1;
+}
+
+/* Send a finished response (PSH+ACK then FIN).  Called ONLY from the net
+ * process (sole owner of GENET/TCP).  Drops the response if the connection
+ * died (peer RST) while the worker was busy. */
+void tcp_app_flush(void)
+{
+    if (g_app_state != APP_DONE) return;
+    if (g_conn.state == TCP_ESTABLISHED) {
+        tcp_send(TCP_FLAG_PSH | TCP_FLAG_ACK, g_app_resp, g_app_resp_len);
+        g_conn.my_seq += g_app_resp_len;
+        tcp_send(TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0);
+        g_conn.my_seq += 1;
+        g_conn.state = TCP_FIN_WAIT_1;
+        g_app_served++;
+        uart_puts("http: served request (worker), FIN sent\n");
+    } else {
+        uart_puts("http: connection gone, dropping worker response\n");
+    }
+    g_app_state = APP_IDLE;
+}
+
 /* Handle one received Ethernet frame.  Returns 1 if it was TCP-for-us
  * (consumed), 0 otherwise. */
 int tcp_handle_packet(const unsigned char *frame, int len)
@@ -685,9 +770,7 @@ int tcp_handle_packet(const unsigned char *frame, int len)
             /* Accumulate the HTTP request across segments (a POST body —
              * e.g. C source for /compile — may not fit one segment).  We
              * only append in-order data; retransmits are just re-ACKed.
-             * Once the full request has arrived we route it and close. */
-            static char http_resp[1500];
-
+             * Once the full request has arrived we hand it to the worker. */
             if (seq == g_conn.peer_seq) {                 /* in-order: append */
                 int space = (int)sizeof(g_httpreq) - 1 - g_httpreqlen;
                 int n = data_len < space ? data_len : space;
@@ -716,15 +799,20 @@ int tcp_handle_packet(const unsigned char *frame, int len)
                 return 1;
             }
 
-            int rlen = http_build(g_httpreq, http_resp, (int)sizeof http_resp);
-            tcp_send(TCP_FLAG_PSH | TCP_FLAG_ACK, http_resp, rlen);
-            g_conn.my_seq += rlen;
-
-            /* Close immediately (HTTP/1.0 Connection: close). */
-            tcp_send(TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0);
-            g_conn.my_seq += 1;
-            g_conn.state = TCP_FIN_WAIT_1;
-            uart_puts("http: served request, FIN sent\n");
+            /* Complete request: hand it to the app-worker process instead of
+             * running http_build (cc/llm) here on the net process's stack.
+             * ACK the request now; tcp_app_flush() sends the response when
+             * the worker is done.  Only queue when idle (single in-flight). */
+            if (g_app_state == APP_IDLE) {
+                int n = g_httpreqlen;
+                if (n > (int)sizeof(g_app_req) - 1) n = (int)sizeof(g_app_req) - 1;
+                for (int i = 0; i < n; i++) g_app_req[i] = g_httpreq[i];
+                g_app_req[n] = 0;
+                g_app_req_len = n;
+                __asm__ volatile ("dsb sy" ::: "memory");  /* req visible before QUEUED */
+                g_app_state = APP_QUEUED;
+            }
+            tcp_send(TCP_FLAG_ACK, 0, 0);   /* ack the request; reply follows */
             return 1;
         }
         if (flags & TCP_FLAG_FIN) {

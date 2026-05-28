@@ -15,6 +15,7 @@
 #include "shell.h"
 #include "memory.h"
 #include "proc.h"
+#include "critical.h"
 #include "video.h"
 #include "early_diag.h"
 #include "wm.h"
@@ -143,62 +144,83 @@ static void genet_rx_tick(void)
     genet_irq_rearm();
 }
 
-/* ---------- IRQ-woken network process (bottom half) ----------
- * Instead of the wm-loop polling genet_rx_tick() every frame, RX draining
- * + protocol dispatch now lives in a dedicated process on its own 8 KB
- * stack.  The GENET RX IRQ (INTID 189) readies it; the wm-loop yields to it
- * each frame, so it runs serialized with the shell/AIPL runtime (NULLPROC)
- * — no preemption into it, because its dispatch path can reach the
- * non-reentrant cc/llm/vheap state.  This decouples the network code from
- * the wm tick and isolates its stack, and is the foundation for true
- * preemptive networking once the app layer is split off.
+/* ---------- IRQ-woken network process + app worker (preemptive net) ----------
+ * Two cooperating processes decouple networking from both the wm-loop and
+ * the non-reentrant AIPL runtime:
+ *   - net process  : drains RX, runs the TCP/ARP/ICMP state machine, and
+ *                     flushes finished HTTP responses.  Sole owner of
+ *                     GENET/TCP state; never touches vheap/cc/llm.  Woken by
+ *                     the GENET RX IRQ (INTID 189) and by the app worker.
+ *   - app worker   : runs http_build (cc/llm) for a queued request on its
+ *                     own stack, then kicks the net process to send the
+ *                     reply.  Touches vheap/cc/llm; never touches GENET/TCP.
+ * They share only the single-slot mailbox in tcp_server.c (g_app_state).
  *
- * Wake handshake (race-free): the process masks IRQs before deciding to
- * block, so an IRQ can never proc_ready() it while it is still PR_CURR.
- *   - g_net_pending : set by the IRQ; "packets may be waiting, don't sleep"
- *   - g_net_blocked : set by the process under mask; "I am about to wait,
- *                     the IRQ may ready me" */
-static int          g_net_pid = -1;
-static volatile int g_net_blocked;
-static volatile int g_net_pending;
+ * Why this is preemption-safe (with /netpreempt on): NULLPROC (shell, which
+ * also uses vheap) is never preempted (proc_preempt skips it) and never sits
+ * on the ready list, so a preemption from the app worker can only land on
+ * the net process — which doesn't touch vheap.  Thus the timer can preempt a
+ * long cc/llm to service RX/ICMP/TCP within a tick, with no shared-state race.
+ *
+ * waiter_t: a process parks waiting for work; another context kicks it.
+ * Race-free — park sets `parked` under IRQ mask before blocking, so a kick
+ * (which only readies a parked == PR_WAIT process) is never lost and never
+ * pushes a PR_CURR process onto the ready list. */
+typedef struct { int pid; volatile int pending; volatile int parked; } waiter_t;
+static waiter_t g_net_w = { -1, 0, 0 };
+static waiter_t g_app_w = { -1, 0, 0 };
+
+/* App-layer handoff (tcp_server.c). */
+extern int  tcp_app_req_pending(void);
+extern int  tcp_app_work(void);     /* run cc/llm for the queued request   */
+extern void tcp_app_flush(void);    /* send the finished response          */
+
+static void waiter_kick(waiter_t *w)          /* from any context (IRQ-safe) */
+{
+    unsigned long d = irq_save();
+    w->pending = 1;
+    if (w->parked) { w->parked = 0; proc_ready(w->pid); }
+    irq_restore(d);
+}
+
+static void waiter_park(waiter_t *w)          /* from the waiter's own process */
+{
+    irq_disable_all();                        /* atomic check-and-block */
+    if (w->pending) { w->pending = 0; irq_enable_all(); return; }
+    w->parked = 1;
+    proc_block();                             /* masked; resumes masked on kick */
+    irq_enable_all();
+}
 
 static void net_proc_main(void)
 {
     for (;;) {
-        irq_enable_all();          /* IRQs on while we drain/dispatch */
-        genet_rx_tick();           /* drain + protocol dispatch + IRQ re-arm */
-
-        irq_disable_all();         /* atomic check-and-block vs. the RX IRQ */
-        if (g_net_pending) {       /* a packet arrived during the drain */
-            g_net_pending = 0;
-            continue;              /* loop (top re-enables IRQs) — don't sleep */
-        }
-        g_net_blocked = 1;         /* now the IRQ is allowed to ready us */
-        proc_block();              /* sleeps masked; woken via net_irq_wake() */
-        /* Resumes here (still masked) once readied; loop re-enables IRQs. */
+        irq_enable_all();
+        genet_rx_tick();                       /* drain + dispatch (may queue a request) */
+        if (tcp_app_req_pending()) waiter_kick(&g_app_w);  /* hand off to worker */
+        tcp_app_flush();                       /* send a response the worker finished */
+        waiter_park(&g_net_w);                 /* sleep until RX IRQ or worker kick */
     }
 }
 
-/* Called from genet's RX IRQ (DAIF already masked).  Wake the net process
- * only if it is genuinely blocked — never push a PR_CURR process onto the
- * ready list (that would let proc_block ctxsw into a half-saved frame). */
-static void net_irq_wake(void)
+static void app_proc_main(void)
 {
-    g_net_pending = 1;
-    if (g_net_blocked) {
-        g_net_blocked = 0;
-        proc_ready(g_net_pid);
+    for (;;) {
+        irq_enable_all();
+        if (tcp_app_work())                    /* run cc/llm off the net stack */
+            waiter_kick(&g_net_w);             /* wake net to flush the reply */
+        waiter_park(&g_app_w);                 /* sleep until net queues a request */
     }
 }
 
 static void net_irq_handler(void *arg)
 {
-    genet_irq_handler(arg);        /* driver: count + self-mask + ack */
-    net_irq_wake();                /* upper half: wake the net process */
+    genet_irq_handler(arg);                    /* driver: count + self-mask + ack */
+    waiter_kick(&g_net_w);                     /* upper half: wake the net process */
 }
 
-/* wm tick: instead of draining inline, just yield so the IRQ-woken net
- * process gets the CPU.  No-op (returns immediately) when nothing is ready. */
+/* wm tick: yield so the IRQ-woken net process / app worker get the CPU.
+ * No-op (returns immediately) when nothing is ready. */
 static void net_yield_tick(void)
 {
     proc_yield();
@@ -852,17 +874,19 @@ void kernel_main(void)
      * ~0x06000000 on Pi 4) so we know the controller is powered. */
     genet_init();
 
-    /* NET-D — IRQ-driven RX via a dedicated network process (bottom half).
-     * The GENET RX-ring-16 done interrupt (INTRL2_0 bit 13 = RXDMA_DONE,
-     * GIC SPI 157 = INTID 189) wakes net_proc_main, which drains + dispatches
-     * on its own stack.  net_irq_handler counts + self-masks (driver) then
-     * readies the process; genet_rx_tick re-arms after draining.  Create the
-     * process *before* enabling the IRQ so g_net_pid is valid when it fires. */
-    g_net_pid = proc_create(net_proc_main, 8192, "net");
+    /* NET-D — IRQ-driven RX via a net process + app worker (preemptive net).
+     * The GENET RX done IRQ (INTRL2_0 bit 13 = RXDMA_DONE, GIC SPI 157 =
+     * INTID 189) wakes net_proc_main, which drains + runs the TCP/ARP/ICMP
+     * state machine and queues complete HTTP requests for app_proc_main
+     * (cc/llm on its own stack).  Create both processes *before* enabling the
+     * IRQ so their waiter pids are valid when it fires.  Preemption stays OFF
+     * at boot — enable it at runtime via /netpreempt once verified. */
+    g_net_w.pid = proc_create(net_proc_main, 8192,  "net");
+    g_app_w.pid = proc_create(app_proc_main, 16384, "app");
     connect_interrupt(189, net_irq_handler, 0);
     gic_enable_irq(189);
     genet_irq_enable();
-    uart_puts("net: GENET RX IRQ -> net process (INTID 189)\n");
+    uart_puts("net: GENET RX IRQ -> net process + app worker (INTID 189)\n");
 
     /* Pass our MAC to the responder so ARP replies carry the
      * right source MAC.  d8:3a:dd:a7:fd:bf — confirmed from

@@ -1,5 +1,49 @@
 # NEXT_SESSION — xinu-rpi4
 
+## ✅ 2026-05-29 — ★プリエンプティブ・ネットワーキング（app 層分離 + preempt）★実機検証済
+
+bottom-half の積み残し「真のプリエンプティブ・ネットワーキング」を達成。app 層(HTTP→cc/llm)を net
+プロセスから切り離し、長い計算中もネットワークが低遅延を維持。
+- **2プロセス構成**: `net`(RX drain+TCP/ARP/ICMP 状態機械+完成レスポンス送信、GENET/TCP の単独所有、
+  vheap 非接触) ⇄ `app`(16KB スタックで `http_build`=cc/llm 実行、vheap 所有、GENET/TCP 非接触)。共有は
+  ガード付き1スロット・メールボックス `g_app_state`(IDLE→QUEUED→WORKING→DONE)のみ。tcp_server.c に
+  `tcp_app_req_pending/work/flush`、tcp_handle_packet は inline http_build をやめて enqueue+ACK に変更。
+- **waiter_t**(main.c): レース無し park/kick。park はマスク下で `parked`=1 にしてから proc_block ⇒ kick
+  (parked==PR_WAIT の時だけ proc_ready)が取りこぼし無し・PR_CURR を ready 列に積まない。net_irq_handler と
+  app↔net が同じ waiter で起こし合う。
+- **プリエンプション安全性(実機実証)**: NULLPROC(shell, vheap 使用)は proc_preempt 非対象＆ready 列に不在
+  ⇒ app からのプリエンプトは **net にしか着地しない** ⇒ net は vheap 非接触 ⇒ 競合ゼロ。だから g_preempt_on=1
+  で「長い cc/llm を 1 tick で中断し RX/ICMP/TCP を捌く」が安全。
+- **実行時トグル `/netpreempt?on=1|0`**(診断 `/netstat`= app_state/served/preempt)。診断チャネル温存のため
+  ブート時 OFF、協調動作の正しさ(ping/`/compile`→`=> 7`/served 増加)を確認後に ON。
+- **A/B 実機結果**: 同一 /llm?n=96 計算中の ICMP ping → **OFF: avg 1536ms / max 2967ms(全部完了まで詰まる
+  階段状)、ON: avg 8.7ms / max 12ms(約176倍改善)**。LLM 出力は両者完全一致(~270回/秒 preempt でも無破壊)、
+  ping 0%。/compile=`=> 42` 維持。commit **(this)**。
+- QEMU は GENET 無し+タイマ不発 → **実機のみ検証可**。
+
+## ✅ 2026-05-29 — ★GENET RX を IRQ 駆動ネットワークプロセス化（bottom half）★実機検証済
+
+プリエンプション全面化の前提＝ネットワークを協調 wm-loop ポーリングから切り離す。2段で実機検証。
+
+**① GENET RX IRQ 診断（commit 1682fcb）** — タイマ復活の `/ticks` 手法を踏襲。RX-ring-16 done 割込
+(`INTRL2_0` bit13 = RXDMA_DONE → GIC SPI157 = **INTID 189**)を配線して発火を数える。
+- genet.c: `genet_irq_handler`(count + 自己マスク `INTRL2_0_MASK_SET` + ack `INTRL2_0_CLEAR=STAT`、ストーム防止)、
+  `genet_irq_enable`(init後アーム)、`genet_irq_rearm`(drain後再 unmask)、`genet_irq_count`。`/genetirq` 診断ルート。
+- **実機**: genet_irq が通信で 13→65→67 と増加、Pi 安定(ping 0%)＝GIC が GENET SPI を正しくルーティング。
+
+**② IRQ で起こされるネットワークプロセス（commit 34cdcf6）** — RX drain+dispatch を wm tick から専用
+`net` プロセス(8KB スタック)へ移動。RX IRQ が起こす。
+- main.c: `net_proc_main`(loop: `genet_rx_tick`=drain+dispatch+rearm → 次の IRQ まで block)。
+  `net_irq_handler`= driver の `genet_irq_handler` + `net_irq_wake`。wm tick は `net_yield_tick`(proc_yield)へ。
+- **レース無し wake**: block 判断前に IRQ マスク(`g_net_blocked`)→ IRQ は PR_CURR を ready しない。drain 中着の
+  パケットは `g_net_pending` で再ループ(取りこぼし無し)。NULLPROC(shell/AIPL)と**直列**＝preempt 入れない
+  (dispatch が非リエントラント cc/llm/vheap に届くため)。
+- **実機**: ping 0%、genet_irq 33→94、**`/compile` で cc が net プロセスのスタックで完走(`int main(){int a=1+2*3;return a;}`→`=> 7`)**、
+  /chat dispatch、8連バースト安定。
+- ⚠️ レイテンシは依然フレーム境界(協調 yield ~50ms)。**真のプリエンプティブ・ネットワーキング**には app 層
+  (HTTP→cc/llm)を net プロセスから切り離し、低レベル(ARP/ICMP/TCP状態)だけ IRQ 即時+アプリはワークキュー、が次段階。
+- QEMU は GENET 無し→**実機のみ検証可**。
+
 ## ✅ 2026-05-29 — ★プリエンプティブ・スケジューラ（タイマ駆動 RR）★実機検証済
 
 タイマ IRQ 復活を土台にプリエンプティブ・マルチタスクを実装。100Hz tick で ISR が resched 要求→IRQ
