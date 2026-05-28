@@ -13,6 +13,8 @@
 #include "proc.h"
 #include "uart.h"
 #include "actorproc.h"
+#include "critical.h"
+#include "irq.h"
 
 #define AP_NACT  (NPROC - 1)        /* one Xinu process per actor       */
 #define AP_QLEN  64
@@ -125,6 +127,8 @@ long ap_select(long self, int n, const long *meths, struct ap_msg *out)
 
 static void actor_proc_main(void)
 {
+    irq_enable_all();   /* a freshly-started proc inherits the scheduler's masked
+                         * DAIF from the ctxsw; restore the normal (I-unmasked) state */
     int self = (int)(long)proctab[currpid].arg;
     struct ap_msg m;
     for (;;) {
@@ -250,5 +254,71 @@ int cmd_selectdemo(int argc, char **argv)
     ap_run();
     ap_killall();
     uart_puts("selectdemo: done\n");
+    return 0;
+}
+
+/* ---------- preemptive scheduling demo ----------
+ * Two CPU-bound processes that never yield voluntarily: each spins a chunk
+ * of integer work, then appends its id to a shared log, 14 times.  Under
+ * cooperative scheduling one runs to completion before the other ("AAAA...
+ * BBBB...").  With timer-driven preemption on, the 100 Hz tick time-slices
+ * them, so the log interleaves ("ABABAB...").  Pure integer work in their own
+ * stacks — no shared runtime state — so preempting them is safe. */
+static char         g_plog[160];
+static volatile int g_plogn;
+static volatile int g_preempt_running;
+
+static void plog_put(char c)
+{
+    unsigned long d = irq_save();
+    if (g_plogn < (int)sizeof(g_plog) - 1) g_plog[g_plogn++] = c;
+    irq_restore(d);
+}
+
+static void compute_proc_main(void)
+{
+    irq_enable_all();   /* unmask IRQs (see actor_proc_main) so the timer can preempt us */
+    char id = (char)(long)proctab[currpid].arg;
+    for (int k = 0; k < 10; k++) {
+        volatile long s = 0;
+        for (long i = 0; i < 3000000; i++) s += i;   /* short chunk; total demo stays short
+                                                       * so the unpumped GENET RX ring survives */
+        plog_put(id);
+    }
+    unsigned long d = irq_save(); g_preempt_running--; irq_restore(d);
+    proc_exit();                                      /* never returns */
+}
+
+/* Run the demo (from the shell/NULLPROC context); copies the interleave log
+ * into `out`.  Returns the log length. */
+int preempt_demo(char *out, int outcap)
+{
+    g_plogn = 0; g_preempt_running = 2;
+    int a = proc_create_arg(compute_proc_main, 4096, "cpuA", (void *)(long)'A');
+    int b = proc_create_arg(compute_proc_main, 4096, "cpuB", (void *)(long)'B');
+    if (a < 0 || b < 0) {
+        const char *m = "preempt: no process slots"; int n = 0;
+        while (m[n] && n < outcap - 1) { out[n] = m[n]; n++; } if (outcap) out[n] = 0;
+        return 0;
+    }
+    proc_set_preempt(1);                  /* enable timer-driven preemption */
+    int guard = 0;
+    while (g_preempt_running > 0 && guard++ < 2000000) proc_yield();
+    proc_set_preempt(0);                  /* back to cooperative */
+
+    int n = 0;
+    for (; n < g_plogn && n < outcap - 1; n++) out[n] = g_plog[n];
+    if (outcap) out[n] = 0;
+    return g_plogn;
+}
+
+int cmd_preempt(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    static char o[160];
+    preempt_demo(o, sizeof o);
+    uart_puts("preempt: 2 CPU-bound procs, timer time-sliced -> ");
+    uart_puts(o);
+    uart_puts("\n  (cooperative would be AAAA...BBBB; interleaving = preemption)\n");
     return 0;
 }

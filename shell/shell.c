@@ -670,6 +670,8 @@ extern int cmd_actordemo(int, char **);
 extern int cmd_selectdemo(int, char **);
 /* On-device LLM (baked stories260K) lives in llm/llm.c. */
 extern int cmd_llm(int, char **);
+/* Preemptive-scheduling demo lives in system/actorproc.c. */
+extern int cmd_preempt(int, char **);
 
 static const struct centry commandtab[] = {
     { "help",   "list the commands",                       cmd_help   },
@@ -693,6 +695,7 @@ static const struct centry commandtab[] = {
     { "actordemo","actors as Xinu processes (ping-pong)",   cmd_actordemo },
     { "selectdemo","select: receive a named message first",  cmd_selectdemo },
     { "llm",    "llm [prompt] — generate text (baked LLM)",  cmd_llm    },
+    { "preempt","preempt — demo timer-driven preemptive RR",  cmd_preempt },
     { "echo",   "echo the remaining words back",           cmd_echo   },
     { "hello",  "smoke marker — say hello",                cmd_hello  },
     { "mem",    "show __bss_start / __bss_end / _end",     cmd_mem    },

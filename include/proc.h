@@ -54,6 +54,12 @@ void proc_ready(int pid);
 void proc_resched(void);
 void proc_yield(void);
 void proc_exit(void);
+/* Preemptive scheduling (timer-driven round-robin).  proc_set_preempt(1)
+ * enables it; proc_resched_request() is called from the timer ISR; and
+ * proc_preempt() (after the IRQ is EOI'd) performs the switch. */
+void proc_set_preempt(int on);
+void proc_resched_request(void);
+void proc_preempt(void);
 /* Block the current process (removes it from CURR; resched won't re-ready
  * it) until proc_ready() puts it back.  Used by mailbox receive. */
 void proc_block(void);

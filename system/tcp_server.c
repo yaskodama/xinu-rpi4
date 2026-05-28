@@ -23,6 +23,8 @@ extern int llm_run(const char *prompt, int max_new, char *out, int outcap, int e
 extern int cc_actor_send_str(int actor, const char *method, const char *strarg, char *out, int outcap);
 /* 100 Hz IRQ-driven tick counter (device/timer/timer.c) — for /ticks diag. */
 extern unsigned long timer_ticks(void);
+/* Preemptive-scheduling demo (system/actorproc.c): interleave log -> out. */
+extern int preempt_demo(char *out, int outcap);
 
 extern int genet_tx_frame(const unsigned char *frame, int length);
 
@@ -441,6 +443,15 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, " EL=");        bl = s_putdec(body, bl, (long)((el >> 2) & 3));
         bl = s_put(body, bl, " cntp_ctl=");  bl = s_putdec(body, bl, (long)ctl);   /* bit0=EN bit1=IMASK bit2=ISTATUS */
         bl = s_put(body, bl, " daif=");      bl = s_putdec(body, bl, (long)((daif >> 6) & 0xf));
+        bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "GET /preempt") || starts_with(req, "POST /preempt")) {
+        /* Demo: 2 CPU-bound procs time-sliced by the timer.  Cooperative ->
+         * "AAAA...BBBB"; preemptive -> interleaved "ABABAB...". */
+        ctype = "text/plain";
+        static char plog[160];
+        preempt_demo(plog, sizeof plog);
+        bl = s_put(body, bl, "preempt log: ");
+        bl = s_put(body, bl, plog);
         bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "POST /chat") || starts_with(req, "GET /chat")) {
         /* Converse with a resident actor: deliver the message (POST body or

@@ -12,9 +12,20 @@
 
 #include "proc.h"
 #include "memory.h"
+#include "critical.h"
 
 struct procent proctab[NPROC];
 int            currpid;
+
+/* Preemption (timer-driven round-robin).  Off by default: the cooperative
+ * AIPL/actor/LLM runtime shares non-reentrant global state (the value_t heap,
+ * the LLM buffers, GENET), so we only preempt when explicitly enabled around
+ * isolated, self-contained processes.  The timer ISR sets g_resched_pending;
+ * proc_preempt() (run after the IRQ is EOI'd) acts on it. */
+static volatile int g_preempt_on;
+static volatile int g_resched_pending;
+void proc_set_preempt(int on)      { g_preempt_on = on ? 1 : 0; }
+void proc_resched_request(void)    { g_resched_pending = 1; }
 
 static struct procent *ready_head;
 static struct procent *ready_tail;
@@ -155,9 +166,11 @@ int proc_create_arg(proc_entry_t entry, unsigned long stksize, const char *name,
 void proc_ready(int pid)
 {
     if (pid <= 0 || pid >= NPROC) return;
+    unsigned long d = irq_save();
     struct procent *p = &proctab[pid];
     p->state = PR_READY;
     ready_push(p);
+    irq_restore(d);
 }
 
 /* Pick the next ready process and ctxsw into it.  Returns once we
@@ -166,8 +179,9 @@ void proc_ready(int pid)
  * unconditionally). */
 void proc_resched(void)
 {
+    unsigned long d = irq_save();
     struct procent *newp = ready_pop();
-    if (newp == 0) return;
+    if (newp == 0) { irq_restore(d); return; }
 
     int new_pid       = (int)(newp - proctab);
     struct procent *oldp = &proctab[currpid];
@@ -185,11 +199,22 @@ void proc_resched(void)
 
     ctxsw(&oldp->sp, newp->sp);
     /* Returns here when somebody ctxsw()'s back to us. */
+    irq_restore(d);
 }
 
 void proc_yield(void)
 {
     proc_resched();
+}
+
+/* Timer-driven preemption point: called from irq_dispatch_c after the IRQ is
+ * EOI'd (so the next process can still receive timer IRQs).  Only preempts a
+ * non-NULLPROC (i.e. a real process) when enabled and a tick is pending. */
+void proc_preempt(void)
+{
+    if (!g_preempt_on || !g_resched_pending) return;
+    g_resched_pending = 0;
+    if (currpid != NULLPROC) proc_resched();
 }
 
 /* Reap a process that is blocked (PR_WAIT) — not on the ready list and
@@ -198,12 +223,14 @@ void proc_yield(void)
 void proc_kill(int pid)
 {
     if (pid <= 0 || pid >= NPROC || pid == currpid) return;
+    unsigned long d = irq_save();
     struct procent *p = &proctab[pid];
-    if (p->state == PR_FREE) return;
+    if (p->state == PR_FREE) { irq_restore(d); return; }
     ready_remove(p);                /* never leave a freed slot on the ready list */
     if (p->stkbase) freemem(p->stkbase, p->stklen);
     p->stkbase = 0;
     p->state   = PR_FREE;
+    irq_restore(d);
 }
 
 /* Block the current process: it leaves PR_CURR for PR_WAIT (so resched
@@ -212,6 +239,7 @@ void proc_kill(int pid)
  * and the scheduler picks us again. */
 void proc_block(void)
 {
+    unsigned long d = irq_save();
     struct procent *oldp = &proctab[currpid];
     oldp->state = PR_WAIT;
 
@@ -223,14 +251,17 @@ void proc_block(void)
 
     ctxsw(&oldp->sp, newp->sp);
     /* Resumes here when we are readied and ctxsw'd back into. */
+    irq_restore(d);
 }
 
 /* Process voluntarily exits.  Marks slot free, picks next ready
  * (or NULLPROC if none), and ctxsw away — never returns. */
 void proc_exit(void)
 {
+    irq_save();                 /* never returns -> no restore (eret in target unmasks) */
     int me = currpid;
     proctab[me].state = PR_FREE;
+    ready_remove(&proctab[me]); /* in case it was (re)queued */
 
     struct procent *newp = ready_pop();
     if (newp == 0) newp = &proctab[NULLPROC];
