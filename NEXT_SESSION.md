@@ -1,5 +1,16 @@
 # NEXT_SESSION — xinu-rpi4
 
+## 🚧 2026-05-28 — actors-as-Xinu-processes + blocking receive + select (機構のみ)
+
+`system/actorproc.c`: 各アクターを協調 Xinu プロセス(proc.c)化、アクター毎メールボックス +
+ブロッキング受信。`ap_send`(enqueue+proc_ready)/`ap_recv`(空なら proc_block)/**`ap_select`(選択的
+受信=指定メソッドを待ち他は残す→AIPL `select` の核)**/`actor_proc_main`(recv ループ→g_actor_dispatch)/
+`ap_spawn`/`ap_run`。`proc.c` に **PR_WAIT + proc_block()(ready無しなら NULLPROC へ) + proc_create_arg()**。
+シェル `actordemo`(2アクター ping-pong)/`selectdemo`(GO を DATA より先に select)で QEMU 検証。commit bee8b34。
+★**機構のみ(native demo)。次段階=AIPL --xinu-jit 統合**: g_spawn でアクター毎 ap_spawn、`send`→ap_send、
+翻訳器が `select{case m:}` を ap_select 呼出+分岐に出力。run-to-completion pump では不可能だった
+「ハンドラ途中で特定メッセージを待つ」が可能に。未 flash(実機最新 0d8f2140)。
+
 ## ✅ 2026-05-28 — 非同期 mailbox (並行アクター)
 
 AIPL `send obj.m(args)` を fire-and-forget 化。cc.c に FIFO キュー + 外部 `enqueue(to,mid,a0..a3)`
