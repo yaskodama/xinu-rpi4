@@ -1,5 +1,20 @@
 # NEXT_SESSION — xinu-rpi5
 
+## ✅ 2026-05-28 — 常駐 AIPL アクター (load→メッセージ交換) + float 値
+
+**常駐アクター**: `cc_actor_load(src)` が AIPL→C を常駐コンパイル(code+arena 非解放→g_obj/文字列
+永続)、main() でアクター spawn。`cc_actor_send_msg(actor,method,arg)` が __method_id で名前→id 解決
+→dispatch→結果 render。翻訳器が `__method_id`/`__nobj` を出力、codegen に `cc_func_offset`。
+HTTP **POST /actor/load** / **GET /actor/send?to=&m=&arg=**、シェル `aload`/`amsg`、Mac 側
+`examples_xinujit/actor_server.sh`。★メソッド名は 8整列バッファにコピーしてから v_str(奇数アドレスは
+int タグと衝突)。vheap は load 時のみ reset(string/float フィールド永続)。QEMU(aload/amsg)で
+Counter を load→bump 10=52→get=52→bump 100=152→get=152(状態永続) 確認。**HTTP 経路は実機要**
+(現 flash 79b531b5 は未搭載)。commit xinu 3345537 / abclcp 9c30606 / 83d2905。
+
+**float 値**: value_t に float variant(boxed double, bit60 タグ)。v_floatlit/promote/6桁表示。
+cc.c のみ `-mgeneral-regs-only` 除外ビルド + CPACR FP 有効化。翻訳器 `Float→v_floatlit(IEEE bits)`。
+QEMU で Rotor.spin(0.5*3=1.5)・"angle = "+2.0 OK。commit xinu 3336403 / abclcp dccc2f7。
+
 ## ✅ 2026-05-28 — AIPL --xinu-jit を value_t 化 (文字列対応, QEMU検証)
 
 `cc/cc.c` に **タグ付き value_t ランタイム** (低位bit1=即値int / 0=文字列ポインタ)。
