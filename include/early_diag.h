@@ -14,8 +14,8 @@
 // over the rainbow — telling us both "kernel runs" and "FB lives
 // somewhere around HERE".
 
-#ifndef XINU_RPI5_EARLY_DIAG_H
-#define XINU_RPI5_EARLY_DIAG_H
+#ifndef XINU_RPI4_EARLY_DIAG_H
+#define XINU_RPI4_EARLY_DIAG_H
 
 /* Phys addr the firmware passed in x0 (saved by boot.S after BSS
  * clear).  Reading it before main() is safe because boot.S writes
@@ -24,4 +24,4 @@ extern unsigned long dtb_addr;
 
 void early_paint_diagnostic(void);
 
-#endif /* XINU_RPI5_EARLY_DIAG_H */
+#endif /* XINU_RPI4_EARLY_DIAG_H */

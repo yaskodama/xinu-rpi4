@@ -750,7 +750,7 @@ void shell_main(void)
     uart_puts("type `help` for the command list.\n");
 
     for (;;) {
-        uart_puts("xinu-pi5$ ");
+        uart_puts("xinu-pi4$ ");
         int n = uart_getline(line, SHELL_BUFLEN);
         if (n <= 0) continue;
         shell_dispatch_line(line);

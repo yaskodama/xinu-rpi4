@@ -13,8 +13,8 @@
 // IRQ that drives `resched()` from a clock tick.  For now, every
 // context switch is voluntary.
 
-#ifndef XINU_RPI5_PROC_H
-#define XINU_RPI5_PROC_H
+#ifndef XINU_RPI4_PROC_H
+#define XINU_RPI4_PROC_H
 
 #define NPROC          8
 #define NULLPROC       0
@@ -55,4 +55,4 @@ void proc_exit(void);
  * new_sp is loaded immediately. */
 extern void ctxsw(void **old_sp, void *new_sp);
 
-#endif /* XINU_RPI5_PROC_H */
+#endif /* XINU_RPI4_PROC_H */

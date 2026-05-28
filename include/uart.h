@@ -11,8 +11,8 @@
 //   uart_puts(s) — convenience wrapper that walks a NUL-terminated string
 //                  and converts each '\n' into "\r\n" for terminal sanity.
 
-#ifndef XINU_RPI5_UART_H
-#define XINU_RPI5_UART_H
+#ifndef XINU_RPI4_UART_H
+#define XINU_RPI4_UART_H
 
 void uart_init(void);
 void uart_putc(char c);
@@ -33,4 +33,4 @@ int  uart_poll_char(void);
  * (0x0A) both terminate input. */
 int uart_getline(char *buf, int max);
 
-#endif /* XINU_RPI5_UART_H */
+#endif /* XINU_RPI4_UART_H */

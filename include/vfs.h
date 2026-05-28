@@ -11,8 +11,8 @@
 // on the Pi OS rootfs partition) can be added later as alternative
 // implementations of the same vfs_node_t interface.
 
-#ifndef XINU_RPI5_VFS_H
-#define XINU_RPI5_VFS_H
+#ifndef XINU_RPI4_VFS_H
+#define XINU_RPI4_VFS_H
 
 #define VFS_NAME_MAX  31
 
@@ -101,4 +101,4 @@ void vfs_walk(vfs_node_t *node, int depth, vfs_visit_fn visit, void *ctx);
 unsigned long vfs_node_count(void);
 unsigned long vfs_total_file_bytes(void);
 
-#endif /* XINU_RPI5_VFS_H */
+#endif /* XINU_RPI4_VFS_H */

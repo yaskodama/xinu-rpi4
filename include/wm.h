@@ -12,8 +12,8 @@
 // makes them interesting is what their content callbacks do
 // (clocks, animations, scheduler telemetry).
 
-#ifndef XINU_RPI5_WM_H
-#define XINU_RPI5_WM_H
+#ifndef XINU_RPI4_WM_H
+#define XINU_RPI4_WM_H
 
 #define WM_TITLE_MAX  31
 #define WM_TITLEBAR_H 12          /* 8 px glyph + 2 px padding top/bottom */
@@ -75,4 +75,4 @@ int  wm_view_y(void);
  * the larger desktop scroll without any input.  Pass 0 to stop. */
 void wm_set_autopan(int on);
 
-#endif /* XINU_RPI5_WM_H */
+#endif /* XINU_RPI4_WM_H */

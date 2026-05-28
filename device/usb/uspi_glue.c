@@ -1,6 +1,6 @@
 // device/usb/uspi_glue.c — USPi OS interface adapter.
 //
-// Implements the `uspios.h` contract on top of xinu-rpi5's kmalloc,
+// Implements the `uspios.h` contract on top of xinu-rpi4's kmalloc,
 // generic timer (100 Hz tick), GIC IRQ dispatch and VC mailbox.
 // USPi calls these from its DWC2 driver and HID class layers.
 //
@@ -165,7 +165,7 @@ int SetPowerStateOn(unsigned nDeviceId)
 
 int GetMACAddress(unsigned char Buffer[6])
 {
-    /* xinu-rpi5 doesn't surface Ethernet — USPi only needs this
+    /* xinu-rpi4 doesn't surface Ethernet — USPi only needs this
      * when SMSC951x / LAN7800 are linked, which we keep disabled
      * for the keyboard/mouse-only profile.  Return 0 (failure). */
     for (int i = 0; i < 6; i++) Buffer[i] = 0;

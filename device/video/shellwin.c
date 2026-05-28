@@ -109,7 +109,7 @@ void shellwin_handle_key(char c)
             shell_dispatch_line(inbuf);
             inlen = 0;
         }
-        uart_puts("xinu-pi5$ ");
+        uart_puts("xinu-pi4$ ");
     } else if (c == 0x08 || c == 0x7F) {
         if (inlen > 0) {
             inlen--;

@@ -1,4 +1,4 @@
-# compile/Makefile — top-level build for xinu-rpi5 (and xinu-rpi4).
+# compile/Makefile — top-level build for xinu-rpi4 (and xinu-rpi4).
 #
 # Mirrors the layout convention used by github.com/davidxyz/xinuPi
 # (and Embedded Xinu in general): sources live under per-subsystem

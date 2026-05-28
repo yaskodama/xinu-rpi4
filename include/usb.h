@@ -11,8 +11,8 @@
 // at our MMIO address.  Both make every function a no-op so a
 // single source tree can build for all three boards.
 
-#ifndef XINU_RPI5_USB_H
-#define XINU_RPI5_USB_H
+#ifndef XINU_RPI4_USB_H
+#define XINU_RPI4_USB_H
 
 /* Power on the USB HCD via VC mailbox (Pi 4 only) and read the
  * Synopsys ID register so subsequent shell diagnostics know
@@ -35,4 +35,4 @@ unsigned int usb_synopsys_id(void);
  * "no-response" without re-reading MMIO. */
 int usb_last_init_ok(void);
 
-#endif /* XINU_RPI5_USB_H */
+#endif /* XINU_RPI4_USB_H */

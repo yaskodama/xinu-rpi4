@@ -1,4 +1,4 @@
-# Xinu xinu-rpi5 User's Manual (English)
+# Xinu xinu-rpi4 User's Manual (English)
 
 Embedded Xinu port for the Raspberry Pi 5 (BCM2712 / Cortex-A76, AArch64).
 The same source tree also cross-builds for the Raspberry Pi 4 (BCM2711) and
@@ -117,7 +117,7 @@ sources from `../loader/`, `../device/...`, etc.
 ### 3.1 Basic commands
 
 ```sh
-cd /Users/kodamay/projects/xinu-rpi5/compile
+cd /Users/kodamay/projects/xinu-rpi4/compile
 
 make pi5            # → compile/kernel_2712.img   (real Pi 5)
 make pi4            # → compile/kernel8.img       (real Pi 4)
@@ -274,12 +274,12 @@ Within ~5 seconds of power-on you should see:
 ================================================
   Xinu Pi5 hello (AArch64, BCM2712, kernel_2712.img)
   PL011 UART0 @ 0x107D001000, 115200 8N1
-  bootstrap: leex-style stub + xinu-rpi5 main
+  bootstrap: leex-style stub + xinu-rpi4 main
 ================================================
 
 Round 1 phase B/U done — entering interactive shell.
 type `help` for the command list.
-xinu-pi5$ _
+xinu-pi4$ _
 ```
 
 On a Pi 4 build the prompt is `xinu-pi4$`.
@@ -315,7 +315,7 @@ On a Pi 4 build the prompt is `xinu-pi4$`.
 `procdemo 3` exercises actual AArch64 context switching:
 
 ```
-xinu-pi5$ procdemo 3
+xinu-pi4$ procdemo 3
 procdemo: created pid=1 (ping) and pid=2 (pong), iters=3
 ---------------------------------------------
   [Ping pid=1] tick 1
@@ -501,7 +501,7 @@ Generic recovery flow:
 The places you actually touch:
 
 ```
-xinu-rpi5/
+xinu-rpi4/
 ├── compile/                # run `make` here
 │   ├── Makefile
 │   ├── kernel_2712.img     # Pi 5 (built by `make pi5`)
@@ -525,7 +525,7 @@ For source layout, see the README's Layout section.
 ### From a fresh checkout to a running Pi 5
 
 ```sh
-cd /Users/kodamay/projects/xinu-rpi5/compile
+cd /Users/kodamay/projects/xinu-rpi4/compile
 make clean
 make pi5
 make install_pi5 SDCARD=/Volumes
@@ -537,7 +537,7 @@ screen /dev/tty.usbserial-XXXX 115200
 ### Pi 4 ping check
 
 ```sh
-cd /Users/kodamay/projects/xinu-rpi5/compile
+cd /Users/kodamay/projects/xinu-rpi4/compile
 make pi4
 make install_pi4 SDCARD=/Volumes
 diskutil eject /Volumes/bootfs
@@ -551,12 +551,12 @@ ping 192.168.3.100
 ### Quick command sanity check (QEMU)
 
 ```sh
-cd /Users/kodamay/projects/xinu-rpi5/compile
+cd /Users/kodamay/projects/xinu-rpi4/compile
 make qemu
 # At the prompt:
-xinu-pi5$ procdemo 5
-xinu-pi5$ pingpong 3
-xinu-pi5$ halt
+xinu-pi4$ procdemo 5
+xinu-pi4$ pingpong 3
+xinu-pi4$ halt
 # Ctrl-A X to exit QEMU
 ```
 

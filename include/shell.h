@@ -5,8 +5,8 @@
 // bare-metal Round-1 context — no threads, no tty driver, just direct
 // PL011 UART I/O and a tiny static command table.
 
-#ifndef XINU_RPI5_SHELL_H
-#define XINU_RPI5_SHELL_H
+#ifndef XINU_RPI4_SHELL_H
+#define XINU_RPI4_SHELL_H
 
 #define SHELL_BUFLEN   128
 #define SHELL_MAXTOK    16
@@ -22,4 +22,4 @@ void shell_main(void);
  * blocks. */
 int  shell_dispatch_line(char *line);
 
-#endif /* XINU_RPI5_SHELL_H */
+#endif /* XINU_RPI4_SHELL_H */

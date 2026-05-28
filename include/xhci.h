@@ -14,8 +14,8 @@
 //   XHCI-G  Control transfer (GET_DESCRIPTOR / SET_CONFIGURATION)
 //   XHCI-H  HID Interrupt transfer → cursor + shell input
 
-#ifndef XINU_RPI5_XHCI_H
-#define XINU_RPI5_XHCI_H
+#ifndef XINU_RPI4_XHCI_H
+#define XINU_RPI4_XHCI_H
 
 #ifdef PCIE_BASE   /* Pi 4 only — PI4_CFLAGS supplies the value */
 
@@ -33,4 +33,4 @@ static inline unsigned int xhci_pcie_revision(void){ return 0; }
 
 #endif
 
-#endif /* XINU_RPI5_XHCI_H */
+#endif /* XINU_RPI4_XHCI_H */

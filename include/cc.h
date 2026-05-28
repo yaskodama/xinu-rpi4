@@ -1,7 +1,7 @@
 // include/cc.h — public interface to the on-device C compiler.
 
-#ifndef XINU_RPI5_CC_H
-#define XINU_RPI5_CC_H
+#ifndef XINU_RPI4_CC_H
+#define XINU_RPI4_CC_H
 
 /* `cc <file.c>` shell command. */
 int cmd_cc(int argc, char **argv);
@@ -27,4 +27,4 @@ int cc_actor_load(const char *src, int srclen, char *out, int outcap);
  * Returns 0, or -1 if no program is loaded / the method is unknown. */
 int cc_actor_send_msg(int actor, const char *method, long arg, char *out, int outcap);
 
-#endif /* XINU_RPI5_CC_H */
+#endif /* XINU_RPI4_CC_H */

@@ -14,8 +14,8 @@
 //   NET-F  DHCP client -> IP address
 //   NET-G  TCP + telnetd -> remote shell
 
-#ifndef XINU_RPI5_GENET_H
-#define XINU_RPI5_GENET_H
+#ifndef XINU_RPI4_GENET_H
+#define XINU_RPI4_GENET_H
 
 #ifdef GENET_BASE   /* Pi 4 only — PI4_CFLAGS supplies the value */
 
@@ -85,4 +85,4 @@ static inline unsigned int  genet_phy_bmsr(void)             { return 0xFFFFFFFF
 
 #endif
 
-#endif /* XINU_RPI5_GENET_H */
+#endif /* XINU_RPI4_GENET_H */

@@ -1,17 +1,17 @@
-// include/actor.h — minimal actor + mailbox layer for xinu-rpi5.
+// include/actor.h — minimal actor + mailbox layer for xinu-rpi4.
 //
 // This is the delivery target for remote messages arriving over HTTP
 // (system/tcp_server.c routes GET /send?to=N&m=method&arg=X here).  It
 // is deliberately a small, self-contained object table so that the
 // future AIPL->C codegen port (c_translator.ml --xinu retargeted for
-// xinu-rpi5) can grow into it: each actor is an object with a handful
+// xinu-rpi4) can grow into it: each actor is an object with a handful
 // of integer fields and a name, and a message is (method, arg) applied
 // to it.  For now delivery is synchronous (actor_message runs the
 // handler inline); a real mailbox + actor process can be layered on
 // later without changing this surface.
 
-#ifndef XINU_RPI5_ACTOR_H
-#define XINU_RPI5_ACTOR_H
+#ifndef XINU_RPI4_ACTOR_H
+#define XINU_RPI4_ACTOR_H
 
 #define ACTOR_MAX     8
 #define ACTOR_FIELDS  4
@@ -32,4 +32,4 @@ const char  *actor_name(int id);          /* 0 if id invalid */
 int          actor_field(int id, int idx); /* field value, 0 if invalid */
 unsigned long actor_msg_count(void);       /* total messages handled */
 
-#endif /* XINU_RPI5_ACTOR_H */
+#endif /* XINU_RPI4_ACTOR_H */

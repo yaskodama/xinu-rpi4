@@ -1,4 +1,4 @@
-# xinu-rpi5
+# xinu-rpi4
 
 Embedded Xinu port for the Raspberry Pi 5 (BCM2712, Cortex-A76,
 AArch64-only).
@@ -35,14 +35,14 @@ should show:
 ================================================
   Xinu Pi5 hello (AArch64, BCM2712, kernel_2712.img)
   PL011 UART0 @ 0x107D001000, 115200 8N1
-  bootstrap: leex-style stub + xinu-rpi5 main
+  bootstrap: leex-style stub + xinu-rpi4 main
 ================================================
 
 Round 1 phase B/U done — entering interactive shell.
 Next milestones: M0 MMU, S0 ctxsw, S1 GIC+timer
 
 type `help` for the command list.
-xinu-pi5$ _
+xinu-pi4$ _
 ```
 
 The shell handles backspace/DEL, echoes input, and dispatches via a
@@ -143,23 +143,23 @@ Recorded `make qemu-smoke` output (`qemu-system-aarch64 11.0,
 -cpu cortex-a76`):
 
 ```
-xinu-pi5$ hello
+xinu-pi4$ hello
 hello from Xinu on Raspberry Pi 5 (BCM2712, AArch64)
-xinu-pi5$ mem
+xinu-pi4$ mem
 __bss_start = 0x00000000400810d0
 __bss_end   = 0x00000000400811d0
 _end        = 0x00000000400811d0
-xinu-pi5$ peek 0x09000018           # PL011 FR
+xinu-pi4$ peek 0x09000018           # PL011 FR
 [0x0000000009000018] = 0x00000000000000c0   # TXFE | RI
-xinu-pi5$ uptime
+xinu-pi4$ uptime
 cntpct_el0 = 0x0000000003bf71ad
-xinu-pi5$ ps
+xinu-pi4$ ps
 PID  STATE      CORE  EL  MIDR_EL1            DESCRIPTION
   0  RUN        0     1   0x00000000414fd0b1  shell_main (kernel)
   -  PARK(WFE)  1     -   -                   (parked by boot.S)
   -  PARK(WFE)  2     -   -                   (parked by boot.S)
   -  PARK(WFE)  3     -   -                   (parked by boot.S)
-xinu-pi5$ pingpong 3
+xinu-pi4$ pingpong 3
 pingpong: spawning Ping + Pong, rounds=3
 ---------------------------------------------
   [Ping] send 'ping' -> Pong   (bootstrap)
@@ -172,7 +172,7 @@ pingpong: spawning Ping + Pong, rounds=3
 ---------------------------------------------
 pingpong: done.  Ping  sent=3 recv=3
                  Pong  sent=3 recv=3
-xinu-pi5$ halt
+xinu-pi4$ halt
 halt: masking DAIF, requesting PSCI SYSTEM_OFF...
 # QEMU exits cleanly here (PSCI HVC at EL1 caught by virt emulator)
 ```
@@ -200,7 +200,7 @@ the dispatcher ctxsw'es back to NULLPROC (pid 0 = shell), and
 cmd_procdemo returns from `proc_resched()`.
 
 ```
-xinu-pi5$ procdemo 3
+xinu-pi4$ procdemo 3
 procdemo: created pid=1 (ping) and pid=2 (pong), iters=3
 ---------------------------------------------
   [Ping pid=1] tick 1
@@ -228,7 +228,7 @@ tick.
 Xinu-style subsystem dirs (modelled on `github.com/davidxyz/xinuPi`):
 
 ```
-xinu-rpi5/
+xinu-rpi4/
 ├── compile/                # build directory — run `make` from here
 │   ├── Makefile            # aarch64-elf → kernel_2712.img + kernel_virt.img
 │   ├── link.ld             # load address 0x80000 (Pi 5 firmware)

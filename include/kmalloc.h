@@ -12,8 +12,8 @@
 // kfree() recovers the header from the user pointer, sanity-checks
 // the magic, and feeds the original size back to freemem().
 
-#ifndef XINU_RPI5_KMALLOC_H
-#define XINU_RPI5_KMALLOC_H
+#ifndef XINU_RPI4_KMALLOC_H
+#define XINU_RPI4_KMALLOC_H
 
 /* Allocate `nbytes` of kernel memory.  Returns NULL on out-of-memory.
  * The returned pointer is 16-byte aligned (matching MEM_ALIGN in
@@ -32,4 +32,4 @@ unsigned long kmalloc_total_allocs(void);
 unsigned long kmalloc_total_frees(void);
 unsigned long kmalloc_bad_frees(void);
 
-#endif /* XINU_RPI5_KMALLOC_H */
+#endif /* XINU_RPI4_KMALLOC_H */

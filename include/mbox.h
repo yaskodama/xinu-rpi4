@@ -10,8 +10,8 @@
 // If a future Pi or a Pi 5 revision moves it, override MBOX_BASE
 // via the Makefile (-DMBOX_BASE=0x...UL).
 
-#ifndef XINU_RPI5_MBOX_H
-#define XINU_RPI5_MBOX_H
+#ifndef XINU_RPI4_MBOX_H
+#define XINU_RPI4_MBOX_H
 
 #ifndef MBOX_BASE
 #define MBOX_BASE  0x107C00B880UL
@@ -23,4 +23,4 @@
  * is implicit. */
 int mbox_call(volatile unsigned int *buf);
 
-#endif /* XINU_RPI5_MBOX_H */
+#endif /* XINU_RPI4_MBOX_H */

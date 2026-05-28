@@ -10,8 +10,8 @@
 // running under QEMU virt, which has no VC mailbox), screen_ready()
 // stays false and screen_putc() becomes a no-op.
 
-#ifndef XINU_RPI5_VIDEO_H
-#define XINU_RPI5_VIDEO_H
+#ifndef XINU_RPI4_VIDEO_H
+#define XINU_RPI4_VIDEO_H
 
 #define SCREEN_WIDTH    640
 #define SCREEN_HEIGHT   480
@@ -82,4 +82,4 @@ void draw_string_at(int px, int py, const char *s,
  * Used for animation pacing in wm_run(). */
 void delay_ms(unsigned int ms);
 
-#endif /* XINU_RPI5_VIDEO_H */
+#endif /* XINU_RPI4_VIDEO_H */
