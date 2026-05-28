@@ -124,6 +124,16 @@ QEMU_CFLAGS = $(COMMON) -mcpu=cortex-a76 \
 obj/pi5 obj/pi4 obj/qemu:
 	@mkdir -p $@
 
+# cc.c carries the value_t runtime, which needs floating point for AIPL
+# float values — build it WITHOUT -mgeneral-regs-only (FP enabled at EL1
+# via CPACR in mmu_init).  Everything else stays integer-only.
+PI5_FP_CFLAGS  := $(filter-out -mgeneral-regs-only,$(PI5_CFLAGS))
+PI4_FP_CFLAGS  := $(filter-out -mgeneral-regs-only,$(PI4_CFLAGS))
+QEMU_FP_CFLAGS := $(filter-out -mgeneral-regs-only,$(QEMU_CFLAGS))
+obj/pi5/cc.o:  cc.c | obj/pi5  ; $(CC) $(PI5_FP_CFLAGS)  -c $< -o $@
+obj/pi4/cc.o:  cc.c | obj/pi4  ; $(CC) $(PI4_FP_CFLAGS)  -c $< -o $@
+obj/qemu/cc.o: cc.c | obj/qemu ; $(CC) $(QEMU_FP_CFLAGS) -c $< -o $@
+
 obj/pi5/%.o: %.c  | obj/pi5  ; $(CC) $(PI5_CFLAGS)  -c $< -o $@
 obj/pi5/%.o: %.S  | obj/pi5  ; $(CC) $(PI5_CFLAGS)  -c $< -o $@
 obj/pi4/%.o: %.c  | obj/pi4  ; $(CC) $(PI4_CFLAGS)  -c $< -o $@

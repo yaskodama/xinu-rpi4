@@ -157,20 +157,67 @@ static char *vheap_alloc(int n)
     return p;
 }
 
-static long        v_int(long n)          { return (n << 1) | 1L; }
-static long        v_str(const char *p)   { return (long)p; }
-static int         v_is_int(long w)       { return (w & 1L) != 0; }
-static long        v_int_of(long w)       { return v_is_int(w) ? (w >> 1) : 0; }
-static int         v_truthy(long w)
+/* Float values are boxed (an 8-byte double in the concat heap) and the
+ * pointer is tagged with bit 60 — our identity-mapped addresses fit in
+ * the low 48 bits, so the tag is free and is masked off before deref. */
+#define V_FLOAT_TAG  (1UL << 60)
+#define V_PTR_MASK   ((1UL << 48) - 1)
+
+static long   v_int(long n)        { return (n << 1) | 1L; }
+static long   v_str(const char *p) { return (long)p; }
+static int    v_is_int(long w)     { return (w & 1L) != 0; }
+static int    v_is_float(long w)   { return !(w & 1L) && (((unsigned long)w >> 60) & 1UL); }
+static int    v_is_str(long w)     { return !(w & 1L) && w != 0 && !v_is_float(w); }
+static long   v_int_of(long w)     { return v_is_int(w) ? (w >> 1) : 0; }
+static double v_to_float(long w)
+{
+    if (v_is_int(w))   return (double)(w >> 1);
+    if (v_is_float(w)) return *(double *)((unsigned long)w & V_PTR_MASK);
+    return 0.0;
+}
+static long v_floatval(double x)
+{
+    double *p = (double *)vheap_alloc(8);
+    if (!p) return v_int(0);
+    *p = x;
+    return (long)((unsigned long)p | V_FLOAT_TAG);
+}
+static long v_floatlit(long bits)
+{
+    union { long i; double d; } u; u.i = bits;
+    return v_floatval(u.d);
+}
+static int v_truthy(long w)
 {
     if (w == 0) return 0;
-    if (v_is_int(w)) return (w >> 1) != 0;
+    if (v_is_int(w))   return (w >> 1) != 0;
+    if (v_is_float(w)) return v_to_float(w) != 0.0;
     return ((const char *)w)[0] != 0;
 }
-/* Render a value to text: strings as-is, ints as decimal into `buf`. */
+/* Render a value to text into `buf`: strings as-is, ints/floats as decimal. */
 static const char *v_render(long w, char *buf, int cap)
 {
-    if (!v_is_int(w) && w != 0) return (const char *)w;
+    if (v_is_str(w)) return (const char *)w;
+    if (v_is_float(w)) {
+        double d = v_to_float(w);
+        int i = 0;
+        if (d < 0) { buf[i++] = '-'; d = -d; }
+        long ip = (long)d;
+        char t[24]; int n = 0; unsigned long u = (unsigned long)ip;
+        if (u == 0) t[n++] = '0';
+        while (u) { t[n++] = (char)('0' + (u % 10)); u /= 10; }
+        while (n && i < cap - 9) buf[i++] = t[--n];
+        buf[i++] = '.';
+        double frac = d - (double)ip;
+        for (int k = 0; k < 6 && i < cap - 1; k++) {
+            frac *= 10.0; int dg = (int)frac;
+            if (dg < 0) dg = 0;
+            if (dg > 9) dg = 9;
+            buf[i++] = (char)('0' + dg); frac -= (double)dg;
+        }
+        buf[i] = 0;
+        return buf;
+    }
     long n = v_int_of(w);
     int i = cap - 1; buf[i--] = 0;
     int neg = 0; unsigned long u;
@@ -182,25 +229,32 @@ static const char *v_render(long w, char *buf, int cap)
 }
 static long v_add(long a, long b)
 {
-    if (v_is_int(a) && v_is_int(b)) return v_int(v_int_of(a) + v_int_of(b));
-    char ba[24], bb[24];
-    const char *sa = v_render(a, ba, sizeof ba);
-    const char *sb = v_render(b, bb, sizeof bb);
-    int la = 0; while (sa[la]) la++;
-    int lb = 0; while (sb[lb]) lb++;
-    char *r = vheap_alloc(la + lb + 1);
-    if (!r) return v_str("");
-    int k = 0;
-    for (int j = 0; j < la; j++) r[k++] = sa[j];
-    for (int j = 0; j < lb; j++) r[k++] = sb[j];
-    r[k] = 0;
-    return v_str(r);
+    if (v_is_str(a) || v_is_str(b)) {
+        char ba[32], bb[32];
+        const char *sa = v_render(a, ba, sizeof ba);
+        const char *sb = v_render(b, bb, sizeof bb);
+        int la = 0; while (sa[la]) la++;
+        int lb = 0; while (sb[lb]) lb++;
+        char *r = vheap_alloc(la + lb + 1);
+        if (!r) return v_str("");
+        int k = 0;
+        for (int j = 0; j < la; j++) r[k++] = sa[j];
+        for (int j = 0; j < lb; j++) r[k++] = sb[j];
+        r[k] = 0;
+        return v_str(r);
+    }
+    if (v_is_float(a) || v_is_float(b)) return v_floatval(v_to_float(a) + v_to_float(b));
+    return v_int(v_int_of(a) + v_int_of(b));
 }
-static long v_sub(long a, long b) { return v_int(v_int_of(a) - v_int_of(b)); }
-static long v_mul(long a, long b) { return v_int(v_int_of(a) * v_int_of(b)); }
-static long v_div(long a, long b) { long d = v_int_of(b); return v_int(d ? v_int_of(a) / d : 0); }
-static long v_lt(long a, long b)  { return v_int(v_int_of(a) <  v_int_of(b)); }
-static long v_le(long a, long b)  { return v_int(v_int_of(a) <= v_int_of(b)); }
+static long v_sub(long a, long b) { if (v_is_float(a)||v_is_float(b)) return v_floatval(v_to_float(a)-v_to_float(b)); return v_int(v_int_of(a)-v_int_of(b)); }
+static long v_mul(long a, long b) { if (v_is_float(a)||v_is_float(b)) return v_floatval(v_to_float(a)*v_to_float(b)); return v_int(v_int_of(a)*v_int_of(b)); }
+static long v_div(long a, long b)
+{
+    if (v_is_float(a) || v_is_float(b)) { double d = v_to_float(b); return v_floatval(d != 0.0 ? v_to_float(a)/d : 0.0); }
+    long d = v_int_of(b); return v_int(d ? v_int_of(a)/d : 0);
+}
+static long v_lt(long a, long b) { if (v_is_float(a)||v_is_float(b)) return v_int(v_to_float(a) <  v_to_float(b)); return v_int(v_int_of(a) <  v_int_of(b)); }
+static long v_le(long a, long b) { if (v_is_float(a)||v_is_float(b)) return v_int(v_to_float(a) <= v_to_float(b)); return v_int(v_int_of(a) <= v_int_of(b)); }
 static int  v_streq(long a, long b)
 {
     const char *x = (const char *)a, *y = (const char *)b;
@@ -210,15 +264,16 @@ static int  v_streq(long a, long b)
 }
 static long v_eq(long a, long b)
 {
-    if (v_is_int(a) && v_is_int(b)) return v_int(v_int_of(a) == v_int_of(b));
-    if (!v_is_int(a) && !v_is_int(b)) return v_int(v_streq(a, b));
-    return v_int(0);
+    if (v_is_str(a) && v_is_str(b)) return v_int(v_streq(a, b));
+    if (v_is_str(a) || v_is_str(b)) return v_int(0);
+    if (v_is_float(a) || v_is_float(b)) return v_int(v_to_float(a) == v_to_float(b));
+    return v_int(v_int_of(a) == v_int_of(b));
 }
 static long v_ne(long a, long b)  { return v_int(!v_int_of(v_eq(a, b))); }
 static long v_and(long a, long b) { return v_int(v_truthy(a) && v_truthy(b)); }
 static long v_or(long a, long b)  { return v_int(v_truthy(a) || v_truthy(b)); }
 static long v_not(long a)         { return v_int(!v_truthy(a)); }
-static void v_print(long w)       { char b[24]; emit_str(v_render(w, b, sizeof b)); emit_ch('\n'); }
+static void v_print(long w)       { char b[32]; emit_str(v_render(w, b, sizeof b)); emit_ch('\n'); }
 /* v_truthy is also exported (raw 0/1) for if/while conditions. */
 static long v_truthy_x(long w)    { return v_truthy(w); }
 
@@ -234,6 +289,7 @@ unsigned long cc_resolve_extern(const char *name)
         /* value_t runtime for the AIPL --xinu-jit backend */
         { "v_int",      (void *)&v_int        },
         { "v_str",      (void *)&v_str        },
+        { "v_floatlit", (void *)&v_floatlit   },
         { "v_add",      (void *)&v_add        },
         { "v_sub",      (void *)&v_sub        },
         { "v_mul",      (void *)&v_mul        },

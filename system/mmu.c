@@ -71,6 +71,12 @@ static unsigned long normal_attr(int ro, int xn)
 
 void mmu_init(void)
 {
+    /* Enable EL1 FP/SIMD access (CPACR_EL1.FPEN=0b11).  The kernel is built
+     * -mgeneral-regs-only so it never touches FP itself, but the value_t
+     * runtime in cc/cc.c (built with FP) needs floating point for AIPL
+     * float values; without this an FP instruction traps. */
+    __asm__ volatile ("msr cpacr_el1, %0\n isb\n" :: "r"(3UL << 20) : "memory");
+
     unsigned long ram_base  = ((unsigned long)_start) & ~(ONE_GB - 1);
     unsigned long ram_end   = HEAP_END;
     unsigned long kern_2mb  = ((unsigned long)_start) & ~(TWO_MB - 1);

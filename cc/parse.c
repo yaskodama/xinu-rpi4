@@ -94,9 +94,12 @@ token_t *cc_lex(const char *src)
         }
 
         if (is_digit(*p)) {
-            long v = 0;
-            while (is_digit(*p)) { v = v * 10 + (*p - '0'); p++; }
-            token_t *t = new_tok(TK_NUM); t->val = v;
+            /* unsigned accumulation so 64-bit constants (e.g. IEEE-754
+             * float bit patterns from --xinu-jit) wrap to the right
+             * two's-complement value instead of signed-overflow UB. */
+            unsigned long v = 0;
+            while (is_digit(*p)) { v = v * 10UL + (unsigned long)(*p - '0'); p++; }
+            token_t *t = new_tok(TK_NUM); t->val = (long)v;
             cur = cur->next = t;
             continue;
         }
