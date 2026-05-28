@@ -138,6 +138,11 @@ static void genet_rx_tick(void)
         }
         genet_rx_release();
     }
+    /* Re-arm the RX-done interrupt: the handler self-masked when it fired,
+     * so unmask it now that we've drained what was pending.  (Diagnostic
+     * step toward an IRQ-woken net process; for now RX is still polled
+     * here by the wm tick — the rearm just lets us count fires.) */
+    genet_irq_rearm();
 }
 
 /* USPi is gone (DWC2 only — Pi 4 USB-A keyboards/mice need xHCI).
@@ -787,6 +792,16 @@ void kernel_main(void)
      * if SYS_REV_CTRL responds with a sane value (expected to be
      * ~0x06000000 on Pi 4) so we know the controller is powered. */
     genet_init();
+
+    /* NET-D IRQ diagnostic — wire the GENET RX-ring-16 done interrupt.
+     * INTRL2_0 (bit 13 = RXDMA_DONE) is routed to GIC SPI 157 = INTID 189.
+     * The handler self-masks + counts; genet_rx_tick() drains and re-arms.
+     * RX is still polled by the wm tick for now — this just proves the IRQ
+     * is delivered before we move RX into an interrupt-woken net process. */
+    connect_interrupt(189, genet_irq_handler, 0);
+    gic_enable_irq(189);
+    genet_irq_enable();
+    uart_puts("net: GENET RX IRQ armed (INTID 189)\n");
 
     /* Pass our MAC to the responder so ARP replies carry the
      * right source MAC.  d8:3a:dd:a7:fd:bf — confirmed from

@@ -26,6 +26,9 @@ extern unsigned long timer_ticks(void);
 /* Preemptive-scheduling demo (system/actorproc.c): interleave log -> out. */
 extern int preempt_demo(char *out, int outcap);
 
+/* GENET RX interrupt fire counter (device/genet/genet.c) — for /genetirq diag. */
+extern unsigned long genet_irq_count(void);
+
 extern int genet_tx_frame(const unsigned char *frame, int length);
 
 /* --- byte/checksum helpers (duplicated, intentionally — keeps
@@ -452,6 +455,15 @@ static int http_build(const char *req, char *out, int max)
         preempt_demo(plog, sizeof plog);
         bl = s_put(body, bl, "preempt log: ");
         bl = s_put(body, bl, plog);
+        bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "GET /genetirq") || starts_with(req, "POST /genetirq")) {
+        /* Diagnostic: is the GENET RX-done interrupt (INTID 189) being
+         * delivered?  genet_irq_count advances only in genet_irq_handler.
+         * Curl this twice with traffic in between — if it grows, the GIC is
+         * routing the GENET SPI and we can build an IRQ-woken net process. */
+        ctype = "text/plain";
+        bl = s_put(body, bl, "genet_irq=");
+        bl = s_putdec(body, bl, (long)genet_irq_count());
         bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "POST /chat") || starts_with(req, "GET /chat")) {
         /* Converse with a resident actor: deliver the message (POST body or

@@ -60,6 +60,15 @@ int genet_tx_frame(const unsigned char *frame, int length);
 int  genet_link_up(void);
 unsigned int genet_phy_bmsr(void);
 
+/* RX interrupt (INTRL2_0 bit 13, GIC INTID 189).  genet_irq_handler is the
+ * connect_interrupt() target; genet_irq_enable() arms it after init;
+ * genet_irq_rearm() re-unmasks after the poll path drains a packet;
+ * genet_irq_count() reports fires for the /genetirq diagnostic. */
+void          genet_irq_handler(void *arg);
+void          genet_irq_enable(void);
+void          genet_irq_rearm(void);
+unsigned long genet_irq_count(void);
+
 #else  /* GENET_BASE not defined (Pi 5 / QEMU) — no built-in GENET MAC */
 
 /* main.c, shell.c and the RX dispatcher reference these unconditionally
@@ -82,6 +91,10 @@ static inline int           genet_tx_frame(const unsigned char *f, int n)
                                                              { (void)f; (void)n; return -1; }
 static inline int           genet_link_up(void)              { return 0; }
 static inline unsigned int  genet_phy_bmsr(void)             { return 0xFFFFFFFFu; }
+static inline void          genet_irq_handler(void *a)       { (void)a; }
+static inline void          genet_irq_enable(void)           {}
+static inline void          genet_irq_rearm(void)            {}
+static inline unsigned long genet_irq_count(void)            { return 0; }
 
 #endif
 
