@@ -321,6 +321,17 @@ static long cc_select(long self, long n, long m0, long m1, long m2, long m3)
 }
 static long cc_sel_arg(long i) { return (i >= 0 && i < 4) ? g_sel[i] : v_int(0); }
 
+/* `saga { step {..} compensate {..} ... }` runtime.  AIPL signals a step
+ * failure by raising; this int-only backend has no exceptions, so the AIPL
+ * step body calls `fail()` instead.  The translator emits a driver that runs
+ * the bodies in order, stops at the first fail(), and then runs the already-
+ * completed steps' compensate blocks in reverse (LIFO).  One flag, reset at
+ * each saga; nested sagas are not supported. */
+static int  g_saga_failed;
+static void cc_saga_reset(void)  { g_saga_failed = 0; }
+static long cc_saga_fail(void)   { g_saga_failed = 1; return v_int(0); }
+static long cc_saga_failed(void) { return g_saga_failed; }   /* plain 0/1 for raw C */
+
 unsigned long cc_resolve_extern(const char *name)
 {
     struct { const char *n; void *f; } tab[] = {
@@ -353,6 +364,9 @@ unsigned long cc_resolve_extern(const char *name)
         { "cc_call",    (void *)&cc_call      },
         { "cc_select",  (void *)&cc_select    },
         { "cc_sel_arg", (void *)&cc_sel_arg   },
+        { "cc_saga_reset",  (void *)&cc_saga_reset  },
+        { "cc_saga_fail",   (void *)&cc_saga_fail   },
+        { "cc_saga_failed", (void *)&cc_saga_failed },
         { 0, 0 }
     };
     for (int i = 0; tab[i].n; i++) {
