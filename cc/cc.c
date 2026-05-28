@@ -136,6 +136,92 @@ static long cc_actor_send(long id, const char *method, long arg)
     return (long)out;
 }
 
+/* ---------- value_t runtime (for the AIPL --xinu-jit backend) ----------
+ * A value_t is a tagged 64-bit word: low bit 1 => small int (value = w>>1),
+ * low bit 0 => pointer to a NUL-terminated string (arena/heap data is
+ * >=8-aligned, so a real string pointer never has the low bit set; 0 is
+ * treated as the integer 0 / nil).  Ints are immediate (no allocation, so
+ * loops are cheap); strings are pointers, and concatenation bump-allocates
+ * from a small per-run heap.  The on-device compiler stays int-only — it
+ * just calls these helpers, so the same compiler handles both plain C and
+ * AIPL-generated value_t C. */
+
+static char  g_vheap[8192];
+static int   g_vheaplen;
+static void  vheap_reset(void) { g_vheaplen = 0; }
+static char *vheap_alloc(int n)
+{
+    if (g_vheaplen + n > (int)sizeof(g_vheap)) return 0;
+    char *p = &g_vheap[g_vheaplen];
+    g_vheaplen += (n + 7) & ~7;           /* keep the next block 8-aligned */
+    return p;
+}
+
+static long        v_int(long n)          { return (n << 1) | 1L; }
+static long        v_str(const char *p)   { return (long)p; }
+static int         v_is_int(long w)       { return (w & 1L) != 0; }
+static long        v_int_of(long w)       { return v_is_int(w) ? (w >> 1) : 0; }
+static int         v_truthy(long w)
+{
+    if (w == 0) return 0;
+    if (v_is_int(w)) return (w >> 1) != 0;
+    return ((const char *)w)[0] != 0;
+}
+/* Render a value to text: strings as-is, ints as decimal into `buf`. */
+static const char *v_render(long w, char *buf, int cap)
+{
+    if (!v_is_int(w) && w != 0) return (const char *)w;
+    long n = v_int_of(w);
+    int i = cap - 1; buf[i--] = 0;
+    int neg = 0; unsigned long u;
+    if (n < 0) { neg = 1; u = (unsigned long)(-n); } else u = (unsigned long)n;
+    if (u == 0) buf[i--] = '0';
+    while (u && i >= 0) { buf[i--] = (char)('0' + (u % 10)); u /= 10; }
+    if (neg && i >= 0) buf[i--] = '-';
+    return &buf[i + 1];
+}
+static long v_add(long a, long b)
+{
+    if (v_is_int(a) && v_is_int(b)) return v_int(v_int_of(a) + v_int_of(b));
+    char ba[24], bb[24];
+    const char *sa = v_render(a, ba, sizeof ba);
+    const char *sb = v_render(b, bb, sizeof bb);
+    int la = 0; while (sa[la]) la++;
+    int lb = 0; while (sb[lb]) lb++;
+    char *r = vheap_alloc(la + lb + 1);
+    if (!r) return v_str("");
+    int k = 0;
+    for (int j = 0; j < la; j++) r[k++] = sa[j];
+    for (int j = 0; j < lb; j++) r[k++] = sb[j];
+    r[k] = 0;
+    return v_str(r);
+}
+static long v_sub(long a, long b) { return v_int(v_int_of(a) - v_int_of(b)); }
+static long v_mul(long a, long b) { return v_int(v_int_of(a) * v_int_of(b)); }
+static long v_div(long a, long b) { long d = v_int_of(b); return v_int(d ? v_int_of(a) / d : 0); }
+static long v_lt(long a, long b)  { return v_int(v_int_of(a) <  v_int_of(b)); }
+static long v_le(long a, long b)  { return v_int(v_int_of(a) <= v_int_of(b)); }
+static int  v_streq(long a, long b)
+{
+    const char *x = (const char *)a, *y = (const char *)b;
+    if (!x || !y) return 0;
+    while (*x && *y && *x == *y) { x++; y++; }
+    return *x == 0 && *y == 0;
+}
+static long v_eq(long a, long b)
+{
+    if (v_is_int(a) && v_is_int(b)) return v_int(v_int_of(a) == v_int_of(b));
+    if (!v_is_int(a) && !v_is_int(b)) return v_int(v_streq(a, b));
+    return v_int(0);
+}
+static long v_ne(long a, long b)  { return v_int(!v_int_of(v_eq(a, b))); }
+static long v_and(long a, long b) { return v_int(v_truthy(a) && v_truthy(b)); }
+static long v_or(long a, long b)  { return v_int(v_truthy(a) || v_truthy(b)); }
+static long v_not(long a)         { return v_int(!v_truthy(a)); }
+static void v_print(long w)       { char b[24]; emit_str(v_render(w, b, sizeof b)); emit_ch('\n'); }
+/* v_truthy is also exported (raw 0/1) for if/while conditions. */
+static long v_truthy_x(long w)    { return v_truthy(w); }
+
 unsigned long cc_resolve_extern(const char *name)
 {
     struct { const char *n; void *f; } tab[] = {
@@ -145,6 +231,23 @@ unsigned long cc_resolve_extern(const char *name)
         { "puts",       (void *)&cc_puts      },
         { "actor_send", (void *)&cc_actor_send},
         { "__cc_tick",  (void *)&cc_tick      },
+        /* value_t runtime for the AIPL --xinu-jit backend */
+        { "v_int",      (void *)&v_int        },
+        { "v_str",      (void *)&v_str        },
+        { "v_add",      (void *)&v_add        },
+        { "v_sub",      (void *)&v_sub        },
+        { "v_mul",      (void *)&v_mul        },
+        { "v_div",      (void *)&v_div        },
+        { "v_lt",       (void *)&v_lt         },
+        { "v_le",       (void *)&v_le         },
+        { "v_eq",       (void *)&v_eq         },
+        { "v_ne",       (void *)&v_ne         },
+        { "v_and",      (void *)&v_and        },
+        { "v_or",       (void *)&v_or         },
+        { "v_not",      (void *)&v_not        },
+        { "v_print",    (void *)&v_print      },
+        { "v_truthy",   (void *)&v_truthy_x   },
+        { "v_int_of",   (void *)&v_int_of     },
         { 0, 0 }
     };
     for (int i = 0; tab[i].n; i++) {
@@ -200,6 +303,7 @@ static int compile_run_core(const char *src, unsigned long n, long *retval)
 
     cc_sync_icache(code, (unsigned long)len);
     cc_set_deadline();
+    vheap_reset();              /* fresh string-concat heap for this run */
     long (*entryfn)(void) = (long (*)(void))(code + entry);
     long rc = entryfn();
     if (retval) *retval = rc;
