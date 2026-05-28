@@ -44,7 +44,7 @@ LD       = $(GCCPATH)/bin/$(CROSS)ld
 OBJCOPY  = $(GCCPATH)/bin/$(CROSS)objcopy
 
 # ----- source discovery -----------------------------------------------
-COMPONENTS = loader mem system shell fs cc \
+COMPONENTS = loader mem system shell fs cc llm \
              device/uart device/mbox device/video device/sd device/usb \
              device/usb/xhci device/gic device/timer device/genet \
              network/arp network/net network/netaddr network/ipv4 network/icmp
@@ -133,6 +133,11 @@ QEMU_FP_CFLAGS := $(filter-out -mgeneral-regs-only,$(QEMU_CFLAGS))
 obj/pi5/cc.o:  cc.c | obj/pi5  ; $(CC) $(PI5_FP_CFLAGS)  -c $< -o $@
 obj/pi4/cc.o:  cc.c | obj/pi4  ; $(CC) $(PI4_FP_CFLAGS)  -c $< -o $@
 obj/qemu/cc.o: cc.c | obj/qemu ; $(CC) $(QEMU_FP_CFLAGS) -c $< -o $@
+
+# llm.c runs transformer inference — needs FP/SIMD, like cc.o.
+obj/pi5/llm.o:  llm.c | obj/pi5  ; $(CC) $(PI5_FP_CFLAGS)  -c $< -o $@
+obj/pi4/llm.o:  llm.c | obj/pi4  ; $(CC) $(PI4_FP_CFLAGS)  -c $< -o $@
+obj/qemu/llm.o: llm.c | obj/qemu ; $(CC) $(QEMU_FP_CFLAGS) -c $< -o $@
 
 obj/pi5/%.o: %.c  | obj/pi5  ; $(CC) $(PI5_CFLAGS)  -c $< -o $@
 obj/pi5/%.o: %.S  | obj/pi5  ; $(CC) $(PI5_CFLAGS)  -c $< -o $@
