@@ -1,5 +1,20 @@
 # NEXT_SESSION — xinu-rpi4
 
+## ✅ 2026-05-28 — let-it-crash / アクター監視
+
+アクターのハンドラが `crash()` で**自分を中断**してもシステムを落とさない。各アクタープロセスが
+dispatch を `__builtin_setjmp` フレームで囲み、`ap_crash()` が受信ループへ longjmp（プロセスは生存）。
+同期 `now` 呼出元は `AP_CRASH_REPLY`(=`v_int(0x40000000)`)で unblock され、スーパーバイザが
+`crashed()` と比較して検知→再試行/再起動。**exception ハンドラ/スケジューラ/ready キュー無改修**
+(同一プロセス内の非局所ジャンプのみ)。`crash`/`crashed` は普通の Call(構文変更なし)。
+- include/actorproc.h: `ap_crash()`, `AP_CRASH_REPLY`。actorproc.c: per-actor `g_actor_jmp[][5]`+
+  `g_jmp_armed[]`+`g_cur_reply[]`、actor_proc_main の setjmp/longjmp 経路。cc.c: `cc_crash`/
+  `cc_crashed_value` + extern 登録。translator: `crash()`→cc_crash、`crashed()`→cc_crashed_value。
+- `examples_xinujit/Supervised.abcl`(try1 crash→supervisor 再試行→try2 recover、result=2)。
+- QEMU 検証: recover / 永久クラッシュ→`gave up`(無限ループ無し) / resident 後 / rpc・select・saga 回帰 OK。
+  commit xinu **a69c8f7** / abclcp **bea1734**。
+- **未 flash**(現実機は saga 版 395e68c1=`cc_crash` 未搭載→supervised 送るとクラッシュ。要再フラッシュ)。
+
 ## ✅ 2026-05-28 — AIPL `saga {}`（補償トランザクション）を xinu-jit に対応
 
 AIPL には既に `saga { step {body} compensate {undo} ... }` 構文(lexer/parser/AST/フルCバックエンド/
