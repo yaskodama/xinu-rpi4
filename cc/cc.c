@@ -447,6 +447,8 @@ static long cc_llm(long prompt)          /* one-shot: re-encode `prompt` each ca
     char *out = vheap_alloc(420);
     if (!out) return v_str("");
     llm_run(src, 32, out, 420, 0);       /* 32 new tokens, no prompt echo */
+    cc_set_deadline();                   /* LLM calls are legitimately slow: restart the
+                                          * runaway timer so a caller's loop isn't aborted */
     return v_str(out);
 }
 static long cc_chat(long msg)            /* stateful: continues the KV-cache session */
@@ -457,6 +459,7 @@ static long cc_chat(long msg)            /* stateful: continues the KV-cache ses
     char *out = vheap_alloc(420);
     if (!out) return v_str("");
     llm_chat(src, 32, out, 420);
+    cc_set_deadline();                   /* restart the runaway timer after the slow call */
     return v_str(out);
 }
 
