@@ -15,6 +15,7 @@
 #include "uart.h"
 #include "genet.h"
 #include "actor.h"
+#include "cc.h"
 
 extern int genet_tx_frame(const unsigned char *frame, int length);
 
@@ -99,6 +100,11 @@ static unsigned short g_last_port;
 /* Outgoing frame buffer — volatile + aligned(64), see net_responder
  * for the rationale (MMU off + Device-nGnRnE + GCC store merging). */
 static volatile unsigned char __attribute__((aligned(64))) tx_frame[1518];
+
+/* HTTP request accumulator (reassembles a request that spans segments,
+ * e.g. a /compile POST body).  Reset on each new ESTABLISHED connection. */
+static char g_httpreq[8192];
+static int  g_httpreqlen;
 
 void tcp_set_mac(const unsigned char mac[6])
 {
@@ -286,16 +292,107 @@ static int path_eq(const char *req, const char *lit)
     return *lit == 0 && (*p == ' ' || *p == '?');
 }
 
+static int starts_with(const char *s, const char *p)
+{
+    while (*p) { if (*s != *p) return 0; s++; p++; }
+    return 1;
+}
+
+/* Index just past the "\r\n\r\n" header terminator, or -1 if not present. */
+static int find_header_end(const char *s)
+{
+    for (int i = 0; s[i]; i++)
+        if (s[i]=='\r' && s[i+1]=='\n' && s[i+2]=='\r' && s[i+3]=='\n') return i + 4;
+    return -1;
+}
+
+static int lc(char c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+
+/* Value of the Content-Length header (case-insensitive), or -1. */
+static int content_length(const char *s)
+{
+    const char *key = "content-length:";
+    for (const char *p = s; *p; p++) {
+        const char *k = key; const char *q = p;
+        while (*k && lc(*q) == *k) { q++; k++; }
+        if (*k == 0) {
+            while (*q == ' ') q++;
+            int n = 0, any = 0;
+            while (*q >= '0' && *q <= '9') { n = n*10 + (*q - '0'); q++; any = 1; }
+            return any ? n : -1;
+        }
+    }
+    return -1;
+}
+
+/* Has the full HTTP request arrived?  GET = once headers end; POST = once
+ * the Content-Length body has been received too. */
+static int request_complete(const char *req, int len)
+{
+    int he = find_header_end(req);
+    if (he < 0) return 0;
+    if (starts_with(req, "POST")) {
+        int cl = content_length(req);
+        if (cl < 0) return 1;
+        return (len - he) >= cl;
+    }
+    return 1;
+}
+
+/* URL-decode `in` into `out` (%XX and '+' -> space).  Returns out length. */
+static int url_decode(const char *in, char *out, int max)
+{
+    int o = 0;
+    for (int i = 0; in[i] && o < max - 1; i++) {
+        char c = in[i];
+        if (c == '+') { out[o++] = ' '; }
+        else if (c == '%' && in[i+1] && in[i+2]) {
+            int hi = in[i+1], lo = in[i+2];
+            hi = (hi<='9')?hi-'0':(lc(hi)-'a'+10);
+            lo = (lo<='9')?lo-'0':(lc(lo)-'a'+10);
+            out[o++] = (char)((hi<<4)|lo); i += 2;
+        } else out[o++] = c;
+    }
+    out[o] = 0;
+    return o;
+}
+
 /* Build the HTTP response for NUL-terminated request `req` into `out`
  * (capacity `max`).  Returns the byte length. */
 static int http_build(const char *req, char *out, int max)
 {
-    char body[640];
+    static char body[1400];
     int  bl = 0;
     const char *ctype = "application/json";
     (void)max;
 
-    if (path_eq(req, "/send")) {
+    if (starts_with(req, "POST /compile") || starts_with(req, "GET /compile")) {
+        /* Dynamic compilation: the request carries C source, which we
+         * compile and JIT-run in place; the reply is the program output
+         * plus "=> <return value>".  Source is the POST body, or the
+         * url-encoded `src` query param for a GET. */
+        ctype = "text/plain";
+        static char src[2048];
+        int slen = 0;
+        if (req[0] == 'P') {
+            int he = find_header_end(req);
+            if (he >= 0) {
+                const char *b = req + he;
+                while (b[slen] && slen < (int)sizeof(src) - 1) { src[slen] = b[slen]; slen++; }
+                src[slen] = 0;
+            }
+        } else {
+            static char enc[2048];
+            if (q_param(req, "src", enc, sizeof enc)) slen = url_decode(enc, src, sizeof src);
+        }
+
+        long rv = 0;
+        static char prog[1100];
+        int rc = cc_run_source(src, slen, prog, sizeof prog, &rv);
+        bl = s_put(body, bl, prog);
+        if (rc == 0) { bl = s_put(body, bl, "=> "); bl = s_putdec(body, bl, rv); bl = s_put(body, bl, "\n"); }
+        else         { bl = s_put(body, bl, "\n"); }
+    } else if (path_eq(req, "/send")) {
         int  to  = q_int(req, "to", -1);
         int  arg = q_int(req, "arg", 0);
         char method[ACTOR_NAMELEN];
@@ -330,8 +427,9 @@ static int http_build(const char *req, char *out, int max)
     } else if (path_eq(req, "/")) {
         ctype = "text/plain";
         bl = s_put(body, bl, "xinu-rpi5 (Pi 4) actor HTTP gateway\n"
-                             "GET /api/actors\n"
-                             "GET /send?to=<id>&m=<bump|add|set|get|reset>&arg=<n>\n");
+                             "GET  /api/actors\n"
+                             "GET  /send?to=<id>&m=<bump|add|set|get|reset>&arg=<n>\n"
+                             "POST /compile   (body = C source; JIT-run, returns output + => retval)\n");
     } else {
         ctype = "text/plain";
         bl = s_put(body, bl, "404 not found\n");
@@ -439,6 +537,7 @@ int tcp_handle_packet(const unsigned char *frame, int len)
         if ((flags & TCP_FLAG_ACK) && ack == g_conn.my_seq) {
             g_conn.state = TCP_ESTABLISHED;
             g_estab++;
+            g_httpreqlen = 0;                 /* fresh request accumulator */
             uart_puts("tcp: ESTABLISHED (await HTTP request)\n");
             /* HTTP: the client sends the request first; we reply when
              * its data arrives (see the ESTABLISHED data path). */
@@ -454,19 +553,41 @@ int tcp_handle_packet(const unsigned char *frame, int len)
             return 1;
         }
         if (data_len > 0) {
-            /* Treat the first data segment as an HTTP request: copy it
-             * out of the (volatile) rx buffer, route it through the
-             * actor layer, send the response, then close.  A simple GET
-             * fits in one segment, which is all we handle here. */
-            static char http_req[600];
-            static char http_resp[1400];
-            int n = data_len < (int)sizeof(http_req) - 1
-                  ? data_len : (int)sizeof(http_req) - 1;
-            for (int i = 0; i < n; i++) http_req[i] = (char)data[i];
-            http_req[n] = 0;
-            g_conn.peer_seq = seq + data_len;     /* ack the whole request */
+            /* Accumulate the HTTP request across segments (a POST body —
+             * e.g. C source for /compile — may not fit one segment).  We
+             * only append in-order data; retransmits are just re-ACKed.
+             * Once the full request has arrived we route it and close. */
+            static char http_resp[1500];
 
-            int rlen = http_build(http_req, http_resp, (int)sizeof http_resp);
+            if (seq == g_conn.peer_seq) {                 /* in-order: append */
+                int space = (int)sizeof(g_httpreq) - 1 - g_httpreqlen;
+                int n = data_len < space ? data_len : space;
+                for (int i = 0; i < n; i++) g_httpreq[g_httpreqlen++] = (char)data[i];
+                g_httpreq[g_httpreqlen] = 0;
+                g_conn.peer_seq = seq + data_len;
+            }
+
+            if (!request_complete(g_httpreq, g_httpreqlen)) {
+                if (g_httpreqlen >= (int)sizeof(g_httpreq) - 1) {
+                    /* Buffer full but request still incomplete: refuse
+                     * rather than wait forever for data we can't store. */
+                    const char *m =
+                        "HTTP/1.0 413 Payload Too Large\r\n"
+                        "Content-Type: text/plain\r\nConnection: close\r\n\r\n"
+                        "cc: request too large for /compile buffer\n";
+                    int ml = 0; while (m[ml]) ml++;
+                    tcp_send(TCP_FLAG_PSH | TCP_FLAG_ACK, m, ml);
+                    g_conn.my_seq += ml;
+                    tcp_send(TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0);
+                    g_conn.my_seq += 1;
+                    g_conn.state = TCP_FIN_WAIT_1;
+                    return 1;
+                }
+                tcp_send(TCP_FLAG_ACK, 0, 0);             /* ack, await the rest */
+                return 1;
+            }
+
+            int rlen = http_build(g_httpreq, http_resp, (int)sizeof http_resp);
             tcp_send(TCP_FLAG_PSH | TCP_FLAG_ACK, http_resp, rlen);
             g_conn.my_seq += rlen;
 

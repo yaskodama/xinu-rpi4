@@ -645,8 +645,39 @@ static int cmd_halt(int argc, char **argv)
     for (;;) __asm__ volatile ("wfe");
 }
 
+/* Filesystem commands live in shell/fscmd.c. */
+extern int cmd_pwd(int, char **);
+extern int cmd_ls(int, char **);
+extern int cmd_cd(int, char **);
+extern int cmd_mkdir(int, char **);
+extern int cmd_touch(int, char **);
+extern int cmd_cat(int, char **);
+extern int cmd_write(int, char **);
+extern int cmd_edit(int, char **);
+extern int cmd_rm(int, char **);
+extern int cmd_rmdir(int, char **);
+extern int cmd_tree(int, char **);
+extern int cmd_cp(int, char **);
+extern int cmd_mv(int, char **);
+/* C compiler command lives in cc/cc.c. */
+extern int cmd_cc(int, char **);
+
 static const struct centry commandtab[] = {
     { "help",   "list the commands",                       cmd_help   },
+    { "pwd",    "print the current directory",             cmd_pwd    },
+    { "ls",     "ls [path] — list a directory",            cmd_ls     },
+    { "cd",     "cd [path] — change directory",            cmd_cd     },
+    { "mkdir",  "mkdir <path> — make a directory",         cmd_mkdir  },
+    { "touch",  "touch <path> — create an empty file",     cmd_touch  },
+    { "cat",    "cat <path>... — print file contents",     cmd_cat    },
+    { "write",  "write <path> [text] — overwrite a file",  cmd_write  },
+    { "edit",   "edit <path> — type lines, end with '.'",  cmd_edit   },
+    { "rm",     "rm <file>... — remove files",             cmd_rm     },
+    { "rmdir",  "rmdir <dir> — remove an empty directory", cmd_rmdir  },
+    { "tree",   "tree [path] — show the directory tree",   cmd_tree   },
+    { "cp",     "cp <src> <dst> — copy a file",            cmd_cp     },
+    { "mv",     "mv <src> <dst> — move/rename a file",     cmd_mv     },
+    { "cc",     "cc <file.c> — compile & run a C program", cmd_cc     },
     { "echo",   "echo the remaining words back",           cmd_echo   },
     { "hello",  "smoke marker — say hello",                cmd_hello  },
     { "mem",    "show __bss_start / __bss_end / _end",     cmd_mem    },

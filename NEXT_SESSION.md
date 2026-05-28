@@ -1,5 +1,150 @@
 # NEXT_SESSION — xinu-rpi5
 
+## ✅ 2026-05-28 — JIT 暴走ループ保護 (実行予算)
+
+ネット公開 `/compile` は任意コードを同期 JIT 実行するので、`while(1){}` が Pi を固める
+リスクがあった。**ループ back-edge に実行予算チェックを挿入**して防止:
+- `cc/cc.c`: `cc_tick()` (予算 `CC_BUDGET=2億`、使い切ると 0 を返し `g_aborted` を立てる)、
+  外部シンボル `__cc_tick` 登録、実行前にリセット、中断時は出力に
+  `cc: aborted (runaway loop budget exhausted)` を注記。
+- `cc/codegen.c`: while/for の back-edge (`b lbegin` 直前) に `emit_budget_check(lend)`
+  = `bl cc_tick; cbz x0, lend`。予算切れで全ループが脱出し、関数が return して unwind。
+- **QEMU 検証**: `while(i>=0){i=i+1;}` → 中断・注記表示・**シェル生存**、直後の fib=55 正常、
+  AIPL 由来 Summer(while×100)=5050 回帰 OK。3 ターゲット clean build (kernel8.img 101000)。
+- ⚠️ 現 flash 済 de61f41f には未反映 (実機 /compile を守るには要・次回 flash)。
+  ★残: 深い無限再帰はスタックオーバーフローで fault しうる (loop 予算では捕捉外)。
+
+## ✅ 2026-05-28 — AIPL→C 変換器を /compile 向けに retarget (実機検証済)
+
+abclcp-project (`/Users/kodamay/ocaml-app/abclcp-project`) の AIPL→C 変換器に
+**`--xinu-jit`** ターゲット (`src/c_translator.ml` の `gen_program_xinujit` + `src/aipl2c.ml`)
+を追加。**整数アクター専用の自己完結サブセットC** (this kernel の `cc/` が受理する形:
+`struct Obj{int cls;int f[N];} g_obj[64]` / フィールド=配列 / 送信=`dispatch(to,mid,a0..a3)` の
+cls switch / メソッド=`int m_<C>_<m>(int self,a0..a3)` / globals→main、ランタイムは print/puts のみ)
+を生成。**実機 Pi 4 の `/compile` に POST して検証済**: Counter→5/42/42、Summer(while)→5050、
+Multi(2アクター・クロス now・new)→123、並行 ping 0% loss。
+- サンプル+スクリプト: `abclcp-project/examples_xinujit/` (Counter/Summer/Multi.abcl + run.sh + README)。
+  ワークフロー: `examples_xinujit/run.sh File.abcl [host]` = 変換→`/compile` POST。
+- スコープ: int のみ (float→int 切捨、文字列は print リテラルのみ)。AIPL while は `while(c) do {…}`。
+- 次: 文字列/float (value_t をカーネル側 externs 化)、async mailbox 化、select/saga、無限ループ保護。
+
+## ✅ 2026-05-28 — 階層ファイルシステム + オンデバイス C コンパイラ (JIT)
+
+AIPL→C→実行環境の土台として、Xinu 上に **(1) 使える階層 FS** と **(2) C を機械語に
+コンパイルして即実行する JIT コンパイラ**を実装。**QEMU virt で全機能 PASS**、pi4/pi5/
+qemu の 3 ターゲットともクリーンビルド (kernel8.img 96008 / 2712 85432 / virt 85176)。
+
+### (1) 階層ファイルシステム
+- `fs/vfs.c` + `include/vfs.h` に **cwd / 相対パス・`.`・`..` 解決 (`vfs_resolve`)、
+  `vfs_resolve_parent` (parent+leaf 分離)、`vfs_path` (絶対パス生成)、`vfs_unlink`/
+  `vfs_rmdir`/`vfs_child`** を追加 (既存の tmpfs ツリーの上に)。
+- `shell/fscmd.c` (新規) に **pwd/ls/cd/mkdir/touch/cat/write/edit/rm/rmdir/tree/cp/mv**。
+  `edit` は `uart_getline` ループで単独 `.` 終端の複数行入力 (piped stdin でも動く)。
+  `shell/shell.c` の commandtab に登録。
+
+### (2) オンデバイス C コンパイラ — 新コンポーネント `cc/` (Makefile COMPONENTS に追加)
+- 対象サブセット: **int/char/ポインタ/配列/文字列リテラル**、`+ - * / %`・比較・`&& || !`・
+  `& *`・代入、`if/else/while/for/return/{}`、**関数定義・引数・再帰**。
+  ★`int` は **8 バイト** (AIPL value_t の 64bit タグ語と整合、レジスタ演算を X で統一)、
+  `char`=1、ポインタ/配列=8。
+- `cc/parse.c` = lexer + 再帰下降パーサ (型付き AST、ポインタ演算は要素サイズで scaling)。
+- `cc/codegen.c` = **AArch64 機械語をバッファに直接生成するスタックマシン方式**。
+  全エンコーディングは `aarch64-elf-as` で実機検証して手書き emit。式結果は x0、二項演算は
+  rhs を SP に push して lhs 計算後に pop。ローカルは x29 からのフレームオフセット。
+  ★JIT 前提で**絶対アドレスを emit 時に movz/movk で埋め込む** (文字列=arena アドレス、
+  ユーザ関数=コードバッファ内オフセット (前方参照は fixup で後パッチ)、組み込み=カーネル関数)。
+  分岐はラベル+fixup で相対 b/cbz/cbnz。
+- `cc/cc.c` = ドライバ。arena(256KB) → `cc_lex`→`cc_parse`→`cc_codegen`(code 64KB) →
+  **`dc cvau`/`ic ivau`/`dsb`/`isb` でキャッシュ整合** → `code+entry` を関数ポインタで**その場で実行**
+  → 戻り値表示。組み込みは **外部シンボル表 `cc_resolve_extern`** で解決:
+  `print(int) / putchar / puts(char*) / actor_send(id, "method", arg)`。
+  ★`actor_send` が `system/actor.c` の `actor_message` を呼ぶ = **コンパイルした C から
+  Xinu アクターランタイムを直接駆動** (AIPL バックエンドの seam)。
+- シェル: `cc <file.c>`。`/examples/{fib,hello,actor}.c` を起動時に投入 (`loader/main.c`)。
+
+### QEMU で確認した動作 (全 PASS)
+- FS: pwd/ls/cd/相対パス/`..`/mkdir/write/cat/edit(複数行)/tree/cp/mv/rm/rmdir。
+- `cc /examples/fib.c` → `0 1 1 2 3 5 8 13 21 34` + `=> 55` (再帰・呼び出し・制御フロー)。
+- sum 1..100 → 5050、`int a[5]; a[i]=i*i; Σ` → 30, `a[4]`→16 (配列・添字・scaling)。
+- `strlen(char*)` + 文字列リテラル + `puts` → `hello, xinu` / `=> 11`。
+- `cc /examples/actor.c` → `actor_send` で counter を bump/add/get (1,41,=>41)。
+
+### ⚠️ 実機での使い方の制約 (次の課題)
+- 現状 Pi4 実機は **HDMI 接続時 `wm_run()` が main を占有**し UART REPL (`shell_main`) に
+  到達しない + **USB キーボード未実装 (XHCI 未完)** なので、`cc`/FS を実機で対話駆動できない。
+  → **(a) HDMI を外して起動すれば serial REPL で使える**、または
+    **(b) HTTP に「C ソース受信→コンパイル→実行→結果返却」エンドポイントを足す**
+    (= ユーザの言う **AIPL 動的コンパイル**そのもの。既存 `system/tcp_server.c` の HTTP
+     gateway に `/compile` 等を追加すれば live 実機でネット越しに JIT 実行できる)。
+- コンパイラ/FS は QEMU と Pi4 で**同一コードパス** (GENET/HDMI に非依存、`-mstrict-align`
+  も共通) なので、実機でも同じく動くはず。要・上記いずれかの入力経路。
+- 次の自然な発展: **HTTP `/compile` エンドポイント** → **`c_translator.ml --xinu` を本コンパイラの
+  サブセット + `actor_send`/`print` ランタイムに retarget** → 本物の .abcl アクターを実機 JIT。
+
+### コンパイラ言語拡張 (2026-05-28 同日、E1–E4 完了)
+AIPL→C 出力 (value_t struct / `objects[].fields[]` / switch / typedef) に近づけるため拡張:
+- **E1 グローバル変数** (scalar+array): トップレベル var 宣言を arena 内永続ストレージに置き
+  絶対アドレスを movz/movk で埋込。ゼロ初期化 + 定数スカラ初期化。`find_var` は locals→globals。
+- **E2 typedef + sizeof**: `typedef <type> <name>;` を型表登録、`declspec` が typedef 名を受理。
+  `sizeof(type)` / `sizeof expr` を定数 int に (★int=8/char=1/ptr=8/struct=合計)。
+- **E3 struct + メンバアクセス**: `struct Tag { ... };` 定義 (メンバ名/型/オフセット、★8byte
+  メンバは 8 整列必須=MMU off の unaligned fault 回避)。`declspec` が `struct Tag` 受理。
+  `a.b` / `a->b` (後者は `(*a).b` に正規化)。ネスト/配列メンバ/グローバル struct 配列 OK。
+  ★値渡し/値返しは未対応 (ポインタ経由)。
+- **E4 switch/case/default + break/continue**: switch は値比較連鎖 + `b.cond` ディスパッチ
+  (b.cond エンコーディング追加)、case はラベル配置 (フォールスルーは C 準拠)。break/continue は
+  ループ/switch のラベルスタックで解決 (for の continue は inc 点へ)。
+- ★lexer に `struct/typedef/switch/case/default/break/continue` キーワード、`->`、`:` を追加。
+- **QEMU 検証**: グローバル counter/配列/定数init (3/60/100→163)、struct (`objs[0].fields[1]` 等
+  →25/7/300/109)、typedef+sizeof (8/1/16/42→30)、switch+break+continue (sum 23 / classify
+  200/300/999)。既存 fib/strlen/actor も回帰 OK。3 ターゲット clean build
+  (kernel8.img 98696 / 2712 90120 / virt 89864)。
+- **コンパイラ対応 C サブセット (現状)**: int(8B)/char/ポインタ/配列/struct/typedef/文字列、
+  四則+剰余・比較・`&&||!`・`&*`・`. ->`・添字・代入・sizeof、if/else/while/for/switch/
+  return/break/continue/{}、関数・引数(≤8)・再帰、グローバル変数。組み込み
+  print/putchar/puts/actor_send。**未対応**: struct 値渡し/値返し、複合リテラル、setjmp/longjmp
+  (saga)、float、関数ポインタ、可変長引数、複数翻訳単位。
+
+### HTTP /compile エンドポイント (動的コンパイル, 2026-05-28 同日)
+**ネット越しに C ソースを送る→コンパイル→JIT 実行→結果(出力 + `=> 戻り値`)を返す**。
+live 実機で AIPL/C を投げて実行できる = 動的コンパイルの seam。
+- `include/cc.h` 新規 + `cc/cc.c`: **出力キャプチャ**追加 (`g_cap`/`emit_ch`)、コア
+  `compile_run_core` を抽出、**`cc_run_source(src,len,out,outcap,*retval)`** 公開。
+  `cmd_cc` もこの経路に統一 (→ キャプチャ経路を QEMU で検証可能、fib=55 確認済)。
+  エラー時は out に `cc: <message>`。
+- `system/tcp_server.c`: HTTP gateway に **`POST /compile`** (ボディ=C ソース) と
+  **`GET /compile?src=<urlencoded>`** を追加。`cc_run_source` を呼び text/plain で結果返却。
+  ★**リクエストのセグメント蓄積**を実装 (`g_httpreq[4096]`+`request_complete`: POST は
+  Content-Length まで待つ、GET はヘッダ終端で完結)。これで C ソースが MSS を跨いでも受信可。
+  SYN-ACK (finicky) は不変更。応答は 1 セグメント (≤~1400B、prog 出力は 1100B に cap)。
+- ✅ **2026-05-28 実機 Pi 4 で /compile 完全検証** (kernel8.img de61f41f を flash・起動):
+  `POST /compile` で inline(`=>7`)・fib(`=>55`)・strlen(`=>15`)・actor(`bump/add/get`=1/41/`=>41`)・
+  struct+global+switch(25/119/`=>25`)、`GET ?src=`(urlencoded `42`) すべて成功。**HTTP でコンパイル
+  した C が実機アクターを駆動** (`/api/actors` で counter value=41 msgs=3 永続)。**並行 ping 0% loss**
+  (ICMP wedge 回帰なし)。886B ソース (複数セグメント) も `=>120` で**セグメント蓄積が機能**確認。
+- ⚠️ 発見: **>4096B のソースは蓄積バッファ超過で応答せずタイムアウト** (ping/サーバは生存・後続接続は復帰)。
+  → **修正済 (要・次回 flash)**: `g_httpreq` を **8192** に拡大 + バッファ満杯で未完なら **413 を返して close**
+  (ハング回避)。現在 flash 済の de61f41f にはこの修正は未反映 (kernel8.img 再ビルド済 md5 1d9c27a5)。
+- 実機検証手順 (Pi 4):
+  ```sh
+  cd compile && make pi4              # kernel8.img (100808 B)
+  # SD を Mac に挿す → cp kernel8.img /Volumes/bootfs/ ; sync ; diskutil eject
+  # Pi 起動後 (Mac は 192.168.3.202):
+  sudo arp -s 192.168.3.100 d8:3a:dd:a7:fd:bf
+  curl -s --data-binary 'int main(){ puts("hi over HTTP"); return 7; }' http://192.168.3.100/compile
+  curl -s --data-binary @examples_fib.c http://192.168.3.100/compile
+  curl -s --data-binary 'int main(){ return actor_send(0,"bump",0); }' http://192.168.3.100/compile
+  ```
+  期待: 出力 + `=> 7` / `=> 55` / `=> 1` 等。並行 ping 生存も確認。
+- ★既知リスク: 投げた C が無限ループだと dispatch (genet_rx_tick) ごと固まる (将来は命令数上限を)。
+
+### 主要ファイル
+- `fs/vfs.c` `include/vfs.h` `shell/fscmd.c` `shell/shell.c`
+- `cc/ccpriv.h` `cc/parse.c` `cc/codegen.c` `cc/cc.c` `include/cc.h` `compile/Makefile` (COMPONENTS に `cc`)
+- `system/tcp_server.c` (HTTP `/compile`) `loader/main.c` (`/examples` 投入)
+
+---
+
 ## ✅ 2026-05-27 (session 2) — HTTP actor gateway + Mac AIPL→Xinu actor 完動
 
 **実機で「Mac の AIPL アクター → Xinu のアクターへ TCP/HTTP メッセージ」が完動。**

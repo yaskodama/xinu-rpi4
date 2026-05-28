@@ -44,7 +44,7 @@ LD       = $(GCCPATH)/bin/$(CROSS)ld
 OBJCOPY  = $(GCCPATH)/bin/$(CROSS)objcopy
 
 # ----- source discovery -----------------------------------------------
-COMPONENTS = loader mem system shell fs \
+COMPONENTS = loader mem system shell fs cc \
              device/uart device/mbox device/video device/sd device/usb \
              device/usb/xhci device/gic device/timer device/genet \
              network/arp network/net network/netaddr network/ipv4 network/icmp

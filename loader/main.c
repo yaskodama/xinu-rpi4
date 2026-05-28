@@ -512,6 +512,37 @@ static void vfs_populate_demo(void)
             vfs_write_str(f, "kmalloc-backed tmpfs, no input yet.");
         }
     }
+
+    /* Sample C programs for the on-device compiler: run e.g. `cc /examples/fib.c`. */
+    vfs_node_t *ex = vfs_mkdir(r, "examples");
+    if (ex) {
+        vfs_node_t *f;
+        f = vfs_create_file(ex, "fib.c");
+        vfs_write_str(f,
+            "int fib(int n) {\n"
+            "  if (n < 2) return n;\n"
+            "  return fib(n-1) + fib(n-2);\n"
+            "}\n"
+            "int main() {\n"
+            "  int i;\n"
+            "  for (i = 0; i < 10; i = i + 1) print(fib(i));\n"
+            "  return fib(10);\n"
+            "}\n");
+        f = vfs_create_file(ex, "hello.c");
+        vfs_write_str(f,
+            "int main() {\n"
+            "  puts(\"hello from a JIT-compiled C program\");\n"
+            "  return 0;\n"
+            "}\n");
+        f = vfs_create_file(ex, "actor.c");
+        vfs_write_str(f,
+            "/* compiled C driving the Xinu actor runtime */\n"
+            "int main() {\n"
+            "  print(actor_send(0, \"bump\", 0));\n"
+            "  print(actor_send(0, \"add\", 40));\n"
+            "  return actor_send(0, \"get\", 0);\n"
+            "}\n");
+    }
 }
 
 /* ---- File-tree window ------------------------------------------- */

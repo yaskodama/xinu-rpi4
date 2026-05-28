@@ -55,6 +55,42 @@ int vfs_write_str(vfs_node_t *file, const char *s);
  * or NULL.  Trailing slash is allowed.  Path "/" is the root. */
 vfs_node_t *vfs_lookup(const char *path);
 
+/* ---- current working directory + general path resolution ---- */
+
+/* The current working directory (root until first vfs_chdir). */
+vfs_node_t *vfs_cwd(void);
+int         vfs_chdir(vfs_node_t *dir);   /* 0 ok, -1 if not a dir */
+
+/* Resolve a path that may be absolute ("/a/b") or relative ("a/b"),
+ * honouring "." and ".." and trailing slashes, against the current
+ * working directory.  Empty/NULL path resolves to the cwd.  Returns the
+ * node, or NULL if any component is missing or a non-final component is
+ * not a directory. */
+vfs_node_t *vfs_resolve(const char *path);
+
+/* Resolve everything up to (but not including) the final path
+ * component.  On success returns the parent directory node and copies
+ * the final component name into `leaf`.  Used by mkdir/create/rm to
+ * split "dir/dir/leaf" into (parent, "leaf").  Returns NULL if the
+ * parent path is missing / not a directory, or the final component is
+ * empty or "." / "..". */
+vfs_node_t *vfs_resolve_parent(const char *path, char *leaf, int leafmax);
+
+/* Build the absolute path string of `node` into `buf` (e.g. "/home/user").
+ * Returns the length, or -1 if it does not fit in `max`. */
+int vfs_path(vfs_node_t *node, char *buf, int max);
+
+/* Remove a regular file (frees its data + node).  Returns 0 / -1. */
+int vfs_unlink(vfs_node_t *file);
+
+/* Remove an empty directory (not the root).  Returns 0, or -1 if the
+ * node is not a dir / is the root / is non-empty. */
+int vfs_rmdir(vfs_node_t *dir);
+
+/* Look up an immediate child of `dir` by name.  Returns the node or
+ * NULL (also NULL if `dir` is not a directory). */
+vfs_node_t *vfs_child(vfs_node_t *dir, const char *name);
+
 /* Depth-first walk: visit(depth, node, ctx) is called for every
  * reachable node, with `depth` counting the number of ancestors
  * (root = 0).  Useful for the File-Tree window. */
