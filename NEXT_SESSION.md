@@ -1,5 +1,16 @@
 # NEXT_SESSION — xinu-rpi5
 
+## ✅ 2026-05-28 — AIPL --xinu-jit を value_t 化 (文字列対応, QEMU検証)
+
+`cc/cc.c` に **タグ付き value_t ランタイム** (低位bit1=即値int / 0=文字列ポインタ)。
+v_int/v_str/v_add(int加算|文字列連結)/v_sub/mul/div/lt/le/eq/ne/and/or/not/print/truthy/
+int_of + 連結用8KBヒープ、cc_resolve_extern 公開。abclcp `c_translator.ml gen_program_xinujit`
+を raw-int→value_t に retarget (リテラル→v_int/v_str、演算→v_*、print→v_print、if/while→
+v_truthy、objイド→v_int_of)。**`print("count = " + n)` 等の文字列+連結が動作**、int は即値で
+ループ安価。QEMU `cc` で String(count=5/42)・Counter(5/42/42)・Summer(5050)・Multi(123) 全 OK。
+float は依然 int 切捨。commit: xinu-rpi5 `2cc615c` / abclcp `8197984`。残: float 値、async
+mailbox、select/saga。
+
 ## 🚧 2026-05-28 — 仮想記憶 (MMU) Stage 1–3 完了 (QEMU検証・実機未flash)
 
 MMU オフだった前提を反転。`system/mmu.c` + `include/mmu.h`、`kernel_main` の
