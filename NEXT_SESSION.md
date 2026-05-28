@@ -1,5 +1,18 @@
 # NEXT_SESSION — xinu-rpi4
 
+## ✅ 2026-05-28 — ネットワーク越し LLM（HTTP /llm）★実機検証済
+
+`POST /llm`（body=プロンプト、`?n=`=トークン数 既定32/上限96）でプロンプトを送り生成テキストを
+text/plain で返す。tcp_server.c に /llm ルート、llm.c に `llm_run`(バッファ捕捉) + `llm_generate` の
+`drain` フラグ。**HTTP 経路は drain=0**(genet_rx_tick 内なので RX 再入を避ける)、シリアルは drain=1。
+**実機実測(192.168.3.100)**: 約 **100〜155 ms/token**(D-cache OFF)、**wedge なし・毎回生存**。
+- `POST /llm?n=32` "Once upon a time" → "...there was a little girl named Lily. She loved to play
+  outside in the park. One"(Python リファレンスと一致)。n=64 で "The little robot..."/"A cat and a dog..."
+  も coherent(各 ~10秒)。serial macOS は baud 設定不可(tcsetattr EINVAL)で HTTP 経由が正解だった。
+- detok の BOS 先頭スペース除去が1トークンずれていた("Onceupon")→ `emit_piece(token,next)` に修正
+  (commit e1dd96d、**未 flash**、実機は修正前 9dd637ca で "Onceupon" 表示のまま=軽微)。
+- commit xinu **5c34ad1**(/llm) + **e1dd96d**(space fix)。次フラッシュで space fix 反映。
+
 ## ✅ 2026-05-28 — オンデバイス LLM（Ollama 風ローダ・極小スケール）
 
 「ローカルモデルを読み込み端末上で推論」を llama2.c 方式で実装。フル Ollama は不可（Go+llama.cpp+GGUF+
