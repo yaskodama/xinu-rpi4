@@ -40,6 +40,27 @@ firmware version によって変わる可能性。**正しい encoding は circl
   7. ECAM 経由で VL805 vendor/device 読み (offset 0x8000 から bus 1 dev 0 fn 0 cfg)
   8. その後 XHCI-B/C/...（xHCI 初期化）へ続行
 
+**(c) config.txt dtparam も試したが dead end**: `dtparam=pciex1_gen=2` を追加して再起動 →
+firmware に PCIe 初期化を委ねる試み。結果：`/pcie` 直接読みが hang（前回 boot 時は 0 を返したが、
+dtparam ありでは MMIO access が宙吊り＝firmware が PCIe を中途半端に触った可能性）。dtparam は
+**逆効果**だったので config.txt は元に戻した（commit `<this>`）。
+
+### 区切り — このセッションで分かったこと
+- ✅ 安全 probe 基盤（`/pcie` / `/xhci-reset` HTTP 経路）= branch tip にあり、再開時に即使える
+- ❌ mailbox `notify-xhci-reset` (tag 0x00030058): devid=0x100000 も devid=0 も hang = 道なし
+- ❌ config.txt `dtparam=pciex1_gen=2`: firmware を中途半端な状態にする = 道なし
+- 🔥 **proper reference 必須**: 自前 CPRMAN+RC 起動は数百行 + 正確なレジスタ仕様が必要。
+  推測実装は毎回 box ロックアウト（5+ flash サイクルで実証）。
+
+### 次セッションの最低限の準備
+- circle (https://github.com/rsta2/circle) の `lib/usb/xhcidevice.cpp` を手元に
+- Linux `drivers/pci/controller/pcie-brcmstb.c` を手元に
+- BCM2711 ARM Peripherals datasheet（公開版 BCM2835 ARM Peripherals は古いので不十分）
+- これらを参照しながら CPRMAN clock enable + brcmstb-pcie 起動シーケンスを実装
+
+または — **別の方向**：USB ドライバを諦めて HID 入力は外部経路（例：ネットワーク経由のキーボード/マウス
+イベント送信）で代替する設計に転換、というのも検討の余地あり。
+
 **安全な checkpoint commit 済み** — branch `feat/xhci-usb-hid`、tip 以下に記録。
 mailbox hang を踏むと box が固着するので、次セッションでは（a）か（b）の実装が先。
 
