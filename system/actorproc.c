@@ -24,6 +24,7 @@ static struct {
     int head, tail;
     int pid;                        /* Xinu pid, -1 = none              */
     int waiting;                    /* blocked on empty mailbox         */
+    unsigned int nmsg;              /* total messages handled (diagnostic) */
 } g_act[AP_NACT];
 
 static int g_nact;
@@ -52,6 +53,7 @@ void ap_reset(void)
         g_act[i].head = g_act[i].tail = 0;
         g_act[i].pid = -1;
         g_act[i].waiting = 0;
+        g_act[i].nmsg = 0;
         g_jmp_armed[i] = 0;
     }
     g_nact = 0;
@@ -99,6 +101,14 @@ static void ap_recv(int self, struct ap_msg *out)
     while (q_empty(self)) { g_act[self].waiting = 1; proc_block(); }
     *out = g_act[self].q[g_act[self].head];
     g_act[self].head = (g_act[self].head + 1) % AP_QLEN;
+    g_act[self].nmsg++;
+}
+
+/* Count a message handled by a direct dispatch (cc_actor_send_*), which does
+ * not go through ap_recv.  Keeps the wm window's per-actor count accurate. */
+void ap_note_msg(int actor)
+{
+    if (actor >= 0 && actor < g_nact) g_act[actor].nmsg++;
 }
 
 long ap_select(long self, int n, const long *meths, struct ap_msg *out)
@@ -172,6 +182,7 @@ int ap_spawn(void)
     int id = g_nact;
     g_act[id].head = g_act[id].tail = 0;
     g_act[id].waiting = 0;
+    g_act[id].nmsg = 0;
     g_jmp_armed[id] = 0;
     int pid = proc_create_arg(actor_proc_main, 8192, "actor", (void *)(long)id);
     if (pid < 0) return -1;
@@ -189,6 +200,22 @@ void ap_run(void)
         if (!any_ready) break;
         proc_yield();
     }
+}
+
+/* ---- introspection for the wm "Actors" window ---- */
+int ap_live_count(void) { return g_nact; }
+
+/* Fill stats for live actor `i` (0..ap_live_count()-1): its Xinu pid, the
+ * number of messages queued in its mailbox, and whether it is blocked waiting
+ * on an empty mailbox.  Returns 0 on success, -1 if `i` is out of range. */
+int ap_actor_stat(int i, int *pid, int *qlen, int *waiting, unsigned int *nmsg)
+{
+    if (i < 0 || i >= g_nact) return -1;
+    if (pid)     *pid     = g_act[i].pid;
+    if (qlen)    *qlen    = (g_act[i].tail - g_act[i].head + AP_QLEN) % AP_QLEN;
+    if (waiting) *waiting = g_act[i].waiting;
+    if (nmsg)    *nmsg    = g_act[i].nmsg;
+    return 0;
 }
 
 /* ---------- native demo: two actors ping-pong via blocking receive ---------- */

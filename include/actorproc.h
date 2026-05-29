@@ -19,6 +19,11 @@ void ap_send(long to, long method, long a0, long a1, long a2, long a3);
 long ap_call(long self, long to, long method, long a0, long a1, long a2, long a3);
 void ap_run(void);                   /* drive actors until quiescent      */
 
+/* Introspection for the wm "Actors" window. */
+int  ap_live_count(void);                                /* # live actors    */
+int  ap_actor_stat(int i, int *pid, int *qlen, int *waiting, unsigned int *nmsg);
+void ap_note_msg(int actor);         /* count a direct-dispatch message      */
+
 /* Selective receive used by AIPL `select`: block until a message whose
  * method is one of meths[0..n); returns the matched method, *out gets it. */
 long ap_select(long self, int n, const long *meths, struct ap_msg *out);

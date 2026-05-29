@@ -16,6 +16,7 @@
 #include "memory.h"
 #include "proc.h"
 #include "critical.h"
+#include "actorproc.h"
 #include "video.h"
 #include "early_diag.h"
 #include "wm.h"
@@ -728,9 +729,76 @@ static void win_mem(window_t *self, unsigned int frame)
     draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
 }
 
+/* Resident actor's class name (cc/cc.c) — for the Actors window. */
+extern int cc_actor_name(int apid, char *out, int cap);
+
+/* "Actors (live)" window — shows the JIT/AIPL resident actors (loaded via
+ * /actor/load: e.g. the dining philosophers), one row each with the Xinu pid,
+ * scheduler state, and the number of messages queued in its mailbox.  Reads
+ * are lock-free (display only); a torn value just blinks for one frame. */
+static void win_actors(window_t *self, unsigned int frame)
+{
+    (void)frame;
+    int xb = self->x + 8;
+    int yb = self->y + WM_TITLEBAR_H + 6;
+    int line = 0;
+    unsigned int fg = 0xFFFFFFFFU, bg = self->content_bg;
+    char tmp[24]; char *p;
+
+    int n = ap_live_count();
+    draw_string_at(xb, yb + line*12, "Live actors:", 0xFF80FF80U, bg);
+    p = u_to_dec((unsigned long)n, tmp, sizeof tmp);
+    draw_string_at(xb + 104, yb + line*12, p, fg, bg);
+    line += 2;
+
+    if (n <= 0) {
+        draw_string_at(xb, yb + line*12, "(none - POST /actor/load)", 0xFF909090U, bg);
+        return;
+    }
+
+    /* columns: id, name(class), pid, state, msgq, total msgs */
+    draw_string_at(xb, yb + line*12, "id name        pid st     q  msgs",
+                   0xFFB0B0B0U, bg);
+    line++;
+    for (int i = 0; i < n; i++) {
+        int pid = -1, qlen = 0, waiting = 0; unsigned int nmsg = 0;
+        if (ap_actor_stat(i, &pid, &qlen, &waiting, &nmsg) != 0) continue;
+
+        char name[16];
+        if (cc_actor_name(i, name, sizeof name) <= 0) { name[0] = '-'; name[1] = 0; }
+
+        const char *st = "?";
+        if (waiting) {
+            st = "WAITmsg";                  /* blocked on an empty mailbox */
+        } else if (pid > 0 && pid < NPROC) {
+            switch (proctab[pid].state) {
+                case PR_READY: st = "READY"; break;
+                case PR_CURR:  st = "RUN";   break;
+                case PR_WAIT:  st = "WAIT";  break;
+                case PR_TERM:  st = "TERM";  break;
+                default:       st = "FREE";  break;
+            }
+        }
+
+        int col = xb;
+        p = u_to_dec((unsigned long)i,   tmp, sizeof tmp);
+        draw_string_at(col, yb + line*12, p, fg, bg);                  col += 20;
+        draw_string_at(col, yb + line*12, name, 0xFF80FFD0U, bg);      col += 96;
+        p = u_to_dec((unsigned long)pid, tmp, sizeof tmp);
+        draw_string_at(col, yb + line*12, p, fg, bg);                  col += 32;
+        draw_string_at(col, yb + line*12, st, 0xFFFFD080U, bg);        col += 64;
+        p = u_to_dec((unsigned long)qlen, tmp, sizeof tmp);
+        draw_string_at(col, yb + line*12, p, 0xFF80D0FFU, bg);         col += 24;
+        p = u_to_dec((unsigned long)nmsg, tmp, sizeof tmp);
+        draw_string_at(col, yb + line*12, p, 0xFFD0D0D0U, bg);
+        line++;
+    }
+}
+
 /* Static window descriptors — laid out after video_init() picks the
  * actual screen dimensions in kernel_main(). */
 static window_t banner_win;
+static window_t actors_win;
 static window_t status_win;
 static window_t anim_win;
 static window_t ftree_win;
@@ -1015,9 +1083,10 @@ void kernel_main(void)
         ftree_win.draw_content = win_ftree;
         wm_add(&ftree_win);
 
-        /* Memory window: right side, below status so it sits in
-         * the initial viewport with the shell on the left. */
-        mem_win.x = 320;
+        /* Memory window: moved to the far-right of the virtual desktop
+         * (pan right to see it) so the Actors window can take the visible
+         * right-bottom slot of the initial viewport. */
+        mem_win.x = WM_DESKTOP_W - 320;
         mem_win.y = 240;
         mem_win.width  = 320;
         mem_win.height = 220;
@@ -1062,6 +1131,23 @@ void kernel_main(void)
         softkbd_win.content_bg   = 0xFF0A0A14U;
         softkbd_win.draw_content = softkbd_draw;
         wm_add(&softkbd_win);
+
+        /* Actors window: visible right-bottom slot of the initial viewport,
+         * and added LAST so it is the front-most window (wm draws head->tail,
+         * so the last-added one is painted on top).  Shows the live JIT/AIPL
+         * resident actors + their state + mailbox depth. */
+        actors_win.x = 320;
+        actors_win.y = 240;
+        actors_win.width  = 320;
+        actors_win.height = 220;
+        const char *at = "Actors (live)";
+        for (int i = 0; i < WM_TITLE_MAX && at[i]; i++) actors_win.title[i] = at[i];
+        actors_win.chrome_color = 0xFFFF80E0U;
+        actors_win.title_bg     = 0xFF602050U;
+        actors_win.title_fg     = 0xFFFFFFFFU;
+        actors_win.content_bg   = 0xFF181018U;
+        actors_win.draw_content = win_actors;
+        wm_add(&actors_win);
 
         /* Start the cursor at the centre of the *screen* (not the
          * virtual desktop) so it stays in view as the viewport

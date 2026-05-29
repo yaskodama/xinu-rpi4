@@ -642,6 +642,8 @@ static unsigned char *g_res_code;      /* kept alive: the JIT'd code          */
 static long (*g_res_dispatch)(long, long, long, long, long, long);
 static long (*g_res_methodid)(long);
 static long (*g_res_nobj)(void);
+static long (*g_res_clsname)(long);     /* __cls_name(cls) -> v_str  */
+static long (*g_res_objcls)(long);      /* __obj_cls(id)   -> v_int  */
 
 static void res_free(void)
 {
@@ -650,6 +652,7 @@ static void res_free(void)
     if (g_res_arena) kfree(g_res_arena);
     g_res_code = 0; g_res_arena = 0;
     g_res_dispatch = 0; g_res_methodid = 0; g_res_nobj = 0;
+    g_res_clsname = 0; g_res_objcls = 0;
 }
 
 int cc_actor_load(const char *src, int srclen, char *out, int outcap)
@@ -693,6 +696,8 @@ int cc_actor_load(const char *src, int srclen, char *out, int outcap)
     int moff = cc_func_offset("__method_id");
     int noff = cc_func_offset("__nobj");
     int aoff = cc_func_offset("apply");
+    int cnoff = cc_func_offset("__cls_name");
+    int ocoff = cc_func_offset("__obj_cls");
 
     cc_sync_icache(code, (unsigned long)len);
 
@@ -720,6 +725,8 @@ int cc_actor_load(const char *src, int srclen, char *out, int outcap)
     g_res_dispatch = (doff >= 0) ? (void *)(code + doff) : 0;
     g_res_methodid = (moff >= 0) ? (void *)(code + moff) : 0;
     g_res_nobj     = (noff >= 0) ? (void *)(code + noff) : 0;
+    g_res_clsname  = (cnoff >= 0) ? (void *)(code + cnoff) : 0;
+    g_res_objcls   = (ocoff >= 0) ? (void *)(code + ocoff) : 0;
 
     /* Append the actor count. */
     long nobj = g_res_nobj ? v_int_of(g_res_nobj()) : 0;
@@ -758,6 +765,7 @@ int cc_actor_send_msg(int actor, const char *method, long arg, char *out, int ou
     }
 
     long res = g_res_dispatch((long)actor, mid, v_int(arg), v_int(0), v_int(0), v_int(0));
+    ap_note_msg(actor);
 
     /* Drain any asynchronous `send`s the handler triggered (delivered to
      * the resident actor processes). */
@@ -802,7 +810,28 @@ int cc_actor_send_str(int actor, const char *method, const char *strarg, char *o
     char tmp[64];
     const char *r = v_render(res, tmp, sizeof tmp);   /* string -> returns the pointer itself */
     int p = 0; while (r[p] && p < outcap - 1) { out[p] = r[p]; p++; } if (outcap) out[p] = 0;
+    ap_note_msg(actor);
     return 0;
+}
+
+/* Class name of resident actor `apid` (g_obj is indexed by actor id) into
+ * `out`; returns its length, or 0 if no resident program / no name table.
+ * Used by the wm "Actors (live)" window. */
+int cc_actor_name(int apid, char *out, int cap)
+{
+    if (cap <= 0) return 0;
+    out[0] = 0;
+    if (!g_res_objcls || !g_res_clsname) return 0;
+    /* __obj_cls(int id) takes a RAW actor id and returns v_int(cls);
+     * __cls_name(int cls) takes a RAW class index — do NOT v_int()-tag the
+     * args (g_obj[] is indexed raw; cls is compared to raw 0,1,...). */
+    long cls = v_int_of(g_res_objcls((long)apid));
+    long nv  = g_res_clsname(cls);
+    char tmp[40];
+    const char *r = v_render(nv, tmp, sizeof tmp);
+    int n = 0; while (r[n] && n < cap - 1) { out[n] = r[n]; n++; }
+    out[n] = 0;
+    return n;
 }
 
 /* ---- shell front-ends (also let the HTTP-only feature be tested on QEMU) ---- */
