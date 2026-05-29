@@ -1273,10 +1273,10 @@ void kernel_main(void)
 
         /* Graphics window: right side of the 1024x768 screen.  AIPL actors
          * draw line segments / circles into it via the gfx_* builtins. */
-        gfx_win.x = 624;
-        gfx_win.y = 118;
-        gfx_win.width  = 391;
-        gfx_win.height = 644;
+        gfx_win.x = 626;
+        gfx_win.y = 129;
+        gfx_win.width  = 394;
+        gfx_win.height = 629;
         const char *gt = "Graphics";
         for (int i = 0; i < WM_TITLE_MAX && gt[i]; i++) gfx_win.title[i] = gt[i];
         gfx_win.chrome_color = 0xFF80FFC0U;
@@ -1291,8 +1291,8 @@ void kernel_main(void)
          * wm paints it front-most and it is always readable. */
         runtime_win.x = 630;
         runtime_win.y = 0;
-        runtime_win.width  = 356;
-        runtime_win.height = 128;     /* +1 line for the vheap-lock row */
+        runtime_win.width  = 369;
+        runtime_win.height = 119;
         runtime_win.font_scale = 1;
         const char *rt = "Runtime";
         for (int i = 0; i < WM_TITLE_MAX && rt[i]; i++) runtime_win.title[i] = rt[i];

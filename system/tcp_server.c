@@ -19,6 +19,7 @@
 
 /* On-device LLM (llm/llm.c): generate text into `out`, return token count. */
 extern int llm_run(const char *prompt, int max_new, char *out, int outcap, int echo);
+extern int llm_run_drain(const char *prompt, int max_new, char *out, int outcap, int echo, int drain);
 /* Send a STRING message to a resident actor's method; reply -> out (cc/cc.c). */
 extern int cc_actor_send_str(int actor, const char *method, const char *strarg, char *out, int outcap);
 /* 100 Hz IRQ-driven tick counter (device/timer/timer.c) — for /ticks diag. */
@@ -167,6 +168,15 @@ const char *rt_phase(void)            { return (const char *)g_app_phase; }
 extern void proc_set_preempt(int on);
 extern void aipl_lock(void);
 extern void aipl_unlock(void);
+/* Gate timer preemption while a vheap user runs concurrently with resident
+ * actors (system/proc.c, system/actorproc.c).  /llm holds the shared aipl_lock;
+ * if it runs preemptible while AIPL actors are resident, a preempt mid-llm
+ * races the actor scheduling / GENET IRQ re-arm and wedges (own=2 in llm_run,
+ * or ph=idle with the net process never re-woken).  So gate /llm ONLY when
+ * actors exist; pure /llm (no actors) keeps full preemption + its latency win. */
+extern void proc_actor_pump_enter(void);
+extern void proc_actor_pump_leave(void);
+extern int  ap_live_count(void);
 
 /* Fault capture (system/exception.c) — surfaced by /fault. */
 extern volatile unsigned long g_fault_count;
@@ -496,10 +506,15 @@ static int http_build(const char *req, char *out, int max)
         if (n > 96) n = 96;
         static char ltxt[700];
         app_phase("llm");
+        int llm_gated = (ap_live_count() > 0);   /* cooperative iff actors resident */
+        if (llm_gated) proc_actor_pump_enter();
         aipl_lock();   /* shared LLM state — serialize vs. actor cc_llm/cc_chat under preempt */
-        llm_run(prompt[0] ? prompt : (const char *)0, n, ltxt, sizeof ltxt, 1);  /* echo prompt */
-        app_phase("llm-done");
+        /* gated => cooperative => net can't drain the RX ring for us, so drain it
+         * ourselves between tokens (else a long /llm overflows the ring -> NIC wedge). */
+        llm_run_drain(prompt[0] ? prompt : (const char *)0, n, ltxt, sizeof ltxt, 1, llm_gated);
         aipl_unlock();
+        if (llm_gated) proc_actor_pump_leave();
+        app_phase("llm-done");
         bl = s_put(body, bl, ltxt);
         bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "GET /ticks") || starts_with(req, "POST /ticks")) {

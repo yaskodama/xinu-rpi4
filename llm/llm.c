@@ -32,6 +32,8 @@ extern const unsigned char tok_data[];
 /* weak: HDMI runtime-monitor heartbeat (tcp_server.c); no-op on targets
  * built without it so QEMU/Pi5 still link. */
 extern void app_beat(void) __attribute__((weak));
+extern void app_phase(const char *p) __attribute__((weak));   /* sub-phase for the HDMI monitor */
+static void llm_phase(const char *p) { if (app_phase) app_phase(p); }
 
 /* ---------- tiny float helpers (no libm) ---------- */
 /* emit the AArch64 FP sqrt directly (no sqrtf libcall in this freestanding build) */
@@ -304,16 +306,19 @@ static int bpe_encode(const char *prompt, int *toks, int maxtoks, int with_bos)
 
 int llm_generate(const char *prompt, int max_new, void (*sink)(char), int drain, int echo)
 {
-    load();
+    llm_phase("llm-load"); load();                    /* sub-phase: pin where llm_run wedges */
     g_sink = sink;
     g_drain = drain;
 
     static int toks[256];
+    llm_phase("llm-enc");
     int nt = bpe_encode(prompt, toks, 250, 1);        /* with BOS */
 
     int token = toks[0], pos = 0, gen = 0;
     while (pos < C.seq_len && gen < max_new) {
+        llm_phase("llm-fwd");
         float *logits = forward(token, pos);
+        llm_phase("llm-gen");
         int next;
         if (pos + 1 < nt) {                           /* still feeding the prompt */
             next = toks[pos+1];
@@ -335,13 +340,22 @@ int llm_generate(const char *prompt, int max_new, void (*sink)(char), int drain,
  * already inside genet_rx_tick).  Returns tokens produced. */
 static char *g_out; static int g_outcap, g_outlen;
 static void buf_sink(char c) { if (g_outlen < g_outcap - 1) g_out[g_outlen++] = c; }
-int llm_run(const char *prompt, int max_new, char *out, int outcap, int echo)
+/* `drain`: pump the GENET RX ring between tokens.  Needed when the caller runs
+ * cooperatively (preemption gated — e.g. /llm with resident actors), since the
+ * net process then can't run to drain the ring during the long compute, so the
+ * ring would overflow and wedge the NIC.  drain=0 when preemption services the
+ * net process for us (pure /llm). */
+int llm_run_drain(const char *prompt, int max_new, char *out, int outcap, int echo, int drain)
 {
     g_out = out; g_outcap = outcap; g_outlen = 0; if (outcap > 0) out[0] = 0;
-    int n = llm_generate(prompt, max_new, buf_sink, 0, echo);
+    int n = llm_generate(prompt, max_new, buf_sink, drain, echo);
     g_out[(g_outlen < g_outcap) ? g_outlen : (g_outcap - 1)] = 0;
     g_out = 0;
     return n;
+}
+int llm_run(const char *prompt, int max_new, char *out, int outcap, int echo)
+{
+    return llm_run_drain(prompt, max_new, out, outcap, echo, 0);
 }
 
 /* ---------- stateful chat session ----------
