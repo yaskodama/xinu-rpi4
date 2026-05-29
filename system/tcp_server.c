@@ -697,6 +697,16 @@ static int http_build(const char *req, char *out, int max)
         extern int xhci_pcie_dump_html(char *out, int max);
         ctype = "text/plain";
         bl += xhci_pcie_dump_html(body + bl, (int)sizeof body - bl);
+    } else if (starts_with(req, "GET /pcie-init") || starts_with(req, "POST /pcie-init")) {
+        /* On-demand BCM2711 PCIe RC bring-up (Linux pcie-brcmstb.c sequence).
+         * After this, /pcie should show non-zero registers and PCIE_STATUS
+         * should have DL_ACTIVE set. */
+        extern int xhci_pcie_bring_up(void);
+        int rc = xhci_pcie_bring_up();
+        ctype = "text/plain";
+        bl = s_put(body, bl, "pcie-init rc=");
+        bl = s_putdec(body, bl, (long)rc);
+        bl = s_put(body, bl, " (0=link-up, -1=mmio fault, -2=link timeout)\n");
     } else if (starts_with(req, "GET /xhci-reset") || starts_with(req, "POST /xhci-reset")) {
         /* On-demand VC mailbox notify-xhci-reset call.  Isolated so a hung
          * mailbox can't wedge the boot (the original failure mode). */

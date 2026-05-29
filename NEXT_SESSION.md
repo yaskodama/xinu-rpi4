@@ -45,6 +45,39 @@ firmware に PCIe 初期化を委ねる試み。結果：`/pcie` 直接読みが
 dtparam ありでは MMIO access が宙吊り＝firmware が PCIe を中途半端に触った可能性）。dtparam は
 **逆効果**だったので config.txt は元に戻した（commit `<this>`）。
 
+### 2026-05-30 更新 — Linux source 参照後の追加知見
+
+**ソース取得**: `references/` に Linux rpi-6.6.y の pcie-brcmstb.c / xhci-pci.c / bcm2711.dtsi /
+clk-bcm2835.c / brcmstb-l2.c / bcm2835-mmc.c / bcm2835-sdhost.c / sdhci-iproc.c を取得済み
+（.gitignore で除外、README.md に fetch URL あり）。
+
+**驚きの発見**: `bcm2711.dtsi` の `pcie0` ノードに **`clocks` プロパティが無い**。
+`pcie-brcmstb.c::brcm_pcie_probe` は `devm_clk_get_OPTIONAL("sw_pcie")` で NULL を取り、
+`clk_prepare_enable(NULL)` は no-op。**Linux は PCIe クロックを明示的に有効化していない**＝
+**firmware (start4.elf) が PCIe クロックを起動する前提**。
+
+**実装した**: `xhci_pcie_bring_up()` in `device/usb/xhci/xhci.c` — Linux `brcm_pcie_setup` の
+BCM2711 経路を完全再現（bridge reset toggle → SerDes IDDQ off → MISC_CTRL config →
+PERST# deassert → DL_ACTIVE wait）。`/pcie-init` HTTP route 経由でオンデマンド実行可能。
+このシーケンス自体は Linux と同一なので**論理的には正しい**。
+
+**しかし実機テストで判明**: フレッシュブートでも **最初の PCIe MMIO 読みがハング**。
+これは **firmware が我々のベアメタルカーネル用には PCIe クロックを起動していない**ことを意味する
+（一番最初のテスト [kernel 7d07d851] では reads が succeed=0 だったが、その後のテストでは
+hang する。dtparam attempt または mailbox notify-xhci-reset が firmware 状態を変えた可能性、
+または最初の boot は firmware が偶然 PCIe を起動済みだった可能性）。
+
+**真の壁**: Linux は DTB → firmware DT 処理 → firmware が PCIe クロック起動、というパスを
+踏むが、bare-metal は DTB なし → firmware がスキップ → 永久に PCIe 触れない。
+
+**未試行の候補**:
+- config.txt `disable_fw_kms_setup=1` を外す → firmware の full init が走るかも
+- `dtoverlay=` で何か PCIe を強制起動する overlay があるか
+- bare-metal でも DTB をロードする（u-boot 化）
+- **CPRMAN PCIe クロック制御を完全自前実装**（BCM2711 ARM Peripherals datasheet には CPRMAN
+  非掲載、Linux clk-bcm2835.c にも Pi 4 PCIe クロック ID なし、最終手段は Raspberry Pi 公式
+  リポジトリの bootloader/ または firmware/ ソース探索）
+
 ### 区切り — このセッションで分かったこと
 - ✅ 安全 probe 基盤（`/pcie` / `/xhci-reset` HTTP 経路）= branch tip にあり、再開時に即使える
 - ✅ **`setjmp/longjmp` ベース fault-resilient MMIO probe** (`safe_mmio_read32`/`safe_mmio_write32` in

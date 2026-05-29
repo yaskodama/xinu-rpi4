@@ -38,5 +38,8 @@ static inline unsigned int xhci_pcie_revision(void){ return 0; }
  * so a single source tree builds for all boards. */
 int xhci_pcie_dump_html(char *out, int max);   /* writes text dump, returns length */
 int xhci_notify_reset_call(void);              /* VC mailbox notify-xhci-reset; rc */
+/* BCM2711 PCIe RC bring-up (Linux pcie-brcmstb.c brcm_pcie_setup sequence).
+ * Run on demand via /pcie-init.  Returns 0 = link up, <0 = error code. */
+int xhci_pcie_bring_up(void);
 
 #endif /* XINU_RPI4_XHCI_H */

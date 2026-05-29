@@ -117,8 +117,94 @@ static int s_puthex32(char *b, int p, int max, unsigned int v)
     }
     return p;
 }
-/* Fault-resilient MMIO read (system/exception.c).  Returns 0 / -1. */
+/* Fault-resilient MMIO read/write (system/exception.c).  Returns 0 / -1.
+ * safe_mmio cannot catch *hangs* on the AXI bus (no slave response), only
+ * synchronous exceptions; but Linux's pcie-brcmstb.c doesn't enable any clock
+ * for BCM2711 PCIe (the firmware does at boot), so reads to PCIE_BASE should
+ * RESPOND with sane data — at worst the controller is in reset returning 0s. */
 extern int safe_mmio_read32(unsigned long addr, unsigned int *out);
+extern int safe_mmio_write32(unsigned long addr, unsigned int val);
+extern void delay_ms(unsigned int ms);
+
+/* ---- BCM2711 PCIe RC bring-up (from Linux pcie-brcmstb.c brcm_pcie_setup,
+ * BCM2711 cfg uses brcm_pcie_perst_set_generic / brcm_pcie_bridge_sw_init_set_generic
+ * and pcie_offsets[] = { RGR1=0x9210, EXT_CFG_INDEX=0x9000, EXT_CFG_DATA=0x9004,
+ * PCIE_HARD_DEBUG=0x4204, INTR2_CPU=0x4300 }). */
+#define PCIE_RGR1_SW_INIT_1              0x9210
+#define PCIE_MISC_MISC_CTRL_OFF          0x4008    /* avoid clash w/ existing PCIE_MISC_CTRL */
+#define PCIE_MISC_PCIE_CTRL_OFF          0x4064
+#define PCIE_MISC_PCIE_STATUS_OFF        0x4068
+#define PCIE_MISC_HARD_DEBUG_OFF         0x4204
+#define PCIE_EXT_CFG_INDEX               0x9000
+#define PCIE_EXT_CFG_DATA                0x9004
+
+#define RGR1_SW_INIT_1_INIT_GENERIC_MASK 0x2      /* bit 1: bridge reset */
+#define RGR1_SW_INIT_1_PERST_MASK        0x1      /* bit 0: PERST# (generic) */
+#define HARD_PCIE_HARD_DEBUG_SERDES_IDDQ 0x08000000  /* bit 27 */
+#define MISC_CTRL_SCB_ACCESS_EN          0x00001000
+#define MISC_CTRL_CFG_READ_UR_MODE       0x00002000
+#define MISC_CTRL_MAX_BURST_SIZE_MASK    0x00300000
+#define PCIE_STATUS_DL_ACTIVE            0x20     /* bit 5: data-link layer up */
+#define PCIE_STATUS_PHYLINKUP            0x10     /* bit 4: physical link up   */
+
+static int pcie_bridge_sw_init_set(unsigned int val)
+{
+    unsigned int tmp;
+    if (safe_mmio_read32(PCIE_BASE + PCIE_RGR1_SW_INIT_1, &tmp) < 0) return -1;
+    tmp = (tmp & ~RGR1_SW_INIT_1_INIT_GENERIC_MASK)
+        | ((val << 1) & RGR1_SW_INIT_1_INIT_GENERIC_MASK);
+    return safe_mmio_write32(PCIE_BASE + PCIE_RGR1_SW_INIT_1, tmp);
+}
+
+static int pcie_perst_set(unsigned int val)
+{
+    unsigned int tmp;
+    if (safe_mmio_read32(PCIE_BASE + PCIE_RGR1_SW_INIT_1, &tmp) < 0) return -1;
+    tmp = (tmp & ~RGR1_SW_INIT_1_PERST_MASK) | (val & RGR1_SW_INIT_1_PERST_MASK);
+    return safe_mmio_write32(PCIE_BASE + PCIE_RGR1_SW_INIT_1, tmp);
+}
+
+/* Run the BCM2711 PCIe RC bring-up.  Returns: 0 = link up, -1 = MMIO fault,
+ * -2 = link never came up, -3 = controller still all-zero after setup. */
+int xhci_pcie_bring_up(void)
+{
+    unsigned int tmp;
+
+    /* Sanity probe: is the controller responding at all (not faulting)? */
+    if (safe_mmio_read32(PCIE_BASE + PCIE_RGR1_SW_INIT_1, &tmp) < 0) return -1;
+
+    /* 1. Reset the bridge */
+    if (pcie_bridge_sw_init_set(1) < 0) return -1;
+    /* 2. Assert PERST# (some bootloaders may deassert it) */
+    if (pcie_perst_set(1) < 0) return -1;
+    delay_ms(1);                /* > 100us per Linux */
+
+    /* 3. Take the bridge out of reset */
+    if (pcie_bridge_sw_init_set(0) < 0) return -1;
+
+    /* 4. Clear SerDes IDDQ — power up the SerDes block */
+    if (safe_mmio_read32(PCIE_BASE + PCIE_MISC_HARD_DEBUG_OFF, &tmp) < 0) return -1;
+    tmp &= ~HARD_PCIE_HARD_DEBUG_SERDES_IDDQ;
+    if (safe_mmio_write32(PCIE_BASE + PCIE_MISC_HARD_DEBUG_OFF, tmp) < 0) return -1;
+    delay_ms(1);                /* SerDes stable */
+
+    /* 5. MISC_CTRL: enable SCB access, CFG read UR mode, set burst=0 (BCM2711) */
+    if (safe_mmio_read32(PCIE_BASE + PCIE_MISC_MISC_CTRL_OFF, &tmp) < 0) return -1;
+    tmp |= MISC_CTRL_SCB_ACCESS_EN | MISC_CTRL_CFG_READ_UR_MODE;
+    tmp &= ~MISC_CTRL_MAX_BURST_SIZE_MASK;   /* burst = 0 = 128 bytes (BCM2711) */
+    if (safe_mmio_write32(PCIE_BASE + PCIE_MISC_MISC_CTRL_OFF, tmp) < 0) return -1;
+
+    /* 6. Deassert PERST# — releases VL805 from reset and starts link training */
+    if (pcie_perst_set(0) < 0) return -1;
+
+    /* 7. Wait for DL_ACTIVE (link layer up).  Linux waits up to ~100ms.  */
+    for (int i = 0; i < 100; i++) {
+        if (safe_mmio_read32(PCIE_BASE + PCIE_MISC_PCIE_STATUS_OFF, &tmp) < 0) return -1;
+        if (tmp & PCIE_STATUS_DL_ACTIVE) return 0;     /* success */
+        delay_ms(1);
+    }
+    return -2;                  /* timed out waiting for link */
+}
 
 int xhci_pcie_dump_html(char *out, int max)
 {
