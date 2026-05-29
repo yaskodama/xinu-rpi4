@@ -93,4 +93,62 @@ void xhci_init(void)
     dump_pcie_probe("post-mailbox");
 }
 
+/* On-demand /xhci-reset HTTP route: do the VC mailbox call separately so we
+ * can see whether it returns or hangs (the boot-time variant wedged the box). */
+int xhci_notify_reset_call(void) { return xhci_notify_reset(); }
+
+/* Bare PCIe-controller register dump into a text buffer; called by the /pcie
+ * HTTP route.  Reads that fault are caught by the sync-exception handler
+ * (recover_spin) so the box stays alive across iterations. */
+static int s_put(char *b, int p, int max, const char *s)
+{
+    while (*s && p < max - 1) b[p++] = *s++;
+    return p;
+}
+static int s_puthex32(char *b, int p, int max, unsigned int v)
+{
+    if (p < max - 1) b[p++] = '0';
+    if (p < max - 1) b[p++] = 'x';
+    for (int i = 7; i >= 0 && p < max - 1; i--) {
+        unsigned int n = (v >> (i * 4)) & 0xF;
+        b[p++] = (char)(n < 10 ? '0' + n : 'a' + (n - 10));
+    }
+    return p;
+}
+int xhci_pcie_dump_html(char *out, int max)
+{
+    int p = 0;
+    static const struct { const char *name; unsigned int off; } regs[] = {
+        { "vendor[0x000] ", PCIE_RC_CFG_VENDOR   },
+        { "class [0x008] ", PCIE_RC_CFG_CLASS    },
+        { "ctrl  [0x4008]", PCIE_MISC_CTRL       },
+        { "stat  [0x4068]", PCIE_MISC_STATUS     },
+        { "rev   [0x406C]", PCIE_MISC_REVISION   },
+        { "dbg   [0x4204]", PCIE_MISC_HARD_DBG   },
+        { "lcap  [0x04DC]", PCIE_RC_CFG_LINK_CAP },
+    };
+    p = s_put(out, p, max, "pcie_base=");
+    p = s_puthex32(out, p, max, (unsigned int)PCIE_BASE);
+    p = s_put(out, p, max, "\n");
+    for (unsigned i = 0; i < sizeof(regs)/sizeof(regs[0]); i++) {
+        p = s_put(out, p, max, regs[i].name);
+        p = s_put(out, p, max, " = ");
+        p = s_puthex32(out, p, max, PCIE_REG(regs[i].off));
+        p = s_put(out, p, max, "\n");
+    }
+    if (p < max) out[p] = 0;
+    return p;
+}
+
 #endif /* PCIE_BASE */
+
+#ifndef PCIE_BASE
+int xhci_notify_reset_call(void)             { return -1; }
+int xhci_pcie_dump_html(char *out, int max)
+{
+    const char *s = "pcie: not supported on this build\n";
+    int p = 0; while (*s && p < max - 1) out[p++] = *s++;
+    if (p < max) out[p] = 0;
+    return p;
+}
+#endif

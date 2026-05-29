@@ -1,6 +1,39 @@
 # NEXT_SESSION — xinu-rpi4
 
-## 🎯 NEXT — USB driver (Pi 4 xHCI/VL805) + HID keyboard & mouse  ★ユーザ次回主目標
+## 🎯 NEXT — USB driver (Pi 4 xHCI/VL805) + HID keyboard & mouse  ★進行中
+
+### 2026-05-30 — XHCI-A 試行（branch `feat/xhci-usb-hid`）
+
+**実装**: `/pcie` と `/xhci-reset` HTTP 経路を追加し、PCIe コントローラのレジスタダンプと VC mailbox
+`notify-xhci-reset` 呼び出しをオンデマンドで分離（fault しても箱が生存できる safe-probe）。`device/usb/xhci/xhci.c`
+に `xhci_pcie_dump_html`（バッファ書き込み版）と `xhci_notify_reset_call`（外部公開）を追加。boot 時の
+`xhci_init()` は `#if 0` で無効化（前回 boot 時呼び出しで box が起動不能になった反省）。
+
+**判明したこと**:
+1. **PCIe MMIO 読みは fault しない**が **全レジスタが 0x0000000 を返す** — controller がクロックゲート中、
+   firmware は自動では PCIe を起動していない。
+2. **VC mailbox `notify-xhci-reset` (tag 0x00030058) が hang** — `/xhci-reset` 呼び出しで mbox_call が
+   12秒タイムアウト（カーネル側の MBOX_TIMEOUT=~100ms より遥かに長い）。firmware が response を返さず
+   詰まる。以降の全 mailbox call も死亡。
+3. 結果として **app worker が固着し HTTP DEAD**（recover_spin は箱は生かすが、app worker は復旧不可）。
+
+**仮説**: 現在の buffer 引数（特に devid = `0x00100000` = `(1<<20)`）の **エンコーディングが firmware が
+期待する形式と違う**。Linux `xhci-pci.c` の vl805_reset は `(bus<<20)|(slot<<15)|(func<<12)` を使うが、
+firmware version によって変わる可能性。**正しい encoding は circle (https://github.com/rsta2/circle)
+の `lib/usb/xhcidevice.cpp` の `m_VL805Reset` を参照すべき**。
+
+**次手の選択肢**:
+- (a) **circle 参照で devid encoding 修正** → `/xhci-reset` が成功 → PCIe が立ち上がる → `/pcie` で
+  vendor=0x14e4XXXX が読める → XHCI-B（VL805 ECAM 読み）へ。
+- (b) **自前で CPRMAN + brcmstb-pcie bring-up 実装** — Linux `drivers/pci/controller/pcie-brcmstb.c`
+  を参照、CPRMAN クロック有効化 + RGR1_SW_INIT_1 リセットトグル + HARD_DEBUG serdes + MISC_CTRL +
+  リンクアップ待ち。Substantial（数百行）。
+- (c) config.txt に PCIe を明示的に起動させる設定があれば追加（要調査、現在のところ Pi OS 標準
+  config.txt には不要なので無いはず）。
+
+**安全な checkpoint commit 済み** — branch `feat/xhci-usb-hid`、tip 以下に記録。
+mailbox hang を踏むと box が固着するので、次セッションでは（a）か（b）の実装が先。
+
 
 Pi 4 (BCM2711) で USB-A キーボード/マウスを使えるようにする。現在の Xinu は USB スタック無し
 （banner 旧版に "no input -- HDMI-only demo (no USB stack)" があった通り）。

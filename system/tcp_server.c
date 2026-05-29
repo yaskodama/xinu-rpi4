@@ -691,6 +691,21 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, " owner_state=");  bl = s_putdec(body, bl, (long)g_lock_stuck_owner_state);
         bl = s_put(body, bl, " stuck_by=");     bl = s_putdec(body, bl, (long)g_lock_stuck_by);
         bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "GET /pcie") || starts_with(req, "POST /pcie")) {
+        /* On-demand probe of the BCM2711 PCIe-1 controller registers.  Fault-safe:
+         * recover_spin in exception.c keeps the box alive if MMIO faults. */
+        extern int xhci_pcie_dump_html(char *out, int max);
+        ctype = "text/plain";
+        bl += xhci_pcie_dump_html(body + bl, (int)sizeof body - bl);
+    } else if (starts_with(req, "GET /xhci-reset") || starts_with(req, "POST /xhci-reset")) {
+        /* On-demand VC mailbox notify-xhci-reset call.  Isolated so a hung
+         * mailbox can't wedge the boot (the original failure mode). */
+        extern int xhci_notify_reset_call(void);
+        int rc = xhci_notify_reset_call();
+        ctype = "text/plain";
+        bl = s_put(body, bl, "notify-xhci-reset rc=");
+        bl = s_putdec(body, bl, (long)rc);
+        bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "POST /chat") || starts_with(req, "GET /chat")) {
         /* Converse with a resident actor: deliver the message (POST body or
          * ?m= for GET) as a STRING to actor 0's `say` method and return its

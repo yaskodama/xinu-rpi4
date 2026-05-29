@@ -33,4 +33,10 @@ static inline unsigned int xhci_pcie_revision(void){ return 0; }
 
 #endif
 
+/* On-demand diagnostics, callable from any context (used by /pcie + /xhci-reset
+ * HTTP routes).  These tolerate PCIE_BASE undefined (return a stub message / -1)
+ * so a single source tree builds for all boards. */
+int xhci_pcie_dump_html(char *out, int max);   /* writes text dump, returns length */
+int xhci_notify_reset_call(void);              /* VC mailbox notify-xhci-reset; rc */
+
 #endif /* XINU_RPI4_XHCI_H */

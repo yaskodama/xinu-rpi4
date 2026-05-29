@@ -1084,10 +1084,13 @@ void kernel_main(void)
     uart_puts("gic+timer: 100 Hz PPI 30 armed; unmasking DAIF.I\n");
     irq_enable_all();
 
-    /* XHCI-A — PCIe-1 controller MMIO probe.  Skipped at boot: the
-     * controller is clock/power-gated until we implement CPRMAN
-     * + brcmstb-pcie bring-up, so the dump just slows the log.
-     * Re-enable once XHCI-B lands. */
+    /* XHCI-A — moved off the boot path.  First flash attempt: all reads
+     * returned 0x00000000 (controller is clock-gated, MMIO not faulting
+     * but unresponsive), AND something downstream (likely the VC mailbox
+     * notify-xhci-reset waiting on firmware) hung the boot so the network
+     * never came up.  Probe now lives behind /pcie + /xhci-reset HTTP
+     * routes (see system/tcp_server.c) so the box always boots and we
+     * can iterate without losing diagnostics. */
 #if 0
     xhci_init();
 #endif
