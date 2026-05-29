@@ -163,6 +163,72 @@ volatile const char *g_app_phase = "idle";
 void        app_phase(const char *p)  { g_app_phase = p; }
 const char *rt_phase(void)            { return (const char *)g_app_phase; }
 
+/* --------- AIPL runtime work queue (NEXT_SESSION option ②, phase 1) ---------
+ * Separates the cc/llm runtime from the HTTP app worker.  Phase 1: /llm only.
+ * The app worker (in http_build's /llm branch) fills g_aipl_work, sets state to
+ * SUBMIT, kicks the aipl process, and parks on g_aipl_done_w.  The aipl process
+ * (loader/main.c aipl_proc_main) wakes, runs llm_run on its own 32KB stack,
+ * sets state to DONE, and kicks the app worker.  Net stays preemptible while
+ * aipl works, so a long /llm no longer blocks ICMP (the 176x latency win is
+ * naturally preserved by aipl being a preemptible process, not by a separate
+ * gate).  Other routes (/compile, /actor/*, /chat) still execute on the app
+ * worker for now; they will migrate in subsequent phases. */
+enum { AIPL_IDLE = 0, AIPL_SUBMIT, AIPL_RUN, AIPL_DONE };
+static volatile int g_aipl_state;
+static struct {
+    int  kind;                          /* 0 = llm_run                          */
+    int  max_new;
+    int  echo;
+    char prompt[1024];
+    char out[700];
+    int  outlen;
+} g_aipl_work;
+
+/* Wakers/parkers exposed by main.c (waiter_t lives there). */
+extern void aipl_kick(void);            /* app -> aipl (work submitted)         */
+extern void aipl_done_kick(void);       /* aipl -> app (work finished)          */
+extern void aipl_done_wait(void);       /* app: park until aipl kicks back      */
+extern void aipl_done_reset(void);      /* app: clear stale pending before submit */
+/* fwd: vheap mutex (declared below in this file) */
+extern void aipl_lock(void);
+extern void aipl_unlock(void);
+
+int  tcp_aipl_pending(void)  { return g_aipl_state == AIPL_SUBMIT; }
+
+void tcp_aipl_work_run(void)
+{
+    if (g_aipl_state != AIPL_SUBMIT) return;
+    g_aipl_state = AIPL_RUN;
+    app_phase("aipl-llm");
+    if (g_aipl_work.kind == 0) {
+        aipl_lock();
+        g_aipl_work.outlen = llm_run(
+            g_aipl_work.prompt[0] ? g_aipl_work.prompt : (const char *)0,
+            g_aipl_work.max_new, g_aipl_work.out, sizeof g_aipl_work.out,
+            g_aipl_work.echo);
+        aipl_unlock();
+    }
+    __asm__ volatile ("dsb sy" ::: "memory");
+    g_aipl_state = AIPL_DONE;
+    app_phase("aipl-done");
+    aipl_done_kick();
+}
+
+static void tcp_aipl_submit_llm(const char *prompt, int max_new, int echo)
+{
+    g_aipl_work.kind    = 0;
+    g_aipl_work.max_new = max_new;
+    g_aipl_work.echo    = echo;
+    int i;
+    for (i = 0; prompt && prompt[i] && i < (int)sizeof(g_aipl_work.prompt) - 1; i++)
+        g_aipl_work.prompt[i] = prompt[i];
+    g_aipl_work.prompt[i] = 0;
+    g_aipl_work.outlen = 0;
+    g_aipl_work.out[0] = 0;
+    __asm__ volatile ("dsb sy" ::: "memory");
+    g_aipl_state = AIPL_SUBMIT;
+}
+
 /* Preemption control (system/proc.c) — toggled at runtime via /netpreempt
  * so preemptive networking can be enabled only after correctness is proven. */
 extern void proc_set_preempt(int on);
@@ -506,17 +572,21 @@ static int http_build(const char *req, char *out, int max)
         if (n > 96) n = 96;
         static char ltxt[700];
         app_phase("llm");
-        int llm_gated = (ap_live_count() > 0);   /* cooperative iff actors resident */
+        /* The aipl-process route (commit setting up aipl_proc_main as NEXT_SESSION
+         * option-② groundwork) regressed this path: /llm-on-aipl stalls in
+         * forward() with resident actors present (Runtime ph=llm-fwd, own=3).
+         * Reverted to the proven conditional-gate + RX self-drain path — aipl
+         * stays a dormant runtime, available for the next phase (e.g. migrate
+         * /chat first, or investigate forward()/process interaction). */
+        int llm_gated = (ap_live_count() > 0);
         if (llm_gated) proc_actor_pump_enter();
-        aipl_lock();   /* shared LLM state — serialize vs. actor cc_llm/cc_chat under preempt */
-        /* gated => cooperative => net can't drain the RX ring for us, so drain it
-         * ourselves between tokens (else a long /llm overflows the ring -> NIC wedge). */
+        aipl_lock();
         llm_run_drain(prompt[0] ? prompt : (const char *)0, n, ltxt, sizeof ltxt, 1, llm_gated);
         aipl_unlock();
         if (llm_gated) proc_actor_pump_leave();
-        app_phase("llm-done");
         bl = s_put(body, bl, ltxt);
         bl = s_put(body, bl, "\n");
+        app_phase("llm-done");
     } else if (starts_with(req, "GET /ticks") || starts_with(req, "POST /ticks")) {
         /* Diagnostic: is the 100 Hz timer IRQ actually firing?  tick_count is
          * advanced only by the timer ISR; cntpct is the free-running hardware

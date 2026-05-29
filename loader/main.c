@@ -168,13 +168,22 @@ static void genet_rx_tick(void)
  * (which only readies a parked == PR_WAIT process) is never lost and never
  * pushes a PR_CURR process onto the ready list. */
 typedef struct { int pid; volatile int pending; volatile int parked; } waiter_t;
-static waiter_t g_net_w = { -1, 0, 0 };
-static waiter_t g_app_w = { -1, 0, 0 };
+static waiter_t g_net_w      = { -1, 0, 0 };
+static waiter_t g_app_w      = { -1, 0, 0 };
+/* AIPL runtime process (NEXT_SESSION option ②): a third process that owns the
+ * cc/llm runtime, so the app worker (HTTP) is decoupled from the vheap users.
+ * g_aipl_w wakes the aipl process when work is submitted; g_aipl_done_w wakes
+ * the app worker (parked synchronously in http_build) when aipl finishes. */
+static waiter_t g_aipl_w     = { -1, 0, 0 };
+static waiter_t g_aipl_done_w = { -1, 0, 0 };
 
 /* App-layer handoff (tcp_server.c). */
 extern int  tcp_app_req_pending(void);
 extern int  tcp_app_work(void);     /* run cc/llm for the queued request   */
 extern void tcp_app_flush(void);    /* send the finished response          */
+/* AIPL-runtime handoff (tcp_server.c). */
+extern int  tcp_aipl_pending(void); /* aipl work submitted, awaiting execution */
+extern void tcp_aipl_work_run(void);/* run the submitted work on the aipl stack */
 
 /* Live runtime state for the HDMI monitor in win_banner (tcp_server.c). */
 extern int           rt_app_state(void);   /* 0=IDLE 1=QUEUED 2=WORKING 3=DONE */
@@ -213,6 +222,30 @@ static void net_proc_main(void)
         waiter_park(&g_net_w);                 /* sleep until RX IRQ or worker kick */
     }
 }
+
+/* AIPL runtime process: owns the cc/llm work queue.  When app submits a job
+ * (state SUBMIT) and kicks g_aipl_w, this process wakes, runs the job on its
+ * own stack (so the app worker stays free to serve other HTTP traffic), then
+ * kicks g_aipl_done_w to wake the synchronously-waiting app worker. */
+static void aipl_proc_main(void)
+{
+    irq_enable_all();
+    for (;;) {
+        if (tcp_aipl_pending()) {
+            tcp_aipl_work_run();              /* runs llm_run etc.; kicks app when done */
+        }
+        waiter_park(&g_aipl_w);
+    }
+}
+
+/* Called from tcp_server.c (the app worker, mid-http_build) to wake the aipl
+ * runtime after submitting a work item, and to park while waiting for it. */
+void aipl_kick(void)        { waiter_kick(&g_aipl_w); }
+void aipl_done_kick(void)   { waiter_kick(&g_aipl_done_w); }
+void aipl_done_wait(void)   { waiter_park(&g_aipl_done_w); }
+/* Clear any stale pending bit before a fresh submit, so the subsequent park
+ * actually blocks until the aipl process kicks again. */
+void aipl_done_reset(void)  { g_aipl_done_w.pending = 0; g_aipl_done_w.parked = 0; }
 
 static void app_proc_main(void)
 {
@@ -1071,8 +1104,9 @@ void kernel_main(void)
      * (cc/llm on its own stack).  Create both processes *before* enabling the
      * IRQ so their waiter pids are valid when it fires.  Preemption stays OFF
      * at boot — enable it at runtime via /netpreempt once verified. */
-    g_net_w.pid = proc_create(net_proc_main, 8192,  "net");
-    g_app_w.pid = proc_create(app_proc_main, 16384, "app");
+    g_net_w.pid     = proc_create(net_proc_main,  8192,  "net");
+    g_app_w.pid     = proc_create(app_proc_main,  16384, "app");
+    g_aipl_w.pid    = proc_create(aipl_proc_main, 32768, "aipl");   /* big stack: llm */
     connect_interrupt(189, net_irq_handler, 0);
     gic_enable_irq(189);
     genet_irq_enable();
