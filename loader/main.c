@@ -180,6 +180,7 @@ extern void tcp_app_flush(void);    /* send the finished response          */
 extern int           rt_app_state(void);   /* 0=IDLE 1=QUEUED 2=WORKING 3=DONE */
 extern unsigned long rt_served(void);      /* responses flushed               */
 extern unsigned long rt_heartbeat(void);   /* app-worker forward-progress beat */
+extern const char   *rt_phase(void);       /* what the worker is doing (llm/ld-main/disp/...) */
 /* AIPL vheap-lock state (proc.c / exception watchdog) — the key signal for the
  * actor-preemption wedge: which pid holds the heap + how often the watchdog
  * had to force-steal it from a wedged holder. */
@@ -499,7 +500,15 @@ static void win_runtime(window_t *self, unsigned int frame)
 
     char l[64]; int n;
 
-    draw_string_at(xb, yb + line*LH, "Runtime", 0xFF80FF80U, bg); line++;
+    draw_string_at(xb, yb + line*LH, "Runtime", 0xFF80FF80U, bg);
+    {   /* phase: what the app worker is doing — localizes a stuck holder */
+        char pl[40]; int pn = 0; const char *a = "ph="; while (*a) pl[pn++] = *a++;
+        const char *ph = rt_phase(); if (!ph) ph = "?";
+        for (int k = 0; ph[k] && pn < (int)sizeof(pl) - 1; k++) pl[pn++] = ph[k];
+        pl[pn] = 0;
+        draw_string_at(xb + 8*fs*8, yb + line*LH, pl, 0xFF80FF80U, bg);
+    }
+    line++;
 
     /* app=<state>  + ALIVE/STALL/idle */
     n = 0; { const char *a = "app="; while (*a) l[n++] = *a++;

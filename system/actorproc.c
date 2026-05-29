@@ -75,13 +75,25 @@ static int q_empty(int i) { return g_act[i].head == g_act[i].tail; }
 static void ap_post(long to, long method, long reply_to, long a0, long a1, long a2, long a3)
 {
     if (to < 0 || to >= g_nact) return;
+    /* Enqueue + wake ATOMICALLY (IRQ-masked).  Under preemption the receiver's
+     * "scan queue -> set waiting -> block" sequence (ap_recv/ap_select) runs
+     * under the same mask, so a message posted here is either seen by that scan
+     * (receiver doesn't block) or delivered after the receiver has parked
+     * (proc_ready wakes it) — it can never fall in the gap between the scan and
+     * the block.  That gap was the lost-wakeup livelock that wedged MultiAgent:
+     * an Agent's reply landed between the Director's `waiting=1` and its
+     * proc_block(), so the Director blocked forever on a message already in its
+     * queue (Runtime monitor showed app=WORKING, hb frozen, lock own=-1, sw
+     * still climbing == a livelock, not a lock deadlock). */
+    unsigned long d = irq_save();
     int nxt = (g_act[to].tail + 1) % AP_QLEN;
-    if (nxt == g_act[to].head) return;            /* full: drop */
+    if (nxt == g_act[to].head) { irq_restore(d); return; }   /* full: drop */
     struct ap_msg *m = &g_act[to].q[g_act[to].tail];
     m->method = method; m->a0 = a0; m->a1 = a1; m->a2 = a2; m->a3 = a3;
     m->reply_to = reply_to;
     g_act[to].tail = nxt;
     if (g_act[to].waiting) { g_act[to].waiting = 0; proc_ready(g_act[to].pid); }
+    irq_restore(d);
 }
 
 void ap_send(long to, long method, long a0, long a1, long a2, long a3)
@@ -100,10 +112,15 @@ long ap_call(long self, long to, long method, long a0, long a1, long a2, long a3
 
 static void ap_recv(int self, struct ap_msg *out)
 {
+    /* Check-and-block under IRQ mask (mirrors main.c's waiter_park): proc_block
+     * resumes masked when ap_post wakes us, so the q_empty re-check can't miss a
+     * message that arrived between the test and the block. */
+    unsigned long d = irq_save();
     while (q_empty(self)) { g_act[self].waiting = 1; proc_block(); }
     *out = g_act[self].q[g_act[self].head];
     g_act[self].head = (g_act[self].head + 1) % AP_QLEN;
     g_act[self].nmsg++;
+    irq_restore(d);
 }
 
 /* Count a message handled by a direct dispatch (cc_actor_send_*), which does
@@ -117,6 +134,10 @@ long ap_select(long self, int n, const long *meths, struct ap_msg *out)
 {
     int s = (int)self;
     for (;;) {
+        /* Scan + set-waiting + block under IRQ mask so a matching message
+         * posted concurrently (ap_post, also masked) can't be lost in the gap
+         * between the scan and proc_block (the MultiAgent lost-wakeup livelock). */
+        unsigned long d = irq_save();
         for (int idx = g_act[s].head; idx != g_act[s].tail; idx = (idx + 1) % AP_QLEN) {
             long meth = g_act[s].q[idx].method;
             for (int k = 0; k < n; k++) {
@@ -129,16 +150,19 @@ long ap_select(long self, int n, const long *meths, struct ap_msg *out)
                         j = p;
                     }
                     g_act[s].head = (g_act[s].head + 1) % AP_QLEN;
+                    irq_restore(d);
                     return meth;
                 }
             }
         }
-        /* Block for a matching message.  Release the vheap lock first so the
-         * actor that will produce it can run (else deadlock); reacquire on
-         * wake.  No-op when called outside a locked handler. */
+        /* Nothing matches yet.  Mark waiting and release the vheap lock (so the
+         * actor that will produce the message can run), then block — all still
+         * under the mask, so ap_post's enqueue+wake is serialized against this.
+         * proc_block resumes masked; we then unmask and reacquire the heap. */
         g_act[s].waiting = 1;
         int held = aipl_unlock_all();
-        proc_block();                              /* nothing matches yet */
+        proc_block();                              /* masked; resumes masked on wake */
+        irq_restore(d);
         aipl_relock(held);
     }
 }
@@ -207,10 +231,22 @@ int ap_spawn(void)
 void ap_run(void)
 {
     for (int guard = 0; guard < 1000000; guard++) {
-        int any_ready = 0;
-        for (int i = 0; i < g_nact; i++)
-            if (!g_act[i].waiting && !q_empty(i)) any_ready = 1;
-        if (!any_ready) break;
+        int busy = 0;
+        for (int i = 0; i < g_nact; i++) {
+            if (g_act[i].pid <= 0) continue;
+            /* An actor still needs the pump if it has a deliverable message, OR
+             * if its process has not yet settled into the blocked wait (PR_WAIT).
+             * The latter is the key: an actor that just finished a handler is
+             * PR_READY (about to loop back to ap_recv) with an empty queue — the
+             * old "no pending message" test returned here and LEFT it runnable
+             * on the ready list.  A later preemptive /llm would then schedule
+             * that stranded actor while the app worker holds the vheap lock
+             * (Runtime showed app=WORKING, hb frozen, lock own=2).  Draining
+             * every actor to PR_WAIT first leaves nothing runnable behind. */
+            if (!g_act[i].waiting && !q_empty(i)) busy = 1;
+            if (proctab[g_act[i].pid].state != PR_WAIT) busy = 1;
+        }
+        if (!busy) break;
         proc_yield();
     }
 }

@@ -28,6 +28,20 @@ static volatile unsigned long g_ctxsw;     /* context switches (live diagnostic)
 void proc_set_preempt(int on)      { g_preempt_on = on ? 1 : 0; }
 void proc_resched_request(void)    { g_resched_pending = 1; }
 
+/* Preemption gate for the cooperative actor pump.  The preemptive-networking
+ * safety argument assumes the only ready-list vheap user is the app worker (so
+ * a timer preempt lands only on the net process).  Resident AIPL actors break
+ * that: they are vheap users sitting on the ready list, so a preempt can
+ * interleave the app worker's ap_run / an actor handler with another actor and
+ * race the actor scheduling (the MultiAgent wedge).  While the actor pump is
+ * active we therefore suppress preemption — actors run cooperatively (the
+ * proven-safe mode).  Plain compute with no actors (e.g. /llm) keeps full
+ * preemption, so its network-latency win is unaffected.  Counter (not a flag)
+ * so nested actor execution composes. */
+static volatile int g_actor_pump;
+void proc_actor_pump_enter(void) { g_actor_pump++; }
+void proc_actor_pump_leave(void) { if (g_actor_pump > 0) g_actor_pump--; }
+
 /* Live runtime accessors for the HDMI monitor (drawn by the wm in NULLPROC,
  * so they stay visible even when the app worker / HTTP path wedges). */
 int           proc_preempt_on(void)  { return g_preempt_on; }
@@ -197,6 +211,16 @@ void proc_ready(int pid)
     if (pid <= 0 || pid >= NPROC) return;
     unsigned long d = irq_save();
     struct procent *p = &proctab[pid];
+    /* Idempotent: only enqueue a process that is actually blocked.  A double
+     * ready (already PR_READY = on the list, or PR_CURR = running) would
+     * ready_push the node a second time, wiring its `next` into a self-loop
+     * (see ready_remove's note) — ready_pop then returns a running process and
+     * proc_block ctxsw()s into an overwritten frame.  Under preemption a wake
+     * (ap_post) can race a preempt that already parked the target on the ready
+     * list; this guard stops the resulting list corruption, which otherwise
+     * drops an actor from scheduling and livelocks ap_run (the MultiAgent wedge:
+     * app=WORKING, hb frozen, lock own=-1, sw still climbing). */
+    if (p->state == PR_READY || p->state == PR_CURR) { irq_restore(d); return; }
     p->state = PR_READY;
     ready_push(p);
     irq_restore(d);
@@ -243,6 +267,9 @@ void proc_yield(void)
 void proc_preempt(void)
 {
     if (!g_preempt_on || !g_resched_pending) return;
+    /* Suppress preemption while the actor pump runs (leave g_resched_pending set
+     * so a tick isn't lost — the next tick after the pump leaves acts on it). */
+    if (g_actor_pump) return;
     g_resched_pending = 0;
     if (currpid != NULLPROC) proc_resched();
 }

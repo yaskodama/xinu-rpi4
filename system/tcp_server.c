@@ -154,6 +154,14 @@ int           rt_app_state(void)      { return g_app_state; }
 unsigned long rt_served(void)         { return g_app_served; }
 unsigned long rt_heartbeat(void)      { return g_app_heartbeat; }
 
+/* App-worker phase: a short label of what the worker is doing, set at each
+ * lock-holding step (here + cc.c).  Points at static string literals so the wm
+ * can read it from NULLPROC after a wedge.  Localizes WHERE a stuck app worker
+ * (app=WORKING, hb frozen) is — e.g. ph=llm vs ph=ld-main vs ph=disp. */
+volatile const char *g_app_phase = "idle";
+void        app_phase(const char *p)  { g_app_phase = p; }
+const char *rt_phase(void)            { return (const char *)g_app_phase; }
+
 /* Preemption control (system/proc.c) — toggled at runtime via /netpreempt
  * so preemptive networking can be enabled only after correctness is proven. */
 extern void proc_set_preempt(int on);
@@ -487,8 +495,10 @@ static int http_build(const char *req, char *out, int max)
             if (v > 0) n = v; } }
         if (n > 96) n = 96;
         static char ltxt[700];
+        app_phase("llm");
         aipl_lock();   /* shared LLM state — serialize vs. actor cc_llm/cc_chat under preempt */
         llm_run(prompt[0] ? prompt : (const char *)0, n, ltxt, sizeof ltxt, 1);  /* echo prompt */
+        app_phase("llm-done");
         aipl_unlock();
         bl = s_put(body, bl, ltxt);
         bl = s_put(body, bl, "\n");
@@ -722,7 +732,9 @@ int tcp_app_work(void)
     if (g_app_state != APP_QUEUED) return 0;
     g_app_state = APP_WORKING;
     app_beat();                                 /* heartbeat: request started */
+    app_phase("req");
     g_app_resp_len = http_build(g_app_req, g_app_resp, (int)sizeof g_app_resp);
+    app_phase("done");
     __asm__ volatile ("dsb sy" ::: "memory");   /* resp visible before DONE */
     g_app_state = APP_DONE;
     return 1;
@@ -746,6 +758,7 @@ void tcp_app_flush(void)
         uart_puts("http: connection gone, dropping worker response\n");
     }
     g_app_state = APP_IDLE;
+    app_phase("idle");
 }
 
 /* Handle one received Ethernet frame.  Returns 1 if it was TCP-for-us

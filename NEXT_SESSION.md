@@ -1,5 +1,30 @@
 # NEXT_SESSION — xinu-rpi4
 
+## ✅/⏳ 2026-05-29 — ★アクター・プリエンプション wedge 解消（MultiAgent 連打）＋残エッジ特定★実機検証済
+
+branch **`wip/actor-preempt-on-monitor`**（= `wip/actor-preempt-vheap-lock` を Runtime 監視ベースに合流）。
+HDMI 生存型監視（heartbeat＋phase＋lock 状態）で wedge を**画面から**追い、原因を順に潰した。
+
+**解決（実機 80/80）**: preempt ON＋ping 圧力＋MultiAgent 連打で必ず詰まっていた wedge を解消。4 修正:
+1. **lost-wakeup マスク**（actorproc.c）: `ap_post`/`ap_recv`/`ap_select` の「投入＋起床」「走査＋waiting＋block」を
+   IRQ マスクで原子化（main.c の waiter_park/kick と同型）。preempt 下で Agent の reply が Director の
+   select 隙間に入り起床取りこぼし→Director 永久ブロック→ap_run 空回り、を解消。Runtime: `lock own=-1`・hb 停止・
+   sw 増加（ライブロック）で特定。頻度 iter1→9。
+2. **proc_ready 冪等化**（proc.c）: 既に PR_READY/PR_CURR なら再 push 禁止。preempt と起床が重なる二重 push→
+   ready リスト自己ループ→ctxsw 先がゴミ→全停止、を防止。iter9→31。
+3. **プリエンプション・ゲート**（proc.c `g_actor_pump` + cc.c の4経路を enter/leave）★効いた:
+   `ap_run`/actor ディスパッチ中は `proc_preempt` を抑止＝アクター作業中は協調動作（実証済み安全モード）に戻す。
+   プレーンな /llm（アクター無し）は preempt 維持＝176倍の低遅延キープ。これで MultiAgent 連打 80/80 クリア。
+4. **ap_run 終了判定**（actorproc.c）: 全アクターが PR_WAIT になるまでポンプ継続（PR_READY のまま残る取りこぼし防止）。
+
+**残エッジ（⏳ 未解決・要次回）**: **常駐アクター存在下（MultiAgent ロード後）の /llm が `llm_run` 内でロック保持
+固着**。Runtime: **`ph=llm`・`lock own=2`(=app worker)・app=WORKING STALL(hb 停止)・sw 増加**。token ループ未到達
+（hb 停止）＝`load()`/`bpe_encode()`/最初の `forward()` のどこか。ping 1本の現実的負荷でも iter1 で再現＝実バグ
+（トーチャ由来ではない）。**次手**: llm.c に**サブフェーズ計器**（load/encode/forward/token に ph 細分化）を入れて
+固着点を確定 → 修正。仮説: /llm の aipl_lock 保持×preempt×常駐アクターの相互作用、または ctxsw の FP/SIMD 退避漏れ
+（llm は FP 使用、forward 中の preempt で V レジスタが…要確認。ただし net/wm は FP 非使用なので着地先次第）。
+別系統: 4本同時 ping flood では GENET RX IRQ 再アームが溢れ `ph=idle`・sw 停止の全停止（高負荷耐性、別項目）。
+
 ## ✅ 2026-05-29 — ★HDMI 生存型ランタイム監視（案①）★実機検証済
 
 保留中のアクター・プリエンプション wedge を将来追うための前提＝「**計器は固着し得る経路の外**」。

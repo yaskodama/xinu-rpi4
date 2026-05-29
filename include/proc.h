@@ -60,6 +60,12 @@ void proc_exit(void);
 void proc_set_preempt(int on);
 void proc_resched_request(void);
 void proc_preempt(void);
+/* Suppress timer preemption while the cooperative actor pump runs (actors are
+ * ready-list vheap users that would otherwise race the scheduler under
+ * preemption).  Counted; bracket actor execution (cc.c).  Plain non-actor
+ * compute keeps full preemption. */
+void proc_actor_pump_enter(void);
+void proc_actor_pump_leave(void);
 /* Live runtime accessors (read by the HDMI runtime monitor). */
 int           proc_preempt_on(void);
 unsigned long proc_ctxsw_count(void);

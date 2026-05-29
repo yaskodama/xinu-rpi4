@@ -15,6 +15,7 @@
 #include "actor.h"
 #include "actorproc.h"
 #include "proc.h"        /* aipl_lock/unlock — serialize vheap under preemption */
+extern void app_phase(const char *p);   /* HDMI runtime-monitor phase (tcp_server.c) */
 
 /* ---------- arena allocator (whole-program lifetime) ---------- */
 
@@ -629,11 +630,15 @@ static int compile_run_core(const char *src, unsigned long n, long *retval)
     ap_set_dispatch(g_active_dispatch);
     cc_set_apply((aoff >= 0) ? (void *)(code + aoff) : 0);
     long (*entryfn)(void) = (long (*)(void))(code + entry);
+    proc_actor_pump_enter();    /* actors run cooperatively (no timer preempt) */
+    app_phase("co-main");
     aipl_lock();                /* hold the vheap across main()'s direct vheap use */
     long rc = entryfn();        /* main(): spawn actor processes + send */
     aipl_unlock();              /* release before ap_run (actors lock individually) */
+    app_phase("co-run");
     ap_run();                   /* drive actor processes until quiescent */
     ap_killall();               /* one-shot: reap the actor processes */
+    proc_actor_pump_leave();
     g_active_dispatch = 0;
     if (retval) *retval = rc;
 
@@ -788,10 +793,14 @@ int cc_actor_load(const char *src, int srclen, char *out, int outcap)
     cc_set_apply((aoff >= 0) ? (void *)(code + aoff) : 0);
     g_cap = out; g_capcap = outcap; g_caplen = 0; if (outcap > 0) out[0] = 0;
     long (*mainfn)(void) = (long (*)(void))(code + entry);
+    proc_actor_pump_enter();    /* actors run cooperatively (no timer preempt) */
+    app_phase("ld-main");
     aipl_lock();                /* hold the vheap across main()'s direct vheap use */
     mainfn();                   /* spawn actor processes + initial sends */
     aipl_unlock();              /* release before ap_run (actors lock individually) */
+    app_phase("ld-run");
     ap_run();                   /* drive them; actors persist (blocked) for /actor/send */
+    proc_actor_pump_leave();
     if (g_cap) g_cap[(g_caplen < g_capcap) ? g_caplen : (g_capcap - 1)] = 0;
     g_cap = 0;
 
@@ -843,6 +852,8 @@ int cc_actor_send_msg(int actor, const char *method, long a0, long a1, long a2,
         return -1;
     }
 
+    proc_actor_pump_enter();             /* actors run cooperatively (no timer preempt) */
+    app_phase("disp");
     aipl_lock();                         /* serialize the direct handler's vheap use */
     long res = g_res_dispatch((long)actor, mid, v_int(a0), v_int(a1), v_int(a2), v_int(0));
     aipl_unlock();
@@ -852,7 +863,9 @@ int cc_actor_send_msg(int actor, const char *method, long a0, long a1, long a2,
      * the resident actor processes). */
     g_active_dispatch = g_res_dispatch;
     ap_set_dispatch(g_res_dispatch);
+    app_phase("snd-run");
     ap_run();
+    proc_actor_pump_leave();
 
     char tmp[64];
     const char *r = v_render(res, tmp, sizeof tmp);
@@ -885,10 +898,13 @@ int cc_actor_send_str(int actor, const char *method, const char *strarg, char *o
     int ai = 0; while (strarg && strarg[ai] && ai < (int)sizeof(argbuf) - 1) { argbuf[ai] = strarg[ai]; ai++; }
     argbuf[ai] = 0;
 
+    proc_actor_pump_enter();             /* actors run cooperatively (no timer preempt) */
+    app_phase("disp-s");
     aipl_lock();                         /* serialize the direct handler's vheap use */
     long res = g_res_dispatch((long)actor, mid, v_str(argbuf), v_int(0), v_int(0), v_int(0));
     aipl_unlock();
     g_active_dispatch = g_res_dispatch; ap_set_dispatch(g_res_dispatch); ap_run();
+    proc_actor_pump_leave();
 
     char tmp[64];
     const char *r = v_render(res, tmp, sizeof tmp);   /* string -> returns the pointer itself */
