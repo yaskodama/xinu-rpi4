@@ -157,6 +157,16 @@ unsigned long rt_heartbeat(void)      { return g_app_heartbeat; }
 /* Preemption control (system/proc.c) — toggled at runtime via /netpreempt
  * so preemptive networking can be enabled only after correctness is proven. */
 extern void proc_set_preempt(int on);
+extern void aipl_lock(void);
+extern void aipl_unlock(void);
+
+/* Fault capture (system/exception.c) — surfaced by /fault. */
+extern volatile unsigned long g_fault_count;
+extern volatile unsigned long g_fault_esr, g_fault_far, g_fault_elr, g_fault_spsr, g_fault_sp;
+
+/* AIPL lock watchdog (system/proc.c) — surfaced by /lockstat. */
+extern volatile unsigned long g_lock_timeouts;
+extern volatile int           g_lock_stuck_owner, g_lock_stuck_owner_state, g_lock_stuck_by;
 
 void tcp_set_mac(const unsigned char mac[6])
 {
@@ -302,6 +312,16 @@ static int s_putdec(char *b, int pos, long v)
     if (v == 0) { b[pos++] = '0'; return pos; }
     while (v) { t[n++] = (char)('0' + (v % 10)); v /= 10; }
     while (n--) b[pos++] = t[n];
+    return pos;
+}
+
+static int s_puthex(char *b, int pos, unsigned long v)
+{
+    b[pos++] = '0'; b[pos++] = 'x';
+    for (int i = 15; i >= 0; i--) {
+        unsigned long nyb = (v >> (i * 4)) & 0xF;
+        b[pos++] = (char)(nyb < 10 ? '0' + nyb : 'a' + (nyb - 10));
+    }
     return pos;
 }
 
@@ -467,7 +487,9 @@ static int http_build(const char *req, char *out, int max)
             if (v > 0) n = v; } }
         if (n > 96) n = 96;
         static char ltxt[700];
+        aipl_lock();   /* shared LLM state — serialize vs. actor cc_llm/cc_chat under preempt */
         llm_run(prompt[0] ? prompt : (const char *)0, n, ltxt, sizeof ltxt, 1);  /* echo prompt */
+        aipl_unlock();
         bl = s_put(body, bl, ltxt);
         bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "GET /ticks") || starts_with(req, "POST /ticks")) {
@@ -551,6 +573,29 @@ static int http_build(const char *req, char *out, int max)
             bl = s_put(body, bl, "}");
         }
         bl = s_put(body, bl, "]");
+    } else if (starts_with(req, "GET /fault") || starts_with(req, "POST /fault")) {
+        /* Last CPU fault captured by the exception handler (which now keeps the
+         * box alive and spins so this can be read).  count>0 => a fault hit;
+         * ESR_EL1 top 6 bits (EC) decode the cause, FAR_EL1 the bad address. */
+        ctype = "text/plain";
+        bl = s_put(body, bl, "fault_count="); bl = s_putdec(body, bl, (long)g_fault_count);
+        bl = s_put(body, bl, " esr=");        bl = s_puthex(body, bl, g_fault_esr);
+        bl = s_put(body, bl, " ec=");         bl = s_putdec(body, bl, (long)((g_fault_esr >> 26) & 0x3f));
+        bl = s_put(body, bl, " far=");        bl = s_puthex(body, bl, g_fault_far);
+        bl = s_put(body, bl, " elr=");        bl = s_puthex(body, bl, g_fault_elr);
+        bl = s_put(body, bl, " spsr=");       bl = s_puthex(body, bl, g_fault_spsr);
+        bl = s_put(body, bl, " sp=");         bl = s_puthex(body, bl, g_fault_sp);
+        bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "GET /lockstat") || starts_with(req, "POST /lockstat")) {
+        /* AIPL heap-lock watchdog: timeouts>0 means a holder wedged and the
+         * lock was force-stolen.  stuck_owner = the pid that wouldn't release,
+         * its state (1=READY 2=CURR 3=WAIT 4=TERM 0=FREE), stuck_by = waiter. */
+        ctype = "text/plain";
+        bl = s_put(body, bl, "lock_timeouts="); bl = s_putdec(body, bl, (long)g_lock_timeouts);
+        bl = s_put(body, bl, " stuck_owner=");  bl = s_putdec(body, bl, (long)g_lock_stuck_owner);
+        bl = s_put(body, bl, " owner_state=");  bl = s_putdec(body, bl, (long)g_lock_stuck_owner_state);
+        bl = s_put(body, bl, " stuck_by=");     bl = s_putdec(body, bl, (long)g_lock_stuck_by);
+        bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "POST /chat") || starts_with(req, "GET /chat")) {
         /* Converse with a resident actor: deliver the message (POST body or
          * ?m= for GET) as a STRING to actor 0's `say` method and return its

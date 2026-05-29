@@ -33,6 +33,29 @@ void proc_resched_request(void)    { g_resched_pending = 1; }
 int           proc_preempt_on(void)  { return g_preempt_on; }
 unsigned long proc_ctxsw_count(void) { return g_ctxsw; }
 
+/* AIPL vheap mutex state (the lock/unlock impls are further down).  Declared
+ * here so proc_kill() can release the lock if it reaps the process that holds
+ * it — otherwise a dead owner makes every later vheap user spin-yield forever
+ * (the app worker wedges; HTTP dies while ICMP survives). */
+static volatile int g_aipl_owner = -1;
+static volatile int g_aipl_depth;
+
+/* Lock watchdog (diagnostic): if a spinner can't acquire after this many
+ * yields the holder is wedged (never releasing), so we record the culprit and
+ * force-acquire — the app worker then never sticks, keeping HTTP/diagnostics
+ * alive.  Each yield normally lets the holder run to a release point, so the
+ * count only climbs when the holder is blocked/dead; this won't false-trigger
+ * on a legitimately long (e.g. LLM) hold. */
+#define AIPL_SPIN_LIMIT 300000
+volatile unsigned long g_lock_timeouts;
+volatile int           g_lock_stuck_owner;        /* pid that wouldn't release */
+volatile int           g_lock_stuck_owner_state;  /* its proctab state         */
+volatile int           g_lock_stuck_by;           /* pid that gave up waiting   */
+
+/* Lock state accessors for the HDMI runtime monitor (read from NULLPROC). */
+int proc_aipl_owner(void) { return g_aipl_owner; }
+int proc_aipl_depth(void) { return g_aipl_depth; }
+
 static struct procent *ready_head;
 static struct procent *ready_tail;
 
@@ -234,6 +257,11 @@ void proc_kill(int pid)
     struct procent *p = &proctab[pid];
     if (p->state == PR_FREE) { irq_restore(d); return; }
     ready_remove(p);                /* never leave a freed slot on the ready list */
+    /* If we're reaping a process that holds the AIPL heap lock (e.g. an actor
+     * killed mid-handler by ap_killall), release it — otherwise the dead owner
+     * makes every later vheap user spin-yield forever and the app worker (and
+     * thus all HTTP) wedges while ICMP keeps working. */
+    if (g_aipl_owner == pid) { g_aipl_owner = -1; g_aipl_depth = 0; }
     if (p->stkbase) freemem(p->stkbase, p->stklen);
     p->stkbase = 0;
     p->state   = PR_FREE;
@@ -258,6 +286,96 @@ void proc_block(void)
 
     ctxsw(&oldp->sp, newp->sp);
     /* Resumes here when we are readied and ctxsw'd back into. */
+    irq_restore(d);
+}
+
+/* ---------- AIPL vheap mutex (spin-yield) ----------
+ * The AIPL runtime (cc interpreter) shares one non-reentrant value heap
+ * (g_vheap in cc.c).  Under preemption, two vheap users (actors, the app
+ * worker's http_build, shell cc) must never be mid-vheap-op at once.  This
+ * lock serializes them: a contender spin-yields (proc_yield) so the holder
+ * runs to its next release point.  It is acquired only around cc execution
+ * bursts and released at every voluntary block point (ap_select), so the
+ * cooperative actor pump (ap_run) still interleaves and a blocked holder
+ * never wedges the heap.  The net process never takes this lock, so it can
+ * always preempt a vheap user for low network latency.
+ *
+ * NULLPROC must not proc_block on this (proc_ready ignores pid 0), so the
+ * lock spins with proc_yield — which always runs the holder — rather than
+ * blocking.  Recursive (depth-counted) for safety against accidental
+ * nesting; in practice depth stays 1.  (g_aipl_owner/g_aipl_depth are
+ * declared near the top of this file so proc_kill can release a dead
+ * owner's lock.) */
+
+void aipl_lock(void)
+{
+    long spins = 0;
+    for (;;) {
+        unsigned long d = irq_save();
+        if (g_aipl_owner < 0 || g_aipl_owner == currpid) {
+            g_aipl_owner = currpid;
+            g_aipl_depth++;
+            irq_restore(d);
+            return;
+        }
+        if (++spins > AIPL_SPIN_LIMIT) {
+            /* Watchdog: the holder is wedged.  Record it and steal the lock so
+             * the spinner (often the app worker) makes progress — keeps HTTP /
+             * /lockstat alive so the culprit is visible. */
+            int o = g_aipl_owner;
+            g_lock_stuck_owner       = o;
+            g_lock_stuck_owner_state = (o > 0 && o < NPROC) ? (int)proctab[o].state : -1;
+            g_lock_stuck_by          = currpid;
+            g_lock_timeouts++;
+            g_aipl_owner = currpid;
+            g_aipl_depth = 1;
+            irq_restore(d);
+            return;
+        }
+        irq_restore(d);
+        proc_yield();                 /* let the holder run to its release point */
+    }
+}
+
+void aipl_unlock(void)
+{
+    unsigned long d = irq_save();
+    if (g_aipl_owner == currpid && --g_aipl_depth <= 0) {
+        g_aipl_depth = 0;
+        g_aipl_owner = -1;
+    }
+    irq_restore(d);
+}
+
+/* Release fully regardless of depth; returns the depth to restore later.
+ * Used to drop the heap before a voluntary block (ap_select) and on the
+ * let-it-crash path (where a longjmp skips the matching unlock). */
+int aipl_unlock_all(void)
+{
+    unsigned long d = irq_save();
+    int saved = 0;
+    if (g_aipl_owner == currpid) { saved = g_aipl_depth; g_aipl_depth = 0; g_aipl_owner = -1; }
+    irq_restore(d);
+    return saved;
+}
+
+/* Reacquire to a previously-saved depth after waking from a block. */
+void aipl_relock(int saved)
+{
+    if (saved <= 0) return;
+    aipl_lock();                      /* spin-yield to depth 1 */
+    unsigned long d = irq_save();
+    g_aipl_depth = saved;             /* restore the full depth */
+    irq_restore(d);
+}
+
+/* Unconditionally drop the lock — used by the fault handler so a process
+ * that aborts while holding the heap doesn't wedge every other vheap user. */
+void aipl_force_release(void)
+{
+    unsigned long d = irq_save();
+    g_aipl_owner = -1;
+    g_aipl_depth = 0;
     irq_restore(d);
 }
 

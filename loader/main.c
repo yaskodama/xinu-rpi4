@@ -180,6 +180,10 @@ extern void tcp_app_flush(void);    /* send the finished response          */
 extern int           rt_app_state(void);   /* 0=IDLE 1=QUEUED 2=WORKING 3=DONE */
 extern unsigned long rt_served(void);      /* responses flushed               */
 extern unsigned long rt_heartbeat(void);   /* app-worker forward-progress beat */
+/* AIPL vheap-lock state (proc.c / exception watchdog) — the key signal for the
+ * actor-preemption wedge: which pid holds the heap + how often the watchdog
+ * had to force-steal it from a wedged holder. */
+extern volatile unsigned long g_lock_timeouts;
 
 static void waiter_kick(waiter_t *w)          /* from any context (IRQ-safe) */
 {
@@ -524,6 +528,22 @@ static void win_runtime(window_t *self, unsigned int frame)
 
     n = 0; kv_append(l, &n, "girq=", genet_irq_count());
     draw_string_at(xb, yb + line*LH, l, 0xFF80E0FFU, bg); line++;
+
+    /* vheap lock: owner pid (-1 free) + depth + watchdog force-steals.  When
+     * actor preemption wedges, this shows who holds the heap while hb freezes. */
+    n = 0;
+    { const char *a = "lock own="; while (*a) l[n++] = *a++; }
+    {
+        int own = proc_aipl_owner();
+        if (own < 0) { l[n++] = '-'; l[n++] = '1'; }
+        else { char t[12]; char *d = u_to_dec((unsigned long)own, t, sizeof t); while (*d) l[n++] = *d++; }
+        l[n++] = ' ';
+    }
+    kv_append(l, &n, "d=",  (unsigned long)proc_aipl_depth());
+    kv_append(l, &n, "to=", g_lock_timeouts);
+    draw_string_at(xb, yb + line*LH, l,
+        g_lock_timeouts ? 0xFFFF6060U : 0xFFFFC060U, bg);    /* red if watchdog fired */
+    line++;
 }
 
 static void win_anim(window_t *self, unsigned int frame)
@@ -1263,7 +1283,7 @@ void kernel_main(void)
         runtime_win.x = 630;
         runtime_win.y = 0;
         runtime_win.width  = 356;
-        runtime_win.height = 104;
+        runtime_win.height = 128;     /* +1 line for the vheap-lock row */
         runtime_win.font_scale = 1;
         const char *rt = "Runtime";
         for (int i = 0; i < WM_TITLE_MAX && rt[i]; i++) runtime_win.title[i] = rt[i];
