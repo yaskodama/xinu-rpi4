@@ -42,19 +42,21 @@ static void puts_hex32(unsigned int v)
 
 static int xhci_notify_reset(void)
 {
-    /* Property tag 0x00030058 (notify-xhci-reset) — argument is the
-     * VL805 PCI bus/device/function packed as devid.  Pi 4 has VL805
-     * at bus 1 dev 0 fn 0 (after the root-complex on bus 0).  The
-     * encoding Linux uses is (bus << 20) | (dev << 15) | (fn << 12)
-     * = 0x100000 for bus=1 dev=0 fn=0 — but we pass 0 as a fallback
-     * because the firmware default targets VL805 anyway. */
+    /* Property tag 0x00030058 (notify-xhci-reset).  Previous attempt with
+     * devid=0x00100000 hung the firmware (mailbox call never returned -> all
+     * subsequent mailbox calls also dead).  Try devid=0 (firmware default,
+     * which the original comment said was the fallback): on Pi 4 firmware,
+     * VL805 is the only xHCI client of this tag, so default-targets-VL805
+     * should work — if it does we'll know the encoding was the issue, and
+     * if it hangs again the tag itself is the wrong path on this firmware
+     * and we need self-bring-up (CPRMAN + brcmstb-pcie). */
     static volatile unsigned int __attribute__((aligned(16))) buf[8];
     buf[0] = 32;
     buf[1] = 0;
     buf[2] = 0x00030058U;        /* notify-xhci-reset */
     buf[3] = 4;
     buf[4] = 0;
-    buf[5] = 0x00100000U;        /* devid: bus=1, dev=0, fn=0 */
+    buf[5] = 0;                  /* devid: 0 = firmware default (VL805) */
     buf[6] = 0;
     buf[7] = 0;
     return mbox_call(buf);

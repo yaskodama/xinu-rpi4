@@ -23,13 +23,22 @@ firmware version によって変わる可能性。**正しい encoding は circl
 の `lib/usb/xhcidevice.cpp` の `m_VL805Reset` を参照すべき**。
 
 **次手の選択肢**:
-- (a) **circle 参照で devid encoding 修正** → `/xhci-reset` が成功 → PCIe が立ち上がる → `/pcie` で
-  vendor=0x14e4XXXX が読める → XHCI-B（VL805 ECAM 読み）へ。
-- (b) **自前で CPRMAN + brcmstb-pcie bring-up 実装** — Linux `drivers/pci/controller/pcie-brcmstb.c`
+- ~~(a) **circle 参照で devid encoding 修正**~~ ⇒ **試したが dead end**: `devid=0`（firmware default）でも
+  同じく 15秒 timeout で hang（commit `<this>`）。encoding が原因ではなく **tag 0x00030058 自体が
+  この firmware で正しく扱われない/サポート外**。mailbox 経由のショートカットは無い。
+- (b) **自前で CPRMAN + brcmstb-pcie bring-up 実装** ← **これしか道がない**。Linux `drivers/pci/controller/pcie-brcmstb.c`
   を参照、CPRMAN クロック有効化 + RGR1_SW_INIT_1 リセットトグル + HARD_DEBUG serdes + MISC_CTRL +
-  リンクアップ待ち。Substantial（数百行）。
-- (c) config.txt に PCIe を明示的に起動させる設定があれば追加（要調査、現在のところ Pi OS 標準
-  config.txt には不要なので無いはず）。
+  リンクアップ待ち。Substantial（数百行）、複数 flash サイクル必要。
+
+**(b) 実装の概略手順** (Linux drivers/pci/controller/pcie-brcmstb.c brcm_pcie_setup を踏襲):
+  1. CPRMAN PCIe clock 有効化（CM_BASE=0xFE101000、CM_PCIECTL=0x18C、password=0x5A<<24、enable bit=1<<4）
+  2. PCIE_RGR1_SW_INIT_1 (off 0x9210): bit1=PCIE_RST, bit0=BMIPS_RST → set, sleep 2us, clear
+  3. PCIE_MISC_HARD_DEBUG (0x4204): bit14=SERDES_IDDQ off → toggle 経由で初期化
+  4. PCIE_MISC_CTRL (0x4008): SCB_ACCESS_EN, CFG_READ_UR_MODE, MAX_BURST_SIZE 設定
+  5. PCIE_MISC_CPU_2_PCIE_MEM_WIN0_* で outbound window 設定（CPU phys ↔ PCIe addr）
+  6. リンクアップ待ち: PCIE_MISC_PCIE_STATUS bit4 = DLLP active
+  7. ECAM 経由で VL805 vendor/device 読み (offset 0x8000 から bus 1 dev 0 fn 0 cfg)
+  8. その後 XHCI-B/C/...（xHCI 初期化）へ続行
 
 **安全な checkpoint commit 済み** — branch `feat/xhci-usb-hid`、tip 以下に記録。
 mailbox hang を踏むと box が固着するので、次セッションでは（a）か（b）の実装が先。
