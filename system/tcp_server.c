@@ -697,10 +697,19 @@ static int http_build(const char *req, char *out, int max)
          * couldn't bring up; firmware capability-bit gates PCIe on Pi 4 bare-
          * metal — see project memory).  Send a string and each character
          * goes to the active shellwin as if typed.
-         *   POST /type           body = literal text
-         *   GET  /type?t=Hello%20world  URL-encoded text
-         * Special chars: send via URL-encoding (%0d=Enter, %08=Backspace,
-         * %1b=Esc, %09=Tab); shellwin handles them per its existing key-code map. */
+         *
+         *   POST /type             body = literal text
+         *   GET  /type?t=Hello%20world          URL-encoded text
+         *   GET  /type?key=NAME[,NAME,...]      named special keys
+         *   GET  /type?t=ls&key=enter           combine: type "ls" then Enter
+         *
+         * Named keys (in send order if comma-separated):
+         *   enter, tab, esc, bs(=backspace), del, space
+         *   up, down, left, right                       (ANSI: ESC [ A/B/D/C)
+         *   home, end                                   (ANSI: ESC [ H/F)
+         *   ctrl-a .. ctrl-z                            (single byte 0x01-0x1a)
+         *   f1..f4                                      (ANSI: ESC O P/Q/R/S)
+         * Unknown name → ignored. */
         extern void xhci_keyboard_event(char c);
         ctype = "text/plain";
         static char tbuf[256];
@@ -718,8 +727,57 @@ static int http_build(const char *req, char *out, int max)
                 tlen = url_decode(tenc, tbuf, sizeof tbuf);
         }
         for (int i = 0; i < tlen; i++) xhci_keyboard_event(tbuf[i]);
+        /* Named special keys (optional, can follow / precede literal text). */
+        static char kbuf[128];
+        int kbl = 0;
+        if (req[0] != 'P' && q_param(req, "key", kbuf, sizeof kbuf)) {
+            /* Comma-separate the list — process each name in turn. */
+            static const struct { const char *name; const char *seq; } keymap[] = {
+                { "enter", "\r" },     { "cr", "\r" },        { "tab", "\t" },
+                { "esc", "\x1b" },     { "bs", "\x08" },      { "backspace", "\x08" },
+                { "del", "\x7f" },     { "space", " " },
+                { "up",    "\x1b[A" }, { "down",  "\x1b[B" },
+                { "right", "\x1b[C" }, { "left",  "\x1b[D" },
+                { "home",  "\x1b[H" }, { "end",   "\x1b[F" },
+                { "f1",    "\x1bOP" }, { "f2",    "\x1bOQ" },
+                { "f3",    "\x1bOR" }, { "f4",    "\x1bOS" },
+                /* ctrl-a .. ctrl-z handled below by length-check, since
+                 * spelling them all out is ~26 lines for little gain. */
+            };
+            char *p = kbuf;
+            while (*p) {
+                /* Find end of current name token. */
+                char *e = p;
+                while (*e && *e != ',') e++;
+                int nlen = (int)(e - p);
+                if (nlen > 0 && nlen < 16) {
+                    /* Match named entry. */
+                    int matched = 0;
+                    for (unsigned i = 0; i < sizeof(keymap)/sizeof(keymap[0]); i++) {
+                        const char *kn = keymap[i].name;
+                        int j = 0;
+                        while (j < nlen && kn[j] && p[j] == kn[j]) j++;
+                        if (j == nlen && kn[j] == 0) {
+                            const char *s = keymap[i].seq;
+                            while (*s) { xhci_keyboard_event(*s++); kbl++; }
+                            matched = 1;
+                            break;
+                        }
+                    }
+                    /* ctrl-X pattern: "ctrl-x" → 0x18 etc. */
+                    if (!matched && nlen == 6 && p[0]=='c' && p[1]=='t'
+                        && p[2]=='r' && p[3]=='l' && p[4]=='-'
+                        && p[5]>='a' && p[5]<='z') {
+                        xhci_keyboard_event((char)(p[5] - 'a' + 1));
+                        kbl++;
+                    }
+                }
+                p = e;
+                if (*p == ',') p++;
+            }
+        }
         bl = s_put(body, bl, "typed ");
-        bl = s_putdec(body, bl, (long)tlen);
+        bl = s_putdec(body, bl, (long)(tlen + kbl));
         bl = s_put(body, bl, " char(s)\n");
     } else if (starts_with(req, "GET /click") || starts_with(req, "POST /click")) {
         /* Network mouse input — feeds wm_cursor via xhci_mouse_event(btns,dx,dy).

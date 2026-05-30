@@ -1201,8 +1201,8 @@ void kernel_main(void)
          * the viewport (0..sw) shows at any moment. */
         banner_win.x = 0;            /* default layout from the AIPL designer (1024x768) */
         banner_win.y = 10;
-        banner_win.width  = 549;
-        banner_win.height = 90;
+        banner_win.width  = 469;
+        banner_win.height = 94;
         const char *bt = "Xinu " BOARD_NAME " on " SOC_NAME;
         for (int i = 0; i < WM_TITLE_MAX && bt[i]; i++) banner_win.title[i] = bt[i];
         banner_win.chrome_color = 0xFFAACCEEU;
@@ -1262,10 +1262,10 @@ void kernel_main(void)
          * boot log lives here and must stay visible without any
          * scrolling so the user can read what happened during
          * USPi init. */
-        shell_win.x = 5;
-        shell_win.y = 113;
-        shell_win.width  = 543;
-        shell_win.height = 134;
+        shell_win.x = 474;
+        shell_win.y = 2;
+        shell_win.width  = 534;
+        shell_win.height = 245;
         const char *swt = "Shell (UART)";
         for (int i = 0; i < WM_TITLE_MAX && swt[i]; i++) shell_win.title[i] = swt[i];
         shell_win.chrome_color = 0xFF80E080U;
@@ -1311,9 +1311,9 @@ void kernel_main(void)
         /* Graphics window: right side of the 1024x768 screen.  AIPL actors
          * draw line segments / circles into it via the gfx_* builtins. */
         gfx_win.x = 626;
-        gfx_win.y = 129;
-        gfx_win.width  = 394;
-        gfx_win.height = 629;
+        gfx_win.y = 261;
+        gfx_win.width  = 383;
+        gfx_win.height = 502;
         const char *gt = "Graphics";
         for (int i = 0; i < WM_TITLE_MAX && gt[i]; i++) gfx_win.title[i] = gt[i];
         gfx_win.chrome_color = 0xFF80FFC0U;
@@ -1326,10 +1326,10 @@ void kernel_main(void)
         /* Runtime monitor: a compact live view of the app worker, sat over the
          * top of the Graphics window (above the wine glass).  Added LAST so the
          * wm paints it front-most and it is always readable. */
-        runtime_win.x = 630;
-        runtime_win.y = 0;
-        runtime_win.width  = 369;
-        runtime_win.height = 119;
+        runtime_win.x = 0;
+        runtime_win.y = 118;
+        runtime_win.width  = 467;
+        runtime_win.height = 121;
         runtime_win.font_scale = 1;
         const char *rt = "Runtime";
         for (int i = 0; i < WM_TITLE_MAX && rt[i]; i++) runtime_win.title[i] = rt[i];
