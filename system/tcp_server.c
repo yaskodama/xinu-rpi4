@@ -89,6 +89,15 @@ enum {
 #define TCP_FLAG_PSH 0x08
 #define TCP_FLAG_ACK 0x10
 
+/* Multi-conn (NEXT_SESSION #3, 2026-05-30): the kernel now tracks up to
+ * NCONN concurrent TCP connections.  Each connection carries its own
+ * 4-tuple, sequence numbers, and partial-HTTP-request accumulator (a
+ * single shared g_httpreq would corrupt as soon as two clients sent
+ * overlapping segments).  The single g_app_state mailbox still serves
+ * ONE request at a time — the other connections can have their TCP
+ * accumulation continue in parallel and queue when the worker is free. */
+#define NCONN 4
+
 struct tcp_conn {
     int state;
     unsigned char peer_mac[6];
@@ -97,13 +106,48 @@ struct tcp_conn {
     unsigned long my_seq;       /* next byte we will send */
     unsigned long peer_seq;     /* next byte we expect to receive */
     int greeted;
+    /* Per-conn HTTP request accumulator (reassembles a request that
+     * spans segments, e.g. /compile POST body).  Reset on each new
+     * ESTABLISHED. */
+    char httpreq[8192];
+    int  httpreqlen;
 };
 
-static struct tcp_conn g_conn;
+static struct tcp_conn g_conns[NCONN];
+
 static unsigned char g_my_mac[6];
 static unsigned char g_my_ip[4]  = { 192, 168, 3, 100 };
 static unsigned short g_listen_port = 23;
 static unsigned long g_isn_seed = 0xDEADBEEF;
+static unsigned long g_dropped_syn;     /* SYNs refused because all slots in use */
+
+/* Find the connection matching a peer 4-tuple, or NULL if none.  Active
+ * (non-LISTEN/CLOSED) states only — a free slot doesn't match. */
+static struct tcp_conn *find_conn(const volatile unsigned char *peer_ip,
+                                  unsigned short peer_port)
+{
+    for (int i = 0; i < NCONN; i++) {
+        struct tcp_conn *c = &g_conns[i];
+        if (c->state == TCP_CLOSED || c->state == TCP_LISTEN) continue;
+        if (c->peer_port != peer_port) continue;
+        int eq = 1;
+        for (int k = 0; k < 4; k++) if (c->peer_ip[k] != peer_ip[k]) { eq = 0; break; }
+        if (eq) return c;
+    }
+    return 0;
+}
+
+/* Find a free slot to host a new connection (state LISTEN or CLOSED).
+ * Returns NULL when all NCONN slots are in use — the SYN gets dropped
+ * and the client retries (standard TCP backpressure). */
+static struct tcp_conn *alloc_conn(void)
+{
+    for (int i = 0; i < NCONN; i++) {
+        struct tcp_conn *c = &g_conns[i];
+        if (c->state == TCP_CLOSED || c->state == TCP_LISTEN) return c;
+    }
+    return 0;
+}
 
 /* Diagnostic counters — surfaced by the shell `tcpstat` command so we
  * can see what happened without relying on scrolled-off boot output. */
@@ -120,10 +164,9 @@ static unsigned short g_last_port;
  * for the rationale (MMU off + Device-nGnRnE + GCC store merging). */
 static volatile unsigned char __attribute__((aligned(64))) tx_frame[1518];
 
-/* HTTP request accumulator (reassembles a request that spans segments,
- * e.g. a /compile POST body).  Reset on each new ESTABLISHED connection. */
-static char g_httpreq[8192];
-static int  g_httpreqlen;
+/* Per-conn HTTP request buffers live inside struct tcp_conn (above);
+ * the old global g_httpreq[] is gone — multiple peers can have partial
+ * requests in flight simultaneously without stomping each other. */
 
 /* ---------- app-layer handoff (preemptive networking) ----------
  * The net process must NOT run http_build (cc/llm) inline, or a long
@@ -131,14 +174,19 @@ static int  g_httpreqlen;
  * handed to a dedicated app-worker process via this single-slot mailbox;
  * the net process keeps draining and later flushes the finished response.
  * GENET/TCP stays owned by the net process; vheap/cc/llm by the worker.
- * One in-flight request at a time (matches the single g_conn).
+ * One in-flight HTTP REQUEST at a time (the worker is single).  With
+ * multi-conn, other connections continue to accumulate their requests
+ * in their per-conn httpreq[] buffers — they queue here when the worker
+ * is free.  g_app_conn_idx remembers which conn the in-flight request
+ * came from so the eventual flush sends to the right peer.
  *
  * State is owned by exactly one side at each step, so a plain volatile int
  * is race-free under preemption: net sets QUEUED (only from IDLE), worker
  * sets WORKING then DONE, net sets IDLE on flush. */
 enum { APP_IDLE = 0, APP_QUEUED, APP_WORKING, APP_DONE };
 static volatile int g_app_state;
-static char         g_app_req[sizeof g_httpreq];
+static int          g_app_conn_idx = -1;   /* which g_conns[] slot owns this request */
+static char         g_app_req[8192];
 static int          g_app_req_len;
 static char         g_app_resp[1500];
 static int          g_app_resp_len;
@@ -265,8 +313,12 @@ void tcp_set_ip(const unsigned char ip[4])
 void tcp_listen(unsigned short port)
 {
     g_listen_port = port;
-    g_conn.state = TCP_LISTEN;
-    g_conn.greeted = 0;
+    /* Mark every slot as LISTEN (free).  alloc_conn() picks them off
+     * the array in order as SYNs arrive. */
+    for (int i = 0; i < NCONN; i++) {
+        g_conns[i].state   = TCP_LISTEN;
+        g_conns[i].greeted = 0;
+    }
 }
 
 static void puts_u32_dec(unsigned long v)
@@ -291,9 +343,12 @@ static void puts_ip(const unsigned char *ip)
     uart_puts(buf);
 }
 
-/* Build and send a single TCP segment.  `payload` may be NULL (header
- * only).  Returns 0 on success, -1 on failure. */
-static int tcp_send(unsigned char flags, const char *payload, int payload_len)
+/* Build and send a single TCP segment for connection `c`.  `payload` may
+ * be NULL (header only).  Returns 0 on success, -1 on failure.  Takes
+ * the conn explicitly so the multi-conn rework above doesn't have to
+ * stash a "current connection" global. */
+static int tcp_send(struct tcp_conn *c,
+                    unsigned char flags, const char *payload, int payload_len)
 {
     if (payload_len < 0) payload_len = 0;
     int tcp_len = 20 + payload_len;
@@ -305,7 +360,7 @@ static int tcp_send(unsigned char flags, const char *payload, int payload_len)
     for (int i = 0; i < 54; i++) tx_frame[i] = 0;
 
     /* --- Ethernet --- */
-    for (int i = 0; i < 6; i++) tx_frame[i]     = g_conn.peer_mac[i];
+    for (int i = 0; i < 6; i++) tx_frame[i]     = c->peer_mac[i];
     for (int i = 0; i < 6; i++) tx_frame[6 + i] = g_my_mac[i];
     tx_frame[12] = 0x08; tx_frame[13] = 0x00;
 
@@ -321,7 +376,7 @@ static int tcp_send(unsigned char flags, const char *payload, int payload_len)
     ih[9]  = 6;                                /* proto = TCP */
     ih[10] = 0; ih[11] = 0;
     for (int i = 0; i < 4; i++) ih[12 + i] = g_my_ip[i];
-    for (int i = 0; i < 4; i++) ih[16 + i] = g_conn.peer_ip[i];
+    for (int i = 0; i < 4; i++) ih[16 + i] = c->peer_ip[i];
     unsigned short ipsum = ip_checksum((const unsigned char *)ih, 20);
     ih[10] = (unsigned char)(ipsum >> 8);
     ih[11] = (unsigned char)(ipsum & 0xFF);
@@ -330,16 +385,16 @@ static int tcp_send(unsigned char flags, const char *payload, int payload_len)
     volatile unsigned char *th = tx_frame + 34;
     th[0] = (unsigned char)(g_listen_port >> 8);
     th[1] = (unsigned char)(g_listen_port & 0xFF);
-    th[2] = (unsigned char)(g_conn.peer_port >> 8);
-    th[3] = (unsigned char)(g_conn.peer_port & 0xFF);
-    th[4] = (unsigned char)(g_conn.my_seq >> 24);
-    th[5] = (unsigned char)(g_conn.my_seq >> 16);
-    th[6] = (unsigned char)(g_conn.my_seq >> 8);
-    th[7] = (unsigned char)(g_conn.my_seq);
-    th[8]  = (unsigned char)(g_conn.peer_seq >> 24);
-    th[9]  = (unsigned char)(g_conn.peer_seq >> 16);
-    th[10] = (unsigned char)(g_conn.peer_seq >> 8);
-    th[11] = (unsigned char)(g_conn.peer_seq);
+    th[2] = (unsigned char)(c->peer_port >> 8);
+    th[3] = (unsigned char)(c->peer_port & 0xFF);
+    th[4] = (unsigned char)(c->my_seq >> 24);
+    th[5] = (unsigned char)(c->my_seq >> 16);
+    th[6] = (unsigned char)(c->my_seq >> 8);
+    th[7] = (unsigned char)(c->my_seq);
+    th[8]  = (unsigned char)(c->peer_seq >> 24);
+    th[9]  = (unsigned char)(c->peer_seq >> 16);
+    th[10] = (unsigned char)(c->peer_seq >> 8);
+    th[11] = (unsigned char)(c->peer_seq);
     th[12] = 0x50;                             /* data offset = 5 (20 bytes) */
     th[13] = flags;
     th[14] = 0x20; th[15] = 0x00;              /* window = 8192 */
@@ -351,7 +406,7 @@ static int tcp_send(unsigned char flags, const char *payload, int payload_len)
             tx_frame[54 + i] = (unsigned char)payload[i];
     }
 
-    unsigned short ucs = tcp_checksum(g_my_ip, g_conn.peer_ip,
+    unsigned short ucs = tcp_checksum(g_my_ip, c->peer_ip,
                                       (const unsigned char *)th, tcp_len);
     th[16] = (unsigned char)(ucs >> 8);
     th[17] = (unsigned char)(ucs & 0xFF);
@@ -1064,22 +1119,63 @@ int tcp_app_work(void)
 /* Send a finished response (PSH+ACK then FIN).  Called ONLY from the net
  * process (sole owner of GENET/TCP).  Drops the response if the connection
  * died (peer RST) while the worker was busy. */
+/* Hand a queued conn's complete HTTP request to the (now idle) app worker.
+ * Caller must already have established that g_app_state == APP_IDLE.
+ * Returns the conn slot it queued, or -1 if none ready. */
+static int queue_to_app(struct tcp_conn *c)
+{
+    int n = c->httpreqlen;
+    if (n > (int)sizeof(g_app_req) - 1) n = (int)sizeof(g_app_req) - 1;
+    for (int i = 0; i < n; i++) g_app_req[i] = c->httpreq[i];
+    g_app_req[n] = 0;
+    g_app_req_len  = n;
+    g_app_conn_idx = (int)(c - g_conns);
+    __asm__ volatile ("dsb sy" ::: "memory");
+    g_app_state    = APP_QUEUED;
+    return g_app_conn_idx;
+}
+
+/* After flushing a response we may have OTHER connections sitting on
+ * fully-arrived requests that the busy worker couldn't accept earlier.
+ * Walk g_conns and queue one of them; the net loop will kick the
+ * worker next iteration.  Pick FCFS-ish by slot index — good enough
+ * given NCONN is tiny. */
+static void drain_pending_to_app(void)
+{
+    if (g_app_state != APP_IDLE) return;
+    for (int i = 0; i < NCONN; i++) {
+        struct tcp_conn *c = &g_conns[i];
+        if (c->state != TCP_ESTABLISHED) continue;
+        if (c->httpreqlen <= 0) continue;
+        if (!request_complete(c->httpreq, c->httpreqlen)) continue;
+        queue_to_app(c);
+        return;
+    }
+}
+
 void tcp_app_flush(void)
 {
     if (g_app_state != APP_DONE) return;
-    if (g_conn.state == TCP_ESTABLISHED) {
-        tcp_send(TCP_FLAG_PSH | TCP_FLAG_ACK, g_app_resp, g_app_resp_len);
-        g_conn.my_seq += g_app_resp_len;
-        tcp_send(TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0);
-        g_conn.my_seq += 1;
-        g_conn.state = TCP_FIN_WAIT_1;
+    struct tcp_conn *c = (g_app_conn_idx >= 0 && g_app_conn_idx < NCONN)
+                       ? &g_conns[g_app_conn_idx] : 0;
+    if (c && c->state == TCP_ESTABLISHED) {
+        tcp_send(c, TCP_FLAG_PSH | TCP_FLAG_ACK, g_app_resp, g_app_resp_len);
+        c->my_seq += g_app_resp_len;
+        tcp_send(c, TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0);
+        c->my_seq += 1;
+        c->state = TCP_FIN_WAIT_1;
         g_app_served++;
         uart_puts("http: served request (worker), FIN sent\n");
     } else {
         uart_puts("http: connection gone, dropping worker response\n");
     }
+    g_app_conn_idx = -1;
     g_app_state = APP_IDLE;
     app_phase("idle");
+    /* Multi-conn drain: another conn may have a complete request that
+     * the busy worker couldn't accept earlier — pick it up now so the
+     * client doesn't time out. */
+    drain_pending_to_app();
 }
 
 /* Handle one received Ethernet frame.  Returns 1 if it was TCP-for-us
@@ -1136,43 +1232,52 @@ int tcp_handle_packet(const unsigned char *frame, int len)
     int data_len  = total_len - ihl - data_off;
     const volatile unsigned char *data = tcp + data_off;
 
-    /* LISTEN: only SYN starts a connection.  Anything else gets RST. */
-    if (g_conn.state == TCP_CLOSED || g_conn.state == TCP_LISTEN) {
-        if (!(flags & TCP_FLAG_SYN)) return 1;       /* ignore */
+    /* Try matching against an existing connection 4-tuple first.  A SYN
+     * that matches an active conn is a retransmit (or a stray); the
+     * fall-through to the SYN-handling branch below covers the truly
+     * new-connection case. */
+    struct tcp_conn *c = find_conn(ip + 12, sport);
 
+    if (c == 0) {
+        /* No existing connection.  Only a SYN can open one. */
+        if (!(flags & TCP_FLAG_SYN)) return 1;       /* drop stray */
+
+        c = alloc_conn();
+        if (c == 0) {
+            /* All NCONN slots in use — drop the SYN.  TCP client will
+             * retry after a few hundred ms; standard backpressure. */
+            g_dropped_syn++;
+            return 1;
+        }
         /* Capture peer */
-        for (int i = 0; i < 6; i++) g_conn.peer_mac[i] = frame[6 + i];
-        for (int i = 0; i < 4; i++) g_conn.peer_ip[i]  = ip[12 + i];
-        g_conn.peer_port = sport;
-        g_conn.peer_seq  = seq + 1;                  /* ack the SYN */
-        g_conn.my_seq    = g_isn_seed;
-        g_isn_seed      += 0x100;
-        g_conn.greeted   = 0;
+        for (int i = 0; i < 6; i++) c->peer_mac[i] = frame[6 + i];
+        for (int i = 0; i < 4; i++) c->peer_ip[i]  = ip[12 + i];
+        c->peer_port = sport;
+        c->peer_seq  = seq + 1;                  /* ack the SYN */
+        c->my_seq    = g_isn_seed;
+        g_isn_seed  += 0x100;
+        c->greeted   = 0;
+        c->httpreqlen = 0;
 
-        uart_puts("tcp: SYN from "); puts_ip(g_conn.peer_ip);
+        uart_puts("tcp: SYN from "); puts_ip(c->peer_ip);
         uart_puts(":"); puts_u32_dec(sport); uart_puts(" -> SYN+ACK\n");
 
         /* Send SYN+ACK.  SYN occupies one sequence number, so the
          * next byte we send (the greeting) starts at my_seq + 1. */
         g_syn_seen++;
-        if (tcp_send(TCP_FLAG_SYN | TCP_FLAG_ACK, 0, 0) < 0) g_txfail++;
-        else                                                 g_synack_sent++;
-        g_conn.my_seq += 1;
-        g_conn.state   = TCP_SYN_RCVD;
+        if (tcp_send(c, TCP_FLAG_SYN | TCP_FLAG_ACK, 0, 0) < 0) g_txfail++;
+        else                                                    g_synack_sent++;
+        c->my_seq += 1;
+        c->state   = TCP_SYN_RCVD;
         return 1;
     }
 
-    /* Match the active connection 4-tuple */
-    if (g_conn.peer_port != sport) return 1;
-    for (int i = 0; i < 4; i++)
-        if (g_conn.peer_ip[i] != ip[12 + i]) return 1;
-
-    if (g_conn.state == TCP_SYN_RCVD) {
-        if (flags & TCP_FLAG_RST) { g_conn.state = TCP_LISTEN; return 1; }
-        if ((flags & TCP_FLAG_ACK) && ack == g_conn.my_seq) {
-            g_conn.state = TCP_ESTABLISHED;
+    if (c->state == TCP_SYN_RCVD) {
+        if (flags & TCP_FLAG_RST) { c->state = TCP_LISTEN; return 1; }
+        if ((flags & TCP_FLAG_ACK) && ack == c->my_seq) {
+            c->state = TCP_ESTABLISHED;
             g_estab++;
-            g_httpreqlen = 0;                 /* fresh request accumulator */
+            c->httpreqlen = 0;                 /* fresh request accumulator */
             uart_puts("tcp: ESTABLISHED (await HTTP request)\n");
             /* HTTP: the client sends the request first; we reply when
              * its data arrives (see the ESTABLISHED data path). */
@@ -1181,10 +1286,10 @@ int tcp_handle_packet(const unsigned char *frame, int len)
         return 1;
     }
 
-    if (g_conn.state == TCP_ESTABLISHED) {
+    if (c->state == TCP_ESTABLISHED) {
         if (flags & TCP_FLAG_RST) {
             uart_puts("tcp: RST -> CLOSED\n");
-            g_conn.state = TCP_LISTEN;
+            c->state = TCP_LISTEN;
             return 1;
         }
         if (data_len > 0) {
@@ -1192,16 +1297,16 @@ int tcp_handle_packet(const unsigned char *frame, int len)
              * e.g. C source for /compile — may not fit one segment).  We
              * only append in-order data; retransmits are just re-ACKed.
              * Once the full request has arrived we hand it to the worker. */
-            if (seq == g_conn.peer_seq) {                 /* in-order: append */
-                int space = (int)sizeof(g_httpreq) - 1 - g_httpreqlen;
+            if (seq == c->peer_seq) {                 /* in-order: append */
+                int space = (int)sizeof(c->httpreq) - 1 - c->httpreqlen;
                 int n = data_len < space ? data_len : space;
-                for (int i = 0; i < n; i++) g_httpreq[g_httpreqlen++] = (char)data[i];
-                g_httpreq[g_httpreqlen] = 0;
-                g_conn.peer_seq = seq + data_len;
+                for (int i = 0; i < n; i++) c->httpreq[c->httpreqlen++] = (char)data[i];
+                c->httpreq[c->httpreqlen] = 0;
+                c->peer_seq = seq + data_len;
             }
 
-            if (!request_complete(g_httpreq, g_httpreqlen)) {
-                if (g_httpreqlen >= (int)sizeof(g_httpreq) - 1) {
+            if (!request_complete(c->httpreq, c->httpreqlen)) {
+                if (c->httpreqlen >= (int)sizeof(c->httpreq) - 1) {
                     /* Buffer full but request still incomplete: refuse
                      * rather than wait forever for data we can't store. */
                     const char *m =
@@ -1209,50 +1314,45 @@ int tcp_handle_packet(const unsigned char *frame, int len)
                         "Content-Type: text/plain\r\nConnection: close\r\n\r\n"
                         "cc: request too large for /compile buffer\n";
                     int ml = 0; while (m[ml]) ml++;
-                    tcp_send(TCP_FLAG_PSH | TCP_FLAG_ACK, m, ml);
-                    g_conn.my_seq += ml;
-                    tcp_send(TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0);
-                    g_conn.my_seq += 1;
-                    g_conn.state = TCP_FIN_WAIT_1;
+                    tcp_send(c, TCP_FLAG_PSH | TCP_FLAG_ACK, m, ml);
+                    c->my_seq += ml;
+                    tcp_send(c, TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0);
+                    c->my_seq += 1;
+                    c->state = TCP_FIN_WAIT_1;
                     return 1;
                 }
-                tcp_send(TCP_FLAG_ACK, 0, 0);             /* ack, await the rest */
+                tcp_send(c, TCP_FLAG_ACK, 0, 0);             /* ack, await the rest */
                 return 1;
             }
 
             /* Complete request: hand it to the app-worker process instead of
              * running http_build (cc/llm) here on the net process's stack.
              * ACK the request now; tcp_app_flush() sends the response when
-             * the worker is done.  Only queue when idle (single in-flight). */
-            if (g_app_state == APP_IDLE) {
-                int n = g_httpreqlen;
-                if (n > (int)sizeof(g_app_req) - 1) n = (int)sizeof(g_app_req) - 1;
-                for (int i = 0; i < n; i++) g_app_req[i] = g_httpreq[i];
-                g_app_req[n] = 0;
-                g_app_req_len = n;
-                __asm__ volatile ("dsb sy" ::: "memory");  /* req visible before QUEUED */
-                g_app_state = APP_QUEUED;
-            }
-            tcp_send(TCP_FLAG_ACK, 0, 0);   /* ack the request; reply follows */
+             * the worker is done.  Only queue when idle (single in-flight).
+             * If busy, the request sits in c->httpreq until tcp_app_flush()
+             * picks it up via drain_pending_to_app() — the client just
+             * waits longer instead of getting an empty response. */
+            if (g_app_state == APP_IDLE) queue_to_app(c);
+            tcp_send(c, TCP_FLAG_ACK, 0, 0);   /* ack the request; reply follows */
             return 1;
         }
         if (flags & TCP_FLAG_FIN) {
-            g_conn.peer_seq = seq + 1;
-            tcp_send(TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0);
-            g_conn.my_seq += 1;
-            g_conn.state = TCP_LAST_ACK;
+            c->peer_seq = seq + 1;
+            tcp_send(c, TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0);
+            c->my_seq += 1;
+            c->state = TCP_LAST_ACK;
             uart_puts("tcp: peer FIN, sent FIN+ACK\n");
             return 1;
         }
         return 1;
     }
 
-    if (g_conn.state == TCP_FIN_WAIT_1) {
-        if ((flags & TCP_FLAG_ACK) && ack == g_conn.my_seq) {
+    if (c->state == TCP_FIN_WAIT_1) {
+        if ((flags & TCP_FLAG_ACK) && ack == c->my_seq) {
             if (flags & TCP_FLAG_FIN) {
-                g_conn.peer_seq = seq + 1;
-                tcp_send(TCP_FLAG_ACK, 0, 0);
-                g_conn.state = TCP_LISTEN;
+                c->peer_seq = seq + 1;
+                tcp_send(c, TCP_FLAG_ACK, 0, 0);
+                c->state = TCP_LISTEN;
                 uart_puts("tcp: closed (back to LISTEN)\n");
             }
             return 1;
@@ -1260,15 +1360,30 @@ int tcp_handle_packet(const unsigned char *frame, int len)
         return 1;
     }
 
-    if (g_conn.state == TCP_LAST_ACK) {
-        if ((flags & TCP_FLAG_ACK) && ack == g_conn.my_seq) {
-            g_conn.state = TCP_LISTEN;
+    if (c->state == TCP_LAST_ACK) {
+        if ((flags & TCP_FLAG_ACK) && ack == c->my_seq) {
+            c->state = TCP_LISTEN;
             uart_puts("tcp: LAST_ACK -> LISTEN\n");
         }
         return 1;
     }
 
     return 1;
+}
+
+/* Helper: state name (used by both the per-slot dump and the live HDMI
+ * panel).  Kept in one place so changes propagate. */
+static const char *tcp_state_name(int s)
+{
+    switch (s) {
+        case TCP_CLOSED:      return "CLOSED";
+        case TCP_LISTEN:      return "LISTEN";
+        case TCP_SYN_RCVD:    return "SYN_RCVD";
+        case TCP_ESTABLISHED: return "ESTAB";
+        case TCP_FIN_WAIT_1:  return "FINWAIT1";
+        case TCP_LAST_ACK:    return "LASTACK";
+        default:              return "?";
+    }
 }
 
 /* On-demand state dump for the shell `tcpstat` command — reads cleanly
@@ -1280,25 +1395,26 @@ int tcp_handle_packet(const unsigned char *frame, int len)
  *   txfail>0  -> the SYN+ACK could not be transmitted (TX wedge) */
 void tcp_dump_state(void)
 {
-    const char *st;
-    switch (g_conn.state) {
-        case TCP_CLOSED:      st = "CLOSED";      break;
-        case TCP_LISTEN:      st = "LISTEN";      break;
-        case TCP_SYN_RCVD:    st = "SYN_RCVD";    break;
-        case TCP_ESTABLISHED: st = "ESTABLISHED"; break;
-        case TCP_FIN_WAIT_1:  st = "FIN_WAIT_1";  break;
-        case TCP_LAST_ACK:    st = "LAST_ACK";    break;
-        default:              st = "?";           break;
+    uart_puts("tcp: listen_port="); puts_u32_dec(g_listen_port);
+    uart_puts(" any="); puts_u32_dec(g_tcp_any);
+    uart_puts(" seg_rx=");  puts_u32_dec(g_seg_rx);
+    uart_puts(" syn=");     puts_u32_dec(g_syn_seen);
+    uart_puts(" synack=");  puts_u32_dec(g_synack_sent);
+    uart_puts(" estab=");   puts_u32_dec(g_estab);
+    uart_puts(" txfail=");  puts_u32_dec(g_txfail);
+    uart_puts(" drop_syn=");puts_u32_dec(g_dropped_syn);
+    uart_puts("\n");
+    for (int i = 0; i < NCONN; i++) {
+        struct tcp_conn *c = &g_conns[i];
+        uart_puts("  conn[");  puts_u32_dec(i);  uart_puts("] state=");
+        uart_puts(tcp_state_name(c->state));
+        if (c->state != TCP_LISTEN && c->state != TCP_CLOSED) {
+            uart_puts(" peer="); puts_ip(c->peer_ip);
+            uart_puts(":");     puts_u32_dec(c->peer_port);
+        }
+        uart_puts("\n");
     }
-    uart_puts("tcp: state="); uart_puts(st);
-    uart_puts(" listen_port="); puts_u32_dec(g_listen_port);
-    uart_puts("\n     any=");    puts_u32_dec(g_tcp_any);
-    uart_puts(" seg_rx=");        puts_u32_dec(g_seg_rx);
-    uart_puts(" syn=");          puts_u32_dec(g_syn_seen);
-    uart_puts(" synack=");       puts_u32_dec(g_synack_sent);
-    uart_puts(" estab=");        puts_u32_dec(g_estab);
-    uart_puts(" txfail=");       puts_u32_dec(g_txfail);
-    uart_puts("\n     last_peer=");
+    uart_puts("  last_peer=");
     if (g_last_port) { puts_ip(g_last_ip); uart_puts(":"); puts_u32_dec(g_last_port); }
     else             { uart_puts("(none)"); }
     uart_puts("\n");
@@ -1313,15 +1429,22 @@ unsigned long tcp_synack_count(void)  { return g_synack_sent; }
 unsigned long tcp_estab_count(void)   { return g_estab;       }
 unsigned long tcp_txfail_count(void)  { return g_txfail;      }
 
+/* HDMI panel display: report the "most active" connection's state, with
+ * a count of currently-active slots appended so e.g. ESTAB(3/4) means
+ * three of the four conn slots are past LISTEN. */
 const char *tcp_state_str(void)
 {
-    switch (g_conn.state) {
-        case TCP_CLOSED:      return "CLOSED";
-        case TCP_LISTEN:      return "LISTEN";
-        case TCP_SYN_RCVD:    return "SYN_RCVD";
-        case TCP_ESTABLISHED: return "ESTAB";
-        case TCP_FIN_WAIT_1:  return "FINWAIT1";
-        case TCP_LAST_ACK:    return "LASTACK";
-        default:              return "?";
+    /* Pick the highest-priority active state for display, in this order:
+     *   ESTABLISHED > SYN_RCVD > FIN_WAIT_1 > LAST_ACK > LISTEN
+     * (LISTEN if nothing's active). */
+    int best = TCP_LISTEN;
+    static const int prio[] = {
+        [TCP_CLOSED] = 0, [TCP_LISTEN] = 1, [TCP_LAST_ACK] = 2,
+        [TCP_FIN_WAIT_1] = 3, [TCP_SYN_RCVD] = 4, [TCP_ESTABLISHED] = 5,
+    };
+    for (int i = 0; i < NCONN; i++) {
+        int s = g_conns[i].state;
+        if (prio[s] > prio[best]) best = s;
     }
+    return tcp_state_name(best);
 }
