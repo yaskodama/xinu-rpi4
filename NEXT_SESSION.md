@@ -148,6 +148,46 @@ disassemble + pcie_init function 特定で数日〜数週間の作業。
 → `pcie_init` シンボル位置から関数本体を読む → CPRMAN PCIe レジスタオフセット特定 → 我々の kernel で
 `mbox_call(RPI_FIRMWARE_SET_PERIPH_REG, addr, value)` 経由で write → PCIe 起動。
 
+### 🎉 2026-05-30 — Docker で vc4-toolchain 入手成功・start4.elf 完全 disassembly 完了
+
+**`hyperspeeed/vc4-toolchain` Docker image (Docker Hub, prebuilt)** を発見・pull (1コマンド):
+```sh
+docker pull hyperspeeed/vc4-toolchain
+docker run --rm -v "$(pwd):/work" hyperspeeed/vc4-toolchain \
+  /opt/vc4-toolchain/prefix/bin/vc4-elf-objdump -d /work/start4.elf > start4.S
+```
+**結果**: 650,132 行のフル disassembly (28MB の start4.S in `references/`)。
+
+**確認事項**:
+- VC4 PCIE_BASE `0x7d500000` を参照する関数群を特定（PCIe コントローラへの直接アクセス）
+- VC4 CPRMAN `0x7e101000` を参照する関数群を特定（クロック制御）
+- 文字列 `pcie_init`@vaddr `0xed446e4` をロードする `lea r1, 0xed446e4` を line 442902 (`ed446c8`) で発見
+  → `pcie_init` ロガー呼び出しのある関数本体特定
+
+**最有力 PCIe クロック有効化候補**: line 449441 (`ed4995e`) の連続書き込み:
+```asm
+mov r1, 0x5a000036       ; CPRMAN password (0x5a) | value 0x36
+mov r0, 0x7e101000       ; CPRMAN base
+st  r1, (r0+0x128)       ; ← CPRMAN+0x128 (= 0x7E101128) ★クロック CTL レジスタへ書き込み
+mov r3, 0x5a000000       ; password 単独
+st  r3, (r0+0x12C)       ; ← CPRMAN+0x12C ★対応 DIV レジスタ
+```
+- 値 `0x36` の意味: bin `00110110` = SRC=6, ENAB=1, KILL=1（CPRMAN CM_xxxCTL レイアウト）
+- **重要**: `0x128` は **Linux `clk-bcm2835.c` に定義無し** — 標準 CPRMAN レイアウト外で BCM2711 専用追加クロック
+  の可能性 = **PCIe クロックの最有力候補**
+
+### 次フェーズ: 候補レジスタへの書き込みテスト
+1. mailbox tag `RPI_FIRMWARE_SET_PERIPH_REG (0x00038045)` で書き込み（firmware proxy 経由、bus hang 回避）:
+   - 1段目: `mbox_call(SET_PERIPH_REG, 0xFE101128, 0x5a000036)` ← KILL 立てた状態でリセット
+   - 2段目: `mbox_call(SET_PERIPH_REG, 0xFE101128, 0x5a000016)` ← KILL clear で稼働 (SRC=6, ENAB=1)
+   - 3段目: `mbox_call(SET_PERIPH_REG, 0xFE10112C, 0x5a001000)` ← DIV 設定（試行値）
+2. その後 `/pcie` で MMIO 読みが応答するか試す（クロックが ON なら hang せず値返す）
+3. 応答すれば `/pcie-init` で brcm_pcie_setup 実行 → リンクアップ確認 → USB arc 突破
+
+**実装規模**: 約 50-100 行（mailbox call 1個＋HTTP route 1個）、1 flash サイクル。
+**リスク**: CPRMAN+0x128 が違うクロックだった場合 → 他のクロックが切れて何かが死ぬ可能性。
+**安全策**: SET_PERIPH_REG は firmware proxy なので直接 MMIO よりは安全。
+
 ### 試せる代替アプローチ（実装はせず記録）
 **`RPI_FIRMWARE_GET_PERIPH_REG (0x00030045)`** — mailbox 経由で任意 MMIO レジスタを読む tag。
 - 我々のカーネルからこの tag で 0xFD500000 を読めば、firmware 側から PCIe が見えているか確認可能
