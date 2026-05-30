@@ -691,12 +691,165 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, " owner_state=");  bl = s_putdec(body, bl, (long)g_lock_stuck_owner_state);
         bl = s_put(body, bl, " stuck_by=");     bl = s_putdec(body, bl, (long)g_lock_stuck_by);
         bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "POST /type") || starts_with(req, "GET /type")) {
+        /* Network keyboard input — feeds shellwin via xhci_keyboard_event(c)
+         * (the hook originally meant for a real xHCI HID driver, which we
+         * couldn't bring up; firmware capability-bit gates PCIe on Pi 4 bare-
+         * metal — see project memory).  Send a string and each character
+         * goes to the active shellwin as if typed.
+         *   POST /type           body = literal text
+         *   GET  /type?t=Hello%20world  URL-encoded text
+         * Special chars: send via URL-encoding (%0d=Enter, %08=Backspace,
+         * %1b=Esc, %09=Tab); shellwin handles them per its existing key-code map. */
+        extern void xhci_keyboard_event(char c);
+        ctype = "text/plain";
+        static char tbuf[256];
+        int tlen = 0;
+        if (req[0] == 'P') {
+            int he = find_header_end(req);
+            if (he >= 0) {
+                const char *b = req + he;
+                while (b[tlen] && tlen < (int)sizeof(tbuf) - 1) { tbuf[tlen] = b[tlen]; tlen++; }
+                tbuf[tlen] = 0;
+            }
+        } else {
+            static char tenc[256];
+            if (q_param(req, "t", tenc, sizeof tenc))
+                tlen = url_decode(tenc, tbuf, sizeof tbuf);
+        }
+        for (int i = 0; i < tlen; i++) xhci_keyboard_event(tbuf[i]);
+        bl = s_put(body, bl, "typed ");
+        bl = s_putdec(body, bl, (long)tlen);
+        bl = s_put(body, bl, " char(s)\n");
+    } else if (starts_with(req, "GET /click") || starts_with(req, "POST /click")) {
+        /* Network mouse input — feeds wm_cursor via xhci_mouse_event(btns,dx,dy).
+         * Coordinates are RELATIVE (deltas) to match the xHCI HID convention
+         * the underlying function expects.
+         *   GET /click?dx=10&dy=-5&btn=1    (btn: bit0=L bit1=R bit2=M)
+         * No btn => move only.  Same call works for plain mouse moves. */
+        extern void xhci_mouse_event(unsigned nButtons, int dx, int dy);
+        int dx  = q_int(req, "dx",  0);
+        int dy  = q_int(req, "dy",  0);
+        int btn = q_int(req, "btn", 0);
+        xhci_mouse_event((unsigned)btn, dx, dy);
+        ctype = "text/plain";
+        bl = s_put(body, bl, "mouse dx="); bl = s_putdec(body, bl, (long)dx);
+        bl = s_put(body, bl, " dy=");      bl = s_putdec(body, bl, (long)dy);
+        bl = s_put(body, bl, " btn=");     bl = s_putdec(body, bl, (long)btn);
+        bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "GET /pcie") || starts_with(req, "POST /pcie")) {
         /* On-demand probe of the BCM2711 PCIe-1 controller registers.  Fault-safe:
          * recover_spin in exception.c keeps the box alive if MMIO faults. */
         extern int xhci_pcie_dump_html(char *out, int max);
         ctype = "text/plain";
         bl += xhci_pcie_dump_html(body + bl, (int)sizeof body - bl);
+    } else if (starts_with(req, "GET /cprman-read") || starts_with(req, "POST /cprman-read")) {
+        /* Direct MMIO dump of CPRMAN register block around 0x120-0x140 plus
+         * known-active EMMC2 CTL for comparison.  CPRMAN is always-on so reads
+         * are safe.  BUSY bit (bit 7) set = clock is actually running. */
+        extern unsigned int xhci_cprman_read(unsigned int offset);
+        ctype = "text/plain";
+        static const struct { const char *name; unsigned int off; } addrs[] = {
+            { "EMMC2CTL [+0x1d0] (known active, BUSY should=1) ", 0x1D0 },
+            { "EMMC2DIV [+0x1d4]                               ", 0x1D4 },
+            { "PCIE?CTL [+0x128] (just wrote, BUSY=?)          ", 0x128 },
+            { "PCIE?DIV [+0x12c]                               ", 0x12C },
+            { "         +0x120                                 ", 0x120 },
+            { "         +0x124                                 ", 0x124 },
+            { "         +0x130                                 ", 0x130 },
+            { "         +0x134                                 ", 0x134 },
+            { "         +0x138                                 ", 0x138 },
+            { "         +0x13c                                 ", 0x13C },
+            { "         +0x140                                 ", 0x140 },
+            /* +0x180..+0x1C0: caused body-buffer overflow (1400 cap) — pruned.
+             * Linux clk-bcm2835.c: +0x1B0=CM_ARMCTL, +0x1C0=CM_EMMCCTL. */
+            { "PLLA_CTRL[+0x104]                               ", 0x104 },
+            { "PLLC_CTRL[+0x108]                               ", 0x108 },
+            { "PLLD_CTRL[+0x10c]                               ", 0x10C },
+            { "PLLH_CTRL[+0x110]                               ", 0x110 },
+        };
+        for (unsigned i = 0; i < sizeof(addrs)/sizeof(addrs[0]); i++) {
+            bl = s_put(body, bl, addrs[i].name);
+            bl = s_put(body, bl, " = ");
+            bl = s_puthex(body, bl, xhci_cprman_read(addrs[i].off));
+            bl = s_put(body, bl, "\n");
+        }
+    } else if (starts_with(req, "GET /cprman-axi") || starts_with(req, "POST /cprman-axi")) {
+        /* DISABLED: 0x7E1011B0 = CM_ARMCTL (ARM core clock CTL) per
+         * Linux clk-bcm2835.c.  Writing 0x5A001000 would change the CPU
+         * clock and brick the box.  Route kept as a marker so we never
+         * re-introduce the same bug.  Sub-agent that found this register
+         * misidentified it as PCIe — it's actually ARM core CTL. */
+        ctype = "text/plain";
+        bl = s_put(body, bl, "DISABLED: 0x1B0 = CM_ARMCTL, would brick the box\n");
+    } else if (starts_with(req, "GET /cprman-init-osc") || starts_with(req, "POST /cprman-init-osc")) {
+        /* Same as /cprman-init but with SRC=1 (OSC 19.2MHz, always alive).
+         * Definitive test: if BUSY=1 here, 0x128 is a generic CPRMAN clock
+         * register and the SRC=6 source PLL must be enabled separately. */
+        extern int xhci_cprman_enable_pcie_src(unsigned int src);
+        int post_ctl = xhci_cprman_enable_pcie_src(1);
+        ctype = "text/plain";
+        bl = s_put(body, bl, "cprman-init-osc: wrote 0x5A000011 -> CPRMAN+0x128 (SRC=OSC)\n");
+        bl = s_put(body, bl, "post-write CTL = ");
+        bl = s_puthex(body, bl, (unsigned int)post_ctl);
+        bl = s_put(body, bl, "\nBUSY (bit 7) set => 0x128 is a real clock reg; SRC=6 PLL was the problem\n");
+    } else if (starts_with(req, "GET /cprman-init") || starts_with(req, "POST /cprman-init")) {
+        /* DIRECT CPRMAN MMIO write: replay start4.elf disasm pattern at
+         * vaddr 0xed4995e — ungate suspected PCIe clock at CPRMAN+0x128.
+         * CPRMAN is always-on so MMIO won't hang the bus.  Risk: if 0x128
+         * isn't PCIe we kill some other clock and box dies. */
+        extern int xhci_cprman_enable_pcie(void);
+        int post_ctl = xhci_cprman_enable_pcie();
+        ctype = "text/plain";
+        bl = s_put(body, bl, "cprman-init: wrote 0x5A000016 -> CPRMAN+0x128\n");
+        bl = s_put(body, bl, "post-write CTL = ");
+        bl = s_puthex(body, bl, (unsigned int)post_ctl);
+        bl = s_put(body, bl, "\n(expect ENAB|SRC=6=0x16 and BUSY bit 7 set if clock is alive)\n");
+    } else if (starts_with(req, "GET /cprman") || starts_with(req, "POST /cprman")) {
+        /* READ key CPRMAN registers via firmware mailbox proxy.  tag-resp:
+         * 0x80000004 = firmware handled (value valid), 0 = ignored (value bogus). */
+        extern int xhci_periph_read(unsigned int addr, unsigned int *out, unsigned int *resp);
+        extern int xhci_firmware_revision(unsigned int *out, unsigned int *resp);
+        ctype = "text/plain";
+        unsigned int v, rs;
+        /* Sanity: firmware revision (known-good tag) — proves mailbox plumbing OK. */
+        bl = s_put(body, bl, "fw_revision: ");
+        if (xhci_firmware_revision(&v, &rs) == 0) {
+            bl = s_puthex(body, bl, v);
+            bl = s_put(body, bl, " (tag-resp=");
+            bl = s_puthex(body, bl, rs);
+            bl = s_put(body, bl, ")\n");
+        } else {
+            bl = s_put(body, bl, "MBOX_FAIL\n");
+        }
+        /* Try three address formats — ARM 0xFE.. / VC 0x7E.. / bus 0x4_7E.. —
+         * to find which one firmware accepts for GET_PERIPH_REG. */
+        static const struct { const char *name; unsigned int addr; } regs[] = {
+            /* ARM physical (32-bit) */
+            { "ARM EMMC2CTL [0xfe1011d0]", 0xFE1011D0 },
+            { "ARM PCIE?CTL [0xfe101128]", 0xFE101128 },
+            /* VC view (BCM legacy) */
+            { "VC  EMMC2CTL [0x7e1011d0]", 0x7E1011D0 },
+            { "VC  PCIE?CTL [0x7e101128]", 0x7E101128 },
+            /* low-32 of bus addr (high bits dropped, in case it's that) */
+            { "BUS EMMC2CTL [0xfe1011d0]", 0xFE1011D0 }, /* same as ARM */
+            /* small offset variations */
+            { "raw 0x7e1011d4         ", 0x7E1011D4 },
+            { "raw 0xfe1011d4         ", 0xFE1011D4 },
+        };
+        for (unsigned i = 0; i < sizeof(regs)/sizeof(regs[0]); i++) {
+            bl = s_put(body, bl, regs[i].name);
+            bl = s_put(body, bl, " = ");
+            if (xhci_periph_read(regs[i].addr, &v, &rs) == 0) {
+                bl = s_puthex(body, bl, v);
+                bl = s_put(body, bl, " (tag-resp=");
+                bl = s_puthex(body, bl, rs);
+                bl = s_put(body, bl, ")");
+            } else {
+                bl = s_put(body, bl, "MBOX_FAIL");
+            }
+            bl = s_put(body, bl, "\n");
+        }
     } else if (starts_with(req, "GET /pcie-init") || starts_with(req, "POST /pcie-init")) {
         /* On-demand BCM2711 PCIe RC bring-up (Linux pcie-brcmstb.c sequence).
          * After this, /pcie should show non-zero registers and PCIE_STATUS

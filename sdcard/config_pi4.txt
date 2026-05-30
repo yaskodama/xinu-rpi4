@@ -39,3 +39,9 @@ framebuffer_ignore_alpha=1
 otg_mode=1
 
 [all]
+# PCIe / VL805 / USB-A on Pi 4 bare-metal: GIVEN UP after extensive RE
+# (see project memory).  Tried `reduced_axi=1` → destabilised firmware.
+# Tried `vl805_no_spi=1` → no effect; per start4.elf disasm at vaddr
+# 0xec5ae02-0xec5ae26, the firmware's xHCI bring-up at 0xedc7f60 also
+# needs capability bit 0x16 (at gp+245968), which is a hardware/boot bit
+# we can't set from config.txt.  Both flags removed — keep config clean.

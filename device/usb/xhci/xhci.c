@@ -99,6 +99,135 @@ void xhci_init(void)
  * can see whether it returns or hangs (the boot-time variant wedged the box). */
 int xhci_notify_reset_call(void) { return xhci_notify_reset(); }
 
+/* Firmware-proxied peripheral register read/write via VC mailbox.  Safer than
+ * direct MMIO when the controller may be clock-gated (firmware handles the bus
+ * access; we can't hang the AXI from our side).  Tags:
+ *   GET_PERIPH_REG = 0x00030045   in: addr; out: value
+ *   SET_PERIPH_REG = 0x00038045   in: addr + value
+ * Found in raspberrypi-firmware.h.  Returns -1 on mailbox failure, 0 on
+ * success; value written into *out for GET. */
+int xhci_periph_read(unsigned int addr, unsigned int *out, unsigned int *resp)
+{
+    static volatile unsigned int __attribute__((aligned(16))) buf[12];
+    buf[0] = 48;            /* total size (12*4 = 48 bytes) */
+    buf[1] = 0;             /* request code */
+    buf[2] = 0x00030045U;   /* GET_PERIPH_REG */
+    buf[3] = 8;             /* value buf size: addr (in) + value (out) */
+    buf[4] = 0;             /* req/resp */
+    buf[5] = addr;          /* IN: peripheral register address */
+    buf[6] = 0;             /* OUT: value */
+    buf[7] = 0;             /* end tag */
+    buf[8] = buf[9] = buf[10] = buf[11] = 0;
+    if (mbox_call(buf) != 0) return -1;
+    *out = buf[6];
+    if (resp) *resp = buf[4];   /* 0x80000000+len = handled, 0 = ignored */
+    return 0;
+}
+
+/* Sanity-check: GET_FIRMWARE_REVISION — known-good tag. */
+int xhci_firmware_revision(unsigned int *out, unsigned int *resp)
+{
+    static volatile unsigned int __attribute__((aligned(16))) buf[8];
+    buf[0] = 32;            /* 8 u32s = 32 bytes */
+    buf[1] = 0;
+    buf[2] = 0x00000001U;   /* GET_FIRMWARE_REVISION */
+    buf[3] = 4;
+    buf[4] = 0;
+    buf[5] = 0;
+    buf[6] = 0;             /* end tag */
+    buf[7] = 0;
+    if (mbox_call(buf) != 0) return -1;
+    *out = buf[5];
+    if (resp) *resp = buf[4];
+    return 0;
+}
+
+/* Direct CPRMAN MMIO read/write.  CPRMAN is always-on (it controls all the
+ * other clocks), so reads/writes don't hang the bus the way PCIe MMIO does.
+ * Used to enable the PCIe clock by replaying the exact sequence extracted
+ * from start4.elf disasm at vaddr 0xed4995e:
+ *   mov r1, 0x5a000036  ; password | SRC=6, ENAB=1, KILL=1
+ *   mov r0, 0x7e101000  ; CPRMAN base (VC view; ARM 0xFE101000)
+ *   st  r1, (r0+0x128)  ; CTL register
+ *   mov r3, 0x5a000000  ; password only
+ *   st  r3, (r0+0x12C)  ; DIV register
+ * Note: 0x128 is NOT in Linux clk-bcm2835.c (standard CPRMAN map ends earlier
+ * for the relevant block), so it's a BCM2711-only addition — strong PCIe
+ * candidate.  If wrong, we kill some other clock and the box locks up. */
+#define CPRMAN_BASE       0xFE101000UL
+#define CPRMAN_PASSWORD   0x5A000000U
+#define CM_CTL_ENAB       (1U << 4)
+#define CM_CTL_KILL       (1U << 5)
+#define CM_CTL_SRC_MASK   0xfU
+
+/* Write 0x5A001000 to CPRMAN+0x1B0 — extracted from start4.elf disasm at
+ * vaddr 0xed497e8.  Firmware does this iff config flag "reduced_axi" is set.
+ * Bit 12 with password — non-standard format, possibly clock-divider or PCIe
+ * AXI gating.  Bare-metal kernels never hit this path; we replay directly. */
+int xhci_cprman_pcie_axi_enable(void)
+{
+    extern void delay_ms(unsigned int ms);
+    volatile unsigned int *reg = (volatile unsigned int *)(CPRMAN_BASE + 0x1B0);
+    unsigned int before = *reg;
+    *reg = CPRMAN_PASSWORD | 0x1000;
+    __asm__ volatile ("dsb sy" ::: "memory");
+    delay_ms(1);
+    unsigned int after = *reg;
+    /* Pack before/after into the return value: high 16 = before lo, low 16 = after lo. */
+    return (int)((before & 0xFFFF) << 16 | (after & 0xFFFF));
+}
+
+/* Direct CPRMAN MMIO read.  CPRMAN is always-on so this won't hang the bus.
+ * Returns the raw 32-bit register value at CPRMAN_BASE + offset. */
+unsigned int xhci_cprman_read(unsigned int offset)
+{
+    volatile unsigned int *p = (volatile unsigned int *)(CPRMAN_BASE + offset);
+    unsigned int v = *p;
+    __asm__ volatile ("dsb sy" ::: "memory");
+    return v;
+}
+
+/* Configurable CPRMAN clock enable — `src` chooses clock source (1=OSC,
+ * 6=PLLD_PER per BCM2835 conventions).  Returns post-write CTL value. */
+int xhci_cprman_enable_pcie_src(unsigned int src)
+{
+    extern void delay_ms(unsigned int ms);
+    volatile unsigned int *cm_ctl = (volatile unsigned int *)(CPRMAN_BASE + 0x128);
+    volatile unsigned int *cm_div = (volatile unsigned int *)(CPRMAN_BASE + 0x12C);
+    src &= CM_CTL_SRC_MASK;
+    /* Step 1: stop the clock (KILL=1) before configuring source / divider */
+    *cm_ctl = CPRMAN_PASSWORD | CM_CTL_KILL | src;
+    __asm__ volatile ("dsb sy" ::: "memory");
+    /* Step 2: set divider to 1 (DIV.INT=1, DIV.FRAC=0) */
+    *cm_div = CPRMAN_PASSWORD | (1U << 12);
+    __asm__ volatile ("dsb sy" ::: "memory");
+    /* Step 3: enable (KILL=0, ENAB=1, SRC=src) */
+    *cm_ctl = CPRMAN_PASSWORD | CM_CTL_ENAB | src;
+    __asm__ volatile ("dsb sy" ::: "memory");
+    delay_ms(1);
+    return (int)(*cm_ctl & ~CPRMAN_PASSWORD);
+}
+
+int xhci_cprman_enable_pcie(void)
+{
+    return xhci_cprman_enable_pcie_src(6);   /* original: SRC=6 (matches firmware) */
+}
+
+int xhci_periph_write(unsigned int addr, unsigned int val)
+{
+    static volatile unsigned int __attribute__((aligned(16))) buf[12];
+    buf[0] = 48;
+    buf[1] = 0;
+    buf[2] = 0x00038045U;   /* SET_PERIPH_REG */
+    buf[3] = 8;             /* addr + value */
+    buf[4] = 0;
+    buf[5] = addr;
+    buf[6] = val;
+    buf[7] = 0;
+    buf[8] = buf[9] = buf[10] = buf[11] = 0;
+    return mbox_call(buf);
+}
+
 /* Bare PCIe-controller register dump into a text buffer; called by the /pcie
  * HTTP route.  Reads that fault are caught by the sync-exception handler
  * (recover_spin) so the box stays alive across iterations. */
