@@ -16,13 +16,19 @@
 #ifndef XINU_RPI4_PROC_H
 #define XINU_RPI4_PROC_H
 
-#define NPROC          512   /* was 256 — bumped 2026-05-31 because tree_nqueens
-                              * pattern (Branch waits on G Leaf replies, Leaves
-                              * suicide fast but new Branches keep spawning more
-                              * Leaves) hits the cap at ~80 concurrent Xinu procs,
-                              * causing ap_spawn to return -1 and downstream
-                              * sends to "actor -1" to be silently dropped.
-                              * Each proc costs 8 KB stack so 512 = ~4 MB. */
+#define NPROC          2048  /* 2026-05-31: 256 -> 512 -> 1024 -> 2048.
+                              * N-Queens N=8 needed 1467 spawn attempts and
+                              * peak ~1300 concurrent alive (with recycling) —
+                              * 1024 hit 444 spawn_fails and hung; 2048 leaves
+                              * headroom for N=8 + the AP_QLEN reduction below.
+                              * Memory budget: 8 KB stack/proc x 2048 = 16 MB.
+                              * g_act[] in actorproc.c at AP_QLEN=64 takes
+                              * 2047 x (64 x 48 + 16) ≈ 6.3 MB.  Total well
+                              * under HEAP_END=0x40000000.  IMPORTANT: aipl2c's
+                              * g_obj[N] in c_translator.ml must match NPROC
+                              * exactly — any slot id >= bound silently corrupts
+                              * BSS via g_spawn() write.  Current pairing: both
+                              * NPROC and g_obj at 2048. */
 #define NULLPROC       0
 #define PROC_NAME_LEN  16
 #define PROC_DEFAULT_STK   4096UL

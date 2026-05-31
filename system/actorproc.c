@@ -17,11 +17,14 @@
 #include "irq.h"
 
 #define AP_NACT  (NPROC - 1)        /* one Xinu process per actor       */
-#define AP_QLEN  256       /* was 64 — N=6+ N-Queens tree saturated parent
-                            * mailboxes (drops were silent in ap_post, causing
-                            * received != expected mismatches and indefinite
-                            * waits).  256 gives each actor enough headroom
-                            * for the deeper trees the JIT-actor pattern hits. */
+#define AP_QLEN  64        /* 2026-05-31: tested 256 (defense-in-depth) but
+                            * the real N-Queens N=6 bug was g_obj[64] BSS
+                            * overflow in aipl2c, not mailbox saturation —
+                            * N-Queens Solver only ever sees ~8 reply messages
+                            * (one per safe column).  Back to 64 to keep
+                            * g_act[] BSS at ~6 MB for NPROC=2048 instead of
+                            * ~25 MB.  If a future workload genuinely needs
+                            * deeper mailboxes, bump back up. */
 
 static struct {
     struct ap_msg q[AP_QLEN];
