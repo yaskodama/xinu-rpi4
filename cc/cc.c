@@ -496,12 +496,14 @@ extern int  ap_actor_alive(int id);
 extern long ap_actor_age_ms(int id);
 extern int  ap_force_kill(int id);
 extern void ap_gc_protect(int id, int on);
+extern int  ap_actor_protected(int id);
 extern int  ap_gc_sweep(long threshold_ms, int dry_run, int *out_scanned);
 static long cc_actor_count(void)              { return v_int(ap_live_count()); }
 static long cc_actor_alive(long id)           { return v_int(ap_actor_alive((int)v_int_of(id))); }
 static long cc_actor_age(long id)             { return v_int((int)ap_actor_age_ms((int)v_int_of(id))); }
 static long cc_actor_kill(long id)            { return v_int(ap_force_kill((int)v_int_of(id))); }
 static long cc_actor_protect(long id, long on){ ap_gc_protect((int)v_int_of(id), (int)v_int_of(on)); return v_int(0); }
+static long cc_actor_protected(long id)       { return v_int(ap_actor_protected((int)v_int_of(id))); }
 static long cc_gc_sweep(long threshold_ms, long dry)
 {
     int scanned = 0;
@@ -658,13 +660,14 @@ unsigned long cc_resolve_extern(const char *name)
         { "cc_actor_new",(void *)&cc_actor_new},
         { "cc_actor_suicide", (void *)&cc_actor_suicide},
         /* GC primitives — used by the AIPL-side GC actor */
-        { "cc_actor_count",   (void *)&cc_actor_count   },
-        { "cc_actor_alive",   (void *)&cc_actor_alive   },
-        { "cc_actor_age",     (void *)&cc_actor_age     },
-        { "cc_actor_kill",    (void *)&cc_actor_kill    },
-        { "cc_actor_protect", (void *)&cc_actor_protect },
-        { "cc_gc_sweep",      (void *)&cc_gc_sweep      },
-        { "cc_now_ms",        (void *)&cc_now_ms        },
+        { "cc_actor_count",     (void *)&cc_actor_count     },
+        { "cc_actor_alive",     (void *)&cc_actor_alive     },
+        { "cc_actor_age",       (void *)&cc_actor_age       },
+        { "cc_actor_kill",      (void *)&cc_actor_kill      },
+        { "cc_actor_protect",   (void *)&cc_actor_protect   },
+        { "cc_actor_protected", (void *)&cc_actor_protected },
+        { "cc_gc_sweep",        (void *)&cc_gc_sweep        },
+        { "cc_now_ms",          (void *)&cc_now_ms          },
         { "cc_win_move",  (void *)&cc_win_move  },
         { "cc_win_resize",(void *)&cc_win_resize},
         { "cc_win_font",  (void *)&cc_win_font  },

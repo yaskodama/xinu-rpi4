@@ -1,0 +1,146 @@
+// nqueens_with_gc.abcl — parallel N-Queens + GC actor co-resident.
+//
+// Layout after /actor/load:
+//   slot 0: GC (protected)
+//   slot 1: Root (the N-Queens driver)
+//   slot 2..K: Solver actors spawned by Root
+//
+// External flow:
+//   1. POST /actor/load        — loads the combined script
+//   2. POST /actor/send?to=1&m=bootstrap&arg=N  — kicks off N-Queens
+//   3. Poll  /actor/send?to=1&m=get_solutions&arg=0   — read result
+//   4. POST /actor/send?to=0&m=tick&arg=0      — manual GC pass
+//   5. GET   /api/actors-gc                     — verify clean state
+//
+// The GC threshold is set to 30 s — high enough that no in-flight
+// Solver is mistaken for a zombie even on a slow tree (N=8 finishes
+// in ~1 s on Pi 4; Solvers suicide as soon as their child replies
+// arrive, so age stays well below threshold during real work).
+
+class Solver {
+  var parent      = 0;
+  var parent_slot = 0;
+  var expected    = 0;
+  var received    = 0;
+  var sumv        = 0;
+
+  method init_parent(par, sl) {
+    parent = par;
+    parent_slot = sl;
+  }
+
+  function safe(cols, r, c) {
+    var i = 0;
+    while (i < r) do {
+      var p = array_get(cols, i);
+      if (p == c)          { return 0; }
+      if (p - c == r - i)  { return 0; }
+      if (c - p == r - i)  { return 0; }
+      i = i + 1;
+    }
+    return 1;
+  }
+
+  method compute(cols, r, n) {
+    received = 0;  sumv = 0;
+    if (r == n) {
+      send parent.reply(parent_slot, 1);
+      suicide();
+    } else {
+      var c = 0;
+      var n_kids = 0;
+      while (c < n) do {
+        if (safe(cols, r, c)) {
+          var cols2 = array_set(cols, r, c);
+          var child = new Solver();
+          send child.init_parent(self, n_kids);
+          send child.compute(cols2, r + 1, n);
+          n_kids = n_kids + 1;
+        }
+        c = c + 1;
+      }
+      expected = n_kids;
+      if (n_kids == 0) {
+        send parent.reply(parent_slot, 0);
+        suicide();
+      }
+    }
+  }
+
+  method reply(slot, v) {
+    sumv = sumv + v;
+    received = received + 1;
+    if (received == expected) {
+      send parent.reply(parent_slot, sumv);
+      suicide();
+    }
+  }
+}
+
+class Root {
+  var n_solutions = 0;
+  var n_done = 0;
+  method bootstrap(n) {
+    n_done = 0;
+    n_solutions = 0;
+    var cols[12];
+    var top = new Solver();
+    send top.init_parent(self, 0);
+    send top.compute(cols, 0, n);
+  }
+  method reply(slot, v) {
+    n_solutions = v;
+    n_done = 1;
+  }
+  method get_solutions(unused) { return n_solutions; }
+  method get_done(unused)      { return n_done; }
+}
+
+class GC {
+  var threshold_ms = 30000;          /* 30 s: longer than any in-flight Solver */
+  var killed_total = 0;
+  var scans_total  = 0;
+  var last_killed  = 0;
+  var last_scanned = 0;
+  var self_id      = 0;
+
+  method init(my_id) {
+    self_id = my_id;
+    /* Don't sweep ourselves; also protect the Root (slot 1) so the GC
+     * never reaps the N-Queens driver between runs. */
+    actor_protect(my_id, 1);
+    actor_protect(1, 1);
+  }
+
+  method set_threshold(ms) { threshold_ms = ms; }
+
+  method tick() {
+    last_scanned = actor_count();
+    last_killed  = gc_sweep(threshold_ms, 0);
+    killed_total = killed_total + last_killed;
+    scans_total  = scans_total + 1;
+  }
+
+  method tick_dry() {
+    last_scanned = actor_count();
+    last_killed  = gc_sweep(threshold_ms, 1);
+    scans_total  = scans_total + 1;
+  }
+
+  method get(k) {
+    if (k == 0) { return killed_total; }
+    if (k == 1) { return scans_total; }
+    if (k == 2) { return last_killed; }
+    if (k == 3) { return last_scanned; }
+    if (k == 4) { return threshold_ms; }
+    if (k == 5) { return self_id; }
+    return 0;
+  }
+}
+
+var gc = new GC();
+send gc.init(gc);
+
+var root = new Root();
+/* main doesn't auto-kick bootstrap — external caller does
+   POST /actor/send?to=1&m=bootstrap&arg=N */

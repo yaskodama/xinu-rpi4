@@ -344,6 +344,13 @@ int ap_actor_alive(int id)
     return g_act[id].pid != -1 ? 1 : 0;
 }
 
+/* Read the GC-exempt flag set by ap_gc_protect(id, 1). */
+int ap_actor_protected(int id)
+{
+    if (id < 0 || id >= g_nact) return 0;
+    return g_act[id].protected_from_gc ? 1 : 0;
+}
+
 /* GC sweep — for every live actor older than threshold_ms, force-kill it
  * (unless protected).  Returns count killed.  dry_run=1 reports without killing. */
 int ap_gc_sweep(long threshold_ms, int dry_run, int *out_scanned)

@@ -108,8 +108,9 @@ struct tcp_conn {
     int greeted;
     /* Per-conn HTTP request accumulator (reassembles a request that
      * spans segments, e.g. /compile POST body).  Reset on each new
-     * ESTABLISHED. */
-    char httpreq[8192];
+     * ESTABLISHED.  2026-05-31: 8 K -> 32 K so combined-class
+     * /actor/load bodies (N-Queens + GC + extra) fit headers + body. */
+    char httpreq[32768];
     int  httpreqlen;
 };
 
@@ -186,7 +187,7 @@ static volatile unsigned char __attribute__((aligned(64))) tx_frame[1518];
 enum { APP_IDLE = 0, APP_QUEUED, APP_WORKING, APP_DONE };
 static volatile int g_app_state;
 static int          g_app_conn_idx = -1;   /* which g_conns[] slot owns this request */
-static char         g_app_req[8192];
+static char         g_app_req[32768];   /* matches per-conn httpreq[] */
 static int          g_app_req_len;
 static char         g_app_resp[16384];  /* matches http_build's body[] cap */
 static int          g_app_resp_len;
@@ -1007,30 +1008,73 @@ static int http_build(const char *req, char *out, int max)
             }
             bl = s_put(body, bl, "\n");
         }
-    } else if (path_eq(req, "/api/actors-gc")) {
-        /* Detailed actor inventory for GC: id, pid, msgs, qlen, waiting, age_ms,
-         * protected.  Plain-text "id pid msgs qlen waiting age_ms protected\n"
-         * per row; first line is a header.  Used by external dashboards AND by
-         * the AIPL GC actor (which has direct JIT access to the same data). */
-        extern int ap_live_count(void);
-        extern int ap_actor_stat(int i, int *pid, int *qlen, int *waiting, unsigned int *nmsg);
+    } else if (starts_with(req, "GET /api/actors-gc") || starts_with(req, "POST /api/actors-gc")) {
+        /* Actor inventory + GC-target marker.  Each row:
+         *   id pid msgs qlen waiting age_ms protected gc
+         * where `protected`=0/1 mirrors ap_actor_protected(), and `gc` is
+         *   `*`  = age >= threshold AND not protected (the sweep WOULD kill it)
+         *   `P`  = protected from GC regardless of age
+         *   `-`  = within threshold, alive
+         * Query parameters:
+         *   threshold_ms=N   default 5000 — same semantics as /gc
+         *   limit=N          default 50   — cap rows to fit one TCP MTU; the
+         *                                   summary line still reports the
+         *                                   TRUE total / target count.
+         *
+         * The first line is "threshold=N total=M shown=K targets=T protected=P".
+         * That single line is enough for monitors that just want a kill
+         * count without paginating through the inventory. */
+        extern int  ap_live_count(void);
+        extern int  ap_actor_stat(int i, int *pid, int *qlen, int *waiting, unsigned int *nmsg);
         extern long ap_actor_age_ms(int id);
+        extern int  ap_actor_protected(int id);
         ctype = "text/plain";
-        bl = s_put(body, bl, "id pid msgs qlen waiting age_ms\n");
+        long threshold = (long)q_int(req, "threshold_ms", 5000);
+        int  limit     = q_int(req, "limit", 50);
+        if (limit < 1) limit = 1;
+        if (limit > 60) limit = 60;          /* MTU ceiling — 60 * ~30 char = ~1800B */
+
+        /* First pass: count totals (so summary is accurate even if we cap rows). */
         int n = ap_live_count();
+        int total = 0, targets = 0, protected_cnt = 0;
         for (int i = 0; i < n; i++) {
+            int pid = 0; unsigned int nmsg = 0;
+            if (ap_actor_stat(i, &pid, 0, 0, &nmsg) < 0) continue;
+            if (pid == -1) continue;
+            total++;
+            int p = ap_actor_protected(i);
+            if (p) protected_cnt++;
+            long age = ap_actor_age_ms(i);
+            if (!p && age >= 0 && age >= threshold) targets++;
+        }
+        bl = s_put(body, bl, "threshold_ms="); bl = s_putdec(body, bl, threshold);
+        bl = s_put(body, bl, " total=");       bl = s_putdec(body, bl, (long)total);
+        bl = s_put(body, bl, " shown=");
+        int shown_cap = (total < limit) ? total : limit;
+        bl = s_putdec(body, bl, (long)shown_cap);
+        bl = s_put(body, bl, " targets=");     bl = s_putdec(body, bl, (long)targets);
+        bl = s_put(body, bl, " protected=");   bl = s_putdec(body, bl, (long)protected_cnt);
+        bl = s_put(body, bl, "\nid pid msgs qlen waiting age_ms protected gc\n");
+
+        /* Second pass: emit up to `limit` rows. */
+        int shown = 0;
+        for (int i = 0; i < n && shown < limit; i++) {
             int pid = 0, qlen = 0, waiting = 0;
             unsigned int nmsg = 0;
             if (ap_actor_stat(i, &pid, &qlen, &waiting, &nmsg) < 0) continue;
-            if (pid == -1) continue;             /* skip recycled-empty slots */
+            if (pid == -1) continue;
             long age = ap_actor_age_ms(i);
-            bl = s_putdec(body, bl, i);           bl = s_put(body, bl, " ");
-            bl = s_putdec(body, bl, pid);         bl = s_put(body, bl, " ");
-            bl = s_putdec(body, bl, (long)nmsg);  bl = s_put(body, bl, " ");
-            bl = s_putdec(body, bl, qlen);        bl = s_put(body, bl, " ");
-            bl = s_putdec(body, bl, waiting);     bl = s_put(body, bl, " ");
-            bl = s_putdec(body, bl, age);
-            bl = s_put(body, bl, "\n");
+            int prot = ap_actor_protected(i);
+            const char *mark = prot ? "P" : ((age >= 0 && age >= threshold) ? "*" : "-");
+            bl = s_putdec(body, bl, i);          bl = s_put(body, bl, " ");
+            bl = s_putdec(body, bl, pid);        bl = s_put(body, bl, " ");
+            bl = s_putdec(body, bl, (long)nmsg); bl = s_put(body, bl, " ");
+            bl = s_putdec(body, bl, qlen);       bl = s_put(body, bl, " ");
+            bl = s_putdec(body, bl, waiting);    bl = s_put(body, bl, " ");
+            bl = s_putdec(body, bl, age);        bl = s_put(body, bl, " ");
+            bl = s_putdec(body, bl, (long)prot); bl = s_put(body, bl, " ");
+            bl = s_put(body, bl, mark);          bl = s_put(body, bl, "\n");
+            shown++;
         }
     } else if (starts_with(req, "POST /gc") || starts_with(req, "GET /gc")) {
         /* Trigger a GC sweep across the local actor pool.  Use
@@ -1205,7 +1249,13 @@ static int http_build(const char *req, char *out, int max)
          * the C source; main() spawns the actors and they stay alive for
          * later /actor/send messages. */
         ctype = "text/plain";
-        static char asrc[7168];
+        /* 2026-05-31: 7168 -> 32 K because combined scripts (N-Queens +
+         * GC + arbitrary extra classes) easily exceed the old limit —
+         * nqueens_with_gc.abcl compiled to 7655 B and was silently
+         * truncated, leaving the JIT with a half-function and "cc:
+         * expected token" failures.  32 K covers complex demos.  Also
+         * matches the per-conn httpreq buffer which is already 8 K. */
+        static char asrc[32768];
         int aslen = 0;
         if (req[0] == 'P') {
             int he = find_header_end(req);
@@ -1215,7 +1265,7 @@ static int http_build(const char *req, char *out, int max)
                 asrc[aslen] = 0;
             }
         } else {
-            static char aenc[7168];
+            static char aenc[32768];
             if (q_param(req, "src", aenc, sizeof aenc)) aslen = url_decode(aenc, asrc, sizeof asrc);
         }
         static char ares[1100];

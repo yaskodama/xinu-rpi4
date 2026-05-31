@@ -884,13 +884,24 @@ static void win_actors(window_t *self, unsigned int frame)
     unsigned int fg = 0xFFFFFFFFU, bg = self->content_bg;
     char tmp[24]; char *p;
 
-    int n = ap_live_count();
+    /* ap_live_count() is a HIGH-WATER MARK (g_nact, the largest slot id
+     * ever spawned), NOT the current alive count.  When the GC sweep or
+     * suicide() frees a slot, g_act[i].pid goes to -1 but g_obj[i].cls
+     * stays set — so a naive loop redraws class names of dead actors
+     * for as long as the slot's never re-used.  Count alive separately
+     * (pid != -1) and skip dead rows in the display. */
+    int n_high = ap_live_count();
+    int n_alive = 0;
+    for (int i = 0; i < n_high; i++) {
+        int pid = -1;
+        if (ap_actor_stat(i, &pid, 0, 0, 0) == 0 && pid != -1) n_alive++;
+    }
     draw_string_scaled(xb, yb + line*LH, "Live actors:", 0xFF80FF80U, bg, fs);
-    p = u_to_dec((unsigned long)n, tmp, sizeof tmp);
+    p = u_to_dec((unsigned long)n_alive, tmp, sizeof tmp);
     draw_string_scaled(xb + 104*fs, yb + line*LH, p, fg, bg, fs);
     line += 2;
 
-    if (n <= 0) {
+    if (n_alive <= 0) {
         draw_string_scaled(xb, yb + line*LH, "(none - POST /actor/load)", 0xFF909090U, bg, fs);
         return;
     }
@@ -899,9 +910,10 @@ static void win_actors(window_t *self, unsigned int frame)
     draw_string_scaled(xb, yb + line*LH, "id name        pid st     q msg eat",
                        0xFFB0B0B0U, bg, fs);
     line++;
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n_high; i++) {
         int pid = -1, qlen = 0, waiting = 0; unsigned int nmsg = 0;
         if (ap_actor_stat(i, &pid, &qlen, &waiting, &nmsg) != 0) continue;
+        if (pid == -1) continue;      /* killed/recycled slot — skip */
 
         char name[16];
         if (cc_actor_name(i, name, sizeof name) <= 0) { name[0] = '-'; name[1] = 0; }
