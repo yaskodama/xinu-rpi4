@@ -16,7 +16,13 @@
 #ifndef XINU_RPI4_PROC_H
 #define XINU_RPI4_PROC_H
 
-#define NPROC          256
+#define NPROC          512   /* was 256 — bumped 2026-05-31 because tree_nqueens
+                              * pattern (Branch waits on G Leaf replies, Leaves
+                              * suicide fast but new Branches keep spawning more
+                              * Leaves) hits the cap at ~80 concurrent Xinu procs,
+                              * causing ap_spawn to return -1 and downstream
+                              * sends to "actor -1" to be silently dropped.
+                              * Each proc costs 8 KB stack so 512 = ~4 MB. */
 #define NULLPROC       0
 #define PROC_NAME_LEN  16
 #define PROC_DEFAULT_STK   4096UL

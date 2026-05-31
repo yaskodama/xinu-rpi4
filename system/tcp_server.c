@@ -1002,6 +1002,29 @@ static int http_build(const char *req, char *out, int max)
             }
             bl = s_put(body, bl, "\n");
         }
+    } else if (starts_with(req, "GET /jitstats") || starts_with(req, "POST /jitstats")) {
+        /* Diagnostic counters that surface the silent failure modes of the
+         * AIPL JIT actor runtime.  spawn_fails grows when ap_spawn returns
+         * -1 (NPROC exhausted); send_to_neg grows when generated JIT code
+         * does `send actor.method(...)` with actor==-1 (the dropped spawn);
+         * lheap_used + lheap_overflows show the list-heap pressure for the
+         * current run.  Reset on each /actor/load. */
+        extern int cc_spawn_fails(void);
+        extern int cc_send_to_neg(void);
+        extern int cc_lheap_used(void);
+        extern int cc_lheap_overflows(void);
+        extern int ap_drop_oob(void);
+        extern int ap_drop_dead(void);
+        extern int ap_drop_full(void);
+        ctype = "text/plain";
+        bl = s_put(body, bl, "spawn_fails=");    bl = s_putdec(body, bl, (long)cc_spawn_fails());
+        bl = s_put(body, bl, "\nsend_to_neg=");  bl = s_putdec(body, bl, (long)cc_send_to_neg());
+        bl = s_put(body, bl, "\nlheap_used=");   bl = s_putdec(body, bl, (long)cc_lheap_used());
+        bl = s_put(body, bl, "\nlheap_overflows="); bl = s_putdec(body, bl, (long)cc_lheap_overflows());
+        bl = s_put(body, bl, "\nap_drop_oob=");  bl = s_putdec(body, bl, (long)ap_drop_oob());
+        bl = s_put(body, bl, "\nap_drop_dead="); bl = s_putdec(body, bl, (long)ap_drop_dead());
+        bl = s_put(body, bl, "\nap_drop_full="); bl = s_putdec(body, bl, (long)ap_drop_full());
+        bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "GET /mmio-read") || starts_with(req, "POST /mmio-read")) {
         /* Direct MMIO read via safe_mmio_read32 (setjmp around the load —
          * sync faults return -1 instead of wedging the worker).  Use

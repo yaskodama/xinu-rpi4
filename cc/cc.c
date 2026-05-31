@@ -437,13 +437,45 @@ static long (*g_active_dispatch)(long, long, long, long, long, long);
 
 /* `send obj.m(args)` -> enqueue on the target actor's mailbox (a Xinu
  * process); the cooperative scheduler delivers it. */
+/* Silent-failure counters surfaced via /api/jitstats so the next session
+ * can confirm a spawn-fail/send-to-dead is the cause when sums diverge.
+ * Without these, ap_post drops to=-1 messages silently (line 95 in
+ * actorproc.c's "to >= g_nact return") and N-Queens N=6 looks like a
+ * heisenbug. */
+static int g_cc_spawn_fails;
+static int g_cc_send_to_neg;
+int cc_spawn_fails(void)   { return g_cc_spawn_fails; }
+int cc_send_to_neg(void)   { return g_cc_send_to_neg; }
+
 static void cc_enqueue(long to, long mid, long a0, long a1, long a2, long a3)
 {
+    if (to < 0) {
+        if (g_cc_send_to_neg == 0) {
+            extern void uart_puts(const char *);
+            uart_puts("[cc] send to invalid actor id (spawn failed earlier) — message DROPPED\n");
+        }
+        g_cc_send_to_neg++;
+        return;                /* don't even call ap_post with -1 */
+    }
     ap_send(to, mid, a0, a1, a2, a3);
 }
 
-/* `new C()` -> spawn an actor process; returns its id (== g_obj index). */
-static long cc_actor_new(void) { return (long)ap_spawn(); }
+/* `new C()` -> spawn an actor process; returns its id (== g_obj index).
+ * Returns -1 when ap_spawn exhausts NPROC; the JIT must check this in
+ * principle, but the AIPL compiler currently emits no such check, so we
+ * log + count and let cc_enqueue swallow subsequent sends with to=-1. */
+static long cc_actor_new(void)
+{
+    long id = (long)ap_spawn();
+    if (id < 0) {
+        if (g_cc_spawn_fails == 0) {
+            extern void uart_puts(const char *);
+            uart_puts("[cc] ap_spawn FAILED — NPROC exhausted; subsequent send to -1 dropped\n");
+        }
+        g_cc_spawn_fails++;
+    }
+    return id;
+}
 
 /* `suicide()` -> mark `self` as dead.  Receive loop in actorproc.c sees the
  * flag after this dispatch returns, releases the vheap lock, then proc_exits

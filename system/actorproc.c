@@ -81,9 +81,20 @@ void ap_killall(void)
 
 static int q_empty(int i) { return g_act[i].head == g_act[i].tail; }
 
+/* Per-cause silent-drop counters for ap_post.  Surfaced via /jitstats.
+ * Without these, a runaway lost-reply showed as a hung Branch waiting on a
+ * Leaf reply with no signal which path lost the message. */
+static int g_ap_drop_oob;     /* to<0 or to>=g_nact */
+static int g_ap_drop_dead;    /* recipient's slot has pid==-1 (suicided) */
+static int g_ap_drop_full;    /* recipient queue full */
+int  ap_drop_oob(void)  { return g_ap_drop_oob; }
+int  ap_drop_dead(void) { return g_ap_drop_dead; }
+int  ap_drop_full(void) { return g_ap_drop_full; }
+
 static void ap_post(long to, long method, long reply_to, long a0, long a1, long a2, long a3)
 {
-    if (to < 0 || to >= g_nact) return;
+    if (to < 0 || to >= g_nact) { g_ap_drop_oob++; return; }
+    if (g_act[to].pid == -1)    { g_ap_drop_dead++; return; }   /* recipient gone */
     /* Enqueue + wake ATOMICALLY (IRQ-masked).  Under preemption the receiver's
      * "scan queue -> set waiting -> block" sequence (ap_recv/ap_select) runs
      * under the same mask, so a message posted here is either seen by that scan
@@ -96,7 +107,7 @@ static void ap_post(long to, long method, long reply_to, long a0, long a1, long 
      * still climbing == a livelock, not a lock deadlock). */
     unsigned long d = irq_save();
     int nxt = (g_act[to].tail + 1) % AP_QLEN;
-    if (nxt == g_act[to].head) { irq_restore(d); return; }   /* full: drop */
+    if (nxt == g_act[to].head) { g_ap_drop_full++; irq_restore(d); return; }   /* full: drop */
     struct ap_msg *m = &g_act[to].q[g_act[to].tail];
     m->method = method; m->a0 = a0; m->a1 = a1; m->a2 = a2; m->a3 = a3;
     m->reply_to = reply_to;
