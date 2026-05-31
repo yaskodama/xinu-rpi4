@@ -1,0 +1,28 @@
+// gc_zombies.abcl — spawn N "zombie" actors that wait forever for a message
+// that never comes.  Used to load-test the GC actor / /gc HTTP endpoint.
+
+class Zombie {
+  var id = 0;
+  method init(i) { id = i; }
+  // No further methods; the actor sits idle waiting on its mailbox.
+}
+
+class Spawner {
+  var n_spawned = 0;
+  method bootstrap(n) {
+    var i = 0;
+    while (i < n) do {
+      var z = new Zombie();
+      send z.init(i);
+      i = i + 1;
+    }
+    n_spawned = n;
+  }
+  method get(k) {
+    if (k == 0) { return n_spawned; }
+    return 0;
+  }
+}
+
+var s = new Spawner();
+send s.bootstrap(__N__);

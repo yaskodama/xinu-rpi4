@@ -188,7 +188,7 @@ static volatile int g_app_state;
 static int          g_app_conn_idx = -1;   /* which g_conns[] slot owns this request */
 static char         g_app_req[8192];
 static int          g_app_req_len;
-static char         g_app_resp[1500];
+static char         g_app_resp[16384];  /* matches http_build's body[] cap */
 static int          g_app_resp_len;
 static unsigned long g_app_served;     /* responses flushed (diagnostic)     */
 static int          g_net_preempt;     /* preemptive networking on/off        */
@@ -585,7 +585,12 @@ static int url_decode(const char *in, char *out, int max)
  * (capacity `max`).  Returns the byte length. */
 static int http_build(const char *req, char *out, int max)
 {
-    static char body[1400];
+    /* 2026-05-31: bumped 1400 -> 16384 so /api/actors-gc can carry a
+     * ~25-char-per-row inventory for an actor pool up to ~600 deep
+     * without truncation.  Static buffer (shared across NCONN handlers
+     * because http_build is called serially per-connection from the
+     * single app worker), 16 KB out of Pi 4's 8 GB DRAM is negligible. */
+    static char body[16384];
     int  bl = 0;
     const char *ctype = "application/json";
     (void)max;
@@ -1002,6 +1007,47 @@ static int http_build(const char *req, char *out, int max)
             }
             bl = s_put(body, bl, "\n");
         }
+    } else if (path_eq(req, "/api/actors-gc")) {
+        /* Detailed actor inventory for GC: id, pid, msgs, qlen, waiting, age_ms,
+         * protected.  Plain-text "id pid msgs qlen waiting age_ms protected\n"
+         * per row; first line is a header.  Used by external dashboards AND by
+         * the AIPL GC actor (which has direct JIT access to the same data). */
+        extern int ap_live_count(void);
+        extern int ap_actor_stat(int i, int *pid, int *qlen, int *waiting, unsigned int *nmsg);
+        extern long ap_actor_age_ms(int id);
+        ctype = "text/plain";
+        bl = s_put(body, bl, "id pid msgs qlen waiting age_ms\n");
+        int n = ap_live_count();
+        for (int i = 0; i < n; i++) {
+            int pid = 0, qlen = 0, waiting = 0;
+            unsigned int nmsg = 0;
+            if (ap_actor_stat(i, &pid, &qlen, &waiting, &nmsg) < 0) continue;
+            if (pid == -1) continue;             /* skip recycled-empty slots */
+            long age = ap_actor_age_ms(i);
+            bl = s_putdec(body, bl, i);           bl = s_put(body, bl, " ");
+            bl = s_putdec(body, bl, pid);         bl = s_put(body, bl, " ");
+            bl = s_putdec(body, bl, (long)nmsg);  bl = s_put(body, bl, " ");
+            bl = s_putdec(body, bl, qlen);        bl = s_put(body, bl, " ");
+            bl = s_putdec(body, bl, waiting);     bl = s_put(body, bl, " ");
+            bl = s_putdec(body, bl, age);
+            bl = s_put(body, bl, "\n");
+        }
+    } else if (starts_with(req, "POST /gc") || starts_with(req, "GET /gc")) {
+        /* Trigger a GC sweep across the local actor pool.  Use
+         *   POST /gc?threshold_ms=5000           — kill anything idle >5 s
+         *   POST /gc?threshold_ms=5000&dry=1     — list without killing
+         * Returns "killed=N scanned=M threshold_ms=T".  Network-visible
+         * so external monitors can run GC without an AIPL actor on Pi 4. */
+        extern int ap_gc_sweep(long threshold_ms, int dry_run, int *out_scanned);
+        long threshold = (long)q_int(req, "threshold_ms", 5000);
+        int  dry       = q_int(req, "dry", 0);
+        int  scanned   = 0;
+        int  killed    = ap_gc_sweep(threshold, dry, &scanned);
+        ctype = "text/plain";
+        bl = s_put(body, bl, "killed=");        bl = s_putdec(body, bl, (long)killed);
+        bl = s_put(body, bl, " scanned=");      bl = s_putdec(body, bl, (long)scanned);
+        bl = s_put(body, bl, " threshold_ms="); bl = s_putdec(body, bl, threshold);
+        bl = s_put(body, bl, dry ? " (dry-run)\n" : "\n");
     } else if (starts_with(req, "GET /jitstats") || starts_with(req, "POST /jitstats")) {
         /* Diagnostic counters that surface the silent failure modes of the
          * AIPL JIT actor runtime.  spawn_fails grows when ap_spawn returns

@@ -1,0 +1,66 @@
+// gc_actor.abcl — actor-pool garbage collector running as an AIPL actor on
+// xinu-rpi4.  Reads the live actor inventory via cc_actor_count() and the
+// per-slot age (last_active_ms) via cc_actor_age().  Force-kills any actor
+// idle longer than threshold_ms via cc_actor_kill().
+//
+// The GC actor protects itself + actor 0 (Root) so the sweep can't
+// orphan its own slot or the conventional resident.  Trigger one sweep
+// with `send gc.tick();` — external monitors can do this over HTTP via
+//   POST /actor/send?to=<gc_id>&m=tick
+// (or the more lightweight POST /gc?threshold_ms=... which calls the
+// same kernel sweep without going through this actor).
+
+class GC {
+  var threshold_ms = 5000;
+  var killed_total = 0;
+  var scans_total  = 0;
+  var last_killed  = 0;
+  var last_scanned = 0;
+  var self_id      = 0;
+
+  method init(my_id) {
+    self_id = my_id;
+    // Protect ourselves (so the sweep below can never kill the GC).
+    actor_protect(my_id, 1);
+    // Protect actor 0 (Root / resident counter slot) too.
+    actor_protect(0, 1);
+  }
+
+  method set_threshold(ms) {
+    threshold_ms = ms;
+  }
+
+  method tick() {
+    // One pass over the live pool.  We use the kernel's gc_sweep() rather
+    // than scanning ourselves so the loop runs entirely under the kernel's
+    // IRQ-masked critical section (no race with another actor spawning a
+    // new slot mid-scan).
+    var n = actor_count();
+    scans_total = scans_total + 1;
+    last_killed  = gc_sweep(threshold_ms, 0);
+    last_scanned = n;
+    killed_total = killed_total + last_killed;
+  }
+
+  method tick_dry() {
+    // Same scan but dry-run — report only.
+    last_killed  = gc_sweep(threshold_ms, 1);
+    last_scanned = actor_count();
+    scans_total  = scans_total + 1;
+  }
+
+  method get(k) {
+    if (k == 0) { return killed_total; }
+    if (k == 1) { return scans_total; }
+    if (k == 2) { return last_killed; }
+    if (k == 3) { return last_scanned; }
+    if (k == 4) { return threshold_ms; }
+    if (k == 5) { return self_id; }
+    return 0;
+  }
+}
+
+var gc = new GC();
+send gc.init(gc);
+// One immediate sweep to clean any leftover zombies from previous runs.
+send gc.tick();

@@ -32,6 +32,9 @@ static struct {
     int pid;                        /* Xinu pid, -1 = none              */
     int waiting;                    /* blocked on empty mailbox         */
     unsigned int nmsg;              /* total messages handled (diagnostic) */
+    unsigned long birth_ms;         /* timer_ticks() at spawn — for GC */
+    unsigned long last_active_ms;   /* timer_ticks() of last ap_recv dequeue */
+    int protected_from_gc;          /* 1 = GC must never kill this slot */
 } g_act[AP_NACT];
 
 static int g_nact;
@@ -138,11 +141,13 @@ static void ap_recv(int self, struct ap_msg *out)
     /* Check-and-block under IRQ mask (mirrors main.c's waiter_park): proc_block
      * resumes masked when ap_post wakes us, so the q_empty re-check can't miss a
      * message that arrived between the test and the block. */
+    extern unsigned long timer_ticks(void);
     unsigned long d = irq_save();
     while (q_empty(self)) { g_act[self].waiting = 1; proc_block(); }
     *out = g_act[self].q[g_act[self].head];
     g_act[self].head = (g_act[self].head + 1) % AP_QLEN;
     g_act[self].nmsg++;
+    g_act[self].last_active_ms = timer_ticks() * 10;   /* 100 Hz tick -> ms */
     irq_restore(d);
 }
 
@@ -272,6 +277,13 @@ int ap_spawn(void)
     g_act[id].nmsg = 0;
     g_jmp_armed[id] = 0;
     g_dead[id] = 0;
+    {
+        extern unsigned long timer_ticks(void);
+        unsigned long now_ms = timer_ticks() * 10;
+        g_act[id].birth_ms = now_ms;
+        g_act[id].last_active_ms = now_ms;       /* spawn counts as activity */
+        g_act[id].protected_from_gc = 0;
+    }
     int pid = proc_create_arg(actor_proc_main, 8192, "actor", (void *)(long)id);
     if (pid < 0) { g_act[id].pid = -1; return -1; }
     g_act[id].pid = pid;
@@ -285,6 +297,70 @@ void ap_suicide(int id)
 {
     if (id < 0 || id >= g_nact) return;
     g_dead[id] = 1;
+}
+
+/* ---- GC API ------------------------------------------------------------ */
+
+/* Mark an actor as exempt from the GC sweep.  Used by the GC actor itself
+ * (don't sweep yourself!) and by the boot resident actors. */
+void ap_gc_protect(int id, int on)
+{
+    if (id < 0 || id >= g_nact) return;
+    g_act[id].protected_from_gc = on ? 1 : 0;
+}
+
+/* Force-kill an actor: terminate its Xinu process out-of-band (the actor is
+ * NOT given a chance to run its handlers any further).  Slot becomes free.
+ * Returns 0 on kill, -1 if id invalid, dead, or protected. */
+extern void proc_kill(int pid);
+int ap_force_kill(int id)
+{
+    if (id < 0 || id >= g_nact)           return -1;
+    if (g_act[id].pid == -1)              return -1;     /* already dead */
+    if (g_act[id].protected_from_gc)      return -1;
+    int pid = g_act[id].pid;
+    g_act[id].pid = -1;                                   /* slot is free for reuse */
+    g_dead[id] = 1;                                       /* so ap_run doesn't pump it */
+    proc_kill(pid);                                       /* free the Xinu process */
+    return 0;
+}
+
+/* Age (in ms) of the slot's idleness — now_ms - last_active_ms.  Returns -1
+ * for invalid id or dead slot. */
+long ap_actor_age_ms(int id)
+{
+    extern unsigned long timer_ticks(void);
+    if (id < 0 || id >= g_nact)  return -1;
+    if (g_act[id].pid == -1)     return -1;
+    unsigned long now = timer_ticks() * 10;
+    return (long)(now - g_act[id].last_active_ms);
+}
+
+/* True if slot is alive (pid != -1).  Distinguishes "dead, free for reuse"
+ * from "alive, exists". */
+int ap_actor_alive(int id)
+{
+    if (id < 0 || id >= g_nact) return 0;
+    return g_act[id].pid != -1 ? 1 : 0;
+}
+
+/* GC sweep — for every live actor older than threshold_ms, force-kill it
+ * (unless protected).  Returns count killed.  dry_run=1 reports without killing. */
+int ap_gc_sweep(long threshold_ms, int dry_run, int *out_scanned)
+{
+    int killed = 0, scanned = 0;
+    for (int i = 0; i < g_nact; i++) {
+        if (g_act[i].pid == -1) continue;
+        scanned++;
+        if (g_act[i].protected_from_gc) continue;
+        long age = ap_actor_age_ms(i);
+        if (age >= 0 && age >= threshold_ms) {
+            if (!dry_run) { if (ap_force_kill(i) == 0) killed++; }
+            else killed++;
+        }
+    }
+    if (out_scanned) *out_scanned = scanned;
+    return killed;
 }
 
 /* The previous 1 000 000 guard limit was hit at the 10 M actor scale
