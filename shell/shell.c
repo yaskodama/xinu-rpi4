@@ -675,7 +675,30 @@ extern int cmd_llm(int, char **);
 /* Preemptive-scheduling demo lives in system/actorproc.c. */
 extern int cmd_preempt(int, char **);
 
+/* WiFi (BCM43455) control — runs on the shell/main context (not the app
+ * worker), so it can drive bring-up/scan/join interactively over serial.
+ *   wifi probe            M0+M1 bring-up (firmware download)
+ *   wifi scan             escan for APs
+ *   wifi join <ssid> <pw> WPA2-PSK join */
+static int cmd_wifi(int argc, char **argv)
+{
+    extern int wifi_probe(void);
+    extern int wifi_scan_run(void);
+    extern int wifi_join_run(const char *ssid, const char *pass);
+    extern int wifi_dhcp(void);
+    if (argc < 2) { uart_puts("usage: wifi probe | scan | join <ssid> <pass> | dhcp\n"); return 0; }
+    if (str_eq(argv[1], "probe"))      wifi_probe();
+    else if (str_eq(argv[1], "scan"))  wifi_scan_run();
+    else if (str_eq(argv[1], "dhcp"))  wifi_dhcp();
+    else if (str_eq(argv[1], "join")) {
+        if (argc < 3) { uart_puts("usage: wifi join <ssid> <pass>\n"); return 0; }
+        wifi_join_run(argv[2], argc >= 4 ? argv[3] : "");
+    } else uart_puts("wifi: unknown subcommand (probe|scan|join|dhcp)\n");
+    return 0;
+}
+
 static const struct centry commandtab[] = {
+    { "wifi",   "wifi probe|scan|join <ssid> <pass>",       cmd_wifi   },
     { "help",   "list the commands",                       cmd_help   },
     { "pwd",    "print the current directory",             cmd_pwd    },
     { "ls",     "ls [path] — list a directory",            cmd_ls     },

@@ -108,6 +108,32 @@ void uart_init(void)
     }
 }
 
+/* Re-program the PL011 baud divisor for a true 115200 given the ACTUAL
+ * UART reference clock `clk` (Hz), as reported by the firmware mailbox.
+ * The boot-time uart_init() assumes 48 MHz; on Pi 4 the firmware often
+ * leaves UARTCLK at some other rate, garbling the cable.  Call this once
+ * (from the /uartclk route) after boot to fix it without boot-time mbox
+ * risk.  divisor = clk / (16*115200); IBRD = int, FBRD = round(frac*64). */
+void uart_rebaud(unsigned int clk)
+{
+    unsigned int want = 115200u;
+    unsigned int ibrd, fbrd, div64;
+    if (!clk) return;
+    /* div * 64 = clk*4 / want  (since 16*want, *64 => *4/want) */
+    div64 = (unsigned int)(((unsigned long long)clk * 4ULL) / want);
+    ibrd = div64 >> 6;
+    fbrd = div64 & 0x3F;
+    if (ibrd == 0) return;             /* clk too low — refuse, keep current */
+    /* Drain TX, disable, reprogram, re-enable (PL011 requires LCRH rewrite
+     * after IBRD/FBRD to latch the new divisor). */
+    while (!(UART_FR & (1u<<7))) { }   /* wait TXFE (FIFO empty) bit7 */
+    UART_CR = 0;
+    UART_IBRD = ibrd;
+    UART_FBRD = fbrd;
+    UART_LCRH = LCRH_FEN | LCRH_WLEN_8;
+    UART_CR = CR_UARTEN | CR_TXE | CR_RXE;
+}
+
 void uart_putc(char c)
 {
     /* Busy-wait until the TX FIFO has room. */

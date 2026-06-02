@@ -267,6 +267,8 @@ static void net_irq_handler(void *arg)
  * No-op (returns immediately) when nothing is ready. */
 static void net_yield_tick(void)
 {
+    extern void shellwin_step(void);   /* drain UART RX -> interactive shell */
+    shellwin_step();
     proc_yield();
 }
 

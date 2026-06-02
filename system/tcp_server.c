@@ -725,6 +725,89 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, "net_preempt=");
         bl = s_put(body, bl, g_net_preempt ? "on" : "off");
         bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "GET /wifi-stage") || starts_with(req, "POST /wifi-stage")) {
+        /* Run the WiFi bring-up only up to stage n (0..6) and dump the trace.
+         * Lets us bisect which M1 step wedges across reboots. */
+        extern int wifi_probe_stage(int k);
+        extern const char *wifi_trace(void);
+        extern void wifi_set_fwload_hz(unsigned int hz);
+        const char *p = req; int k = 0; unsigned int hz = 0;
+        while (*p && !(p[0]=='n' && p[1]=='=')) p++;
+        if (p[0]=='n' && p[1]=='=') { p += 2; while (*p >= '0' && *p <= '9') { k = k*10 + (*p-'0'); p++; } }
+        { const char *q = req; while (*q && !(q[0]=='h' && q[1]=='z' && q[2]=='=')) q++;
+          if (q[0]=='h' && q[1]=='z' && q[2]=='=') { q += 3; while (*q>='0'&&*q<='9'){ hz=hz*10+(*q-'0'); q++; } } }
+        if (hz) wifi_set_fwload_hz(hz);
+        ctype = "text/plain";
+        wifi_probe_stage(k);
+        bl = s_put(body, bl, wifi_trace());
+    } else if (starts_with(req, "GET /uartclk") || starts_with(req, "POST /uartclk")) {
+        /* Report the firmware's actual UART reference clock + re-baud the
+         * PL011 for a true 115200 from it (the boot divisor assumes 48 MHz,
+         * which is wrong on this Pi 4 -> garbled serial).  After hitting this
+         * once, subsequent serial output decodes cleanly at 115200. */
+        extern unsigned int wifi_clock_rate(unsigned int id);
+        extern unsigned int wifi_clock_measured(unsigned int id);
+        extern void uart_rebaud(unsigned int clk);
+        unsigned int uclk = wifi_clock_rate(2);          /* CLK id 2 = UART  */
+        unsigned int umeas = wifi_clock_measured(2);
+        unsigned int core = wifi_clock_rate(4);          /* CLK id 4 = CORE  */
+        unsigned int use = uclk ? uclk : umeas;
+        ctype = "text/plain";
+        bl = s_put(body, bl, "uart_clk(cfg)=");   bl = s_putdec(body, bl, (long)uclk);
+        bl = s_put(body, bl, "\nuart_clk(meas)="); bl = s_putdec(body, bl, (long)umeas);
+        bl = s_put(body, bl, "\ncore_clk=");       bl = s_putdec(body, bl, (long)core);
+        bl = s_put(body, bl, "\nrebaud_with=");    bl = s_putdec(body, bl, (long)use);
+        bl = s_put(body, bl, "\n");
+        uart_rebaud(use);
+    } else if (starts_with(req, "GET /wifi-join") || starts_with(req, "POST /wifi-join")) {
+        /* M3a: ensure firmware up (M1) then WPA2-PSK join.
+         * /wifi-join?ssid=<urlenc>&pass=<urlenc> ; dumps the join trace. */
+        extern int wifi_join_run(const char *ssid, const char *pass);
+        extern const char *wifi_trace(void);
+        static char ssid[40], pass[80], enc[120];
+        ssid[0] = pass[0] = 0;
+        if (q_param(req, "ssid", enc, sizeof enc)) url_decode(enc, ssid, sizeof ssid);
+        if (q_param(req, "pass", enc, sizeof enc)) url_decode(enc, pass, sizeof pass);
+        ctype = "text/plain";
+        if (!ssid[0]) { bl = s_put(body, bl, "usage: /wifi-join?ssid=..&pass=..\n"); }
+        else { wifi_join_run(ssid, pass); bl = s_put(body, bl, wifi_trace()); }
+    } else if (starts_with(req, "GET /wifi-scan") || starts_with(req, "POST /wifi-scan")) {
+        /* M2: ensure firmware up (M1) then escan for APs; dump the trace. */
+        extern int wifi_scan_run(void);
+        extern const char *wifi_trace(void);
+        ctype = "text/plain";
+        wifi_scan_run();
+        bl = s_put(body, bl, wifi_trace());
+    } else if (starts_with(req, "GET /wifi-bulk") || starts_with(req, "POST /wifi-bulk")) {
+        /* Timed bulk write of kb KB at clock hz Hz — measures real throughput. */
+        extern int wifi_probe_bulk(int kb, unsigned int hz);
+        extern const char *wifi_trace(void);
+        const char *p; int kb = 64; unsigned int hz = 0;
+        p = req; while (*p && !(p[0]=='k' && p[1]=='b' && p[2]=='=')) p++;
+        if (p[0]=='k'&&p[1]=='b'&&p[2]=='=') { kb=0; p+=3; while (*p>='0'&&*p<='9'){ kb=kb*10+(*p-'0'); p++; } }
+        p = req; while (*p && !(p[0]=='h' && p[1]=='z' && p[2]=='=')) p++;
+        if (p[0]=='h'&&p[1]=='z'&&p[2]=='=') { p+=3; while (*p>='0'&&*p<='9'){ hz=hz*10+(*p-'0'); p++; } }
+        ctype = "text/plain";
+        wifi_probe_bulk(kb, hz);
+        bl = s_put(body, bl, wifi_trace());
+    } else if (starts_with(req, "GET /wifi-win") || starts_with(req, "POST /wifi-win")) {
+        /* Single 4-byte backplane write at rambase + w*0x8000 — bisect which
+         * window hard-crashes during the full firmware write. */
+        extern int wifi_probe_winwrite(int w);
+        extern const char *wifi_trace(void);
+        const char *p = req; int w = 0;
+        while (*p && !(p[0]=='w' && p[1]=='=')) p++;
+        if (p[0]=='w' && p[1]=='=') { p += 2; while (*p >= '0' && *p <= '9') { w = w*10 + (*p-'0'); p++; } }
+        ctype = "text/plain";
+        wifi_probe_winwrite(w);
+        bl = s_put(body, bl, wifi_trace());
+    } else if (starts_with(req, "GET /wifi-trace") || starts_with(req, "POST /wifi-trace")) {
+        /* Read-only dump of the WiFi bring-up trace WITHOUT running it —
+         * poll this on a separate connection to watch /wifi-probe progress
+         * live (or read where it stopped). */
+        extern const char *wifi_trace(void);
+        ctype = "text/plain";
+        bl = s_put(body, bl, wifi_trace());
     } else if (starts_with(req, "GET /wifi-probe") || starts_with(req, "POST /wifi-probe")) {
         /* BCM43455 SDIO bring-up (M0): power the chip, init the Arasan host,
          * enumerate SDIO, read the chip-id + cores.  Dumps the trace log. */

@@ -25,6 +25,10 @@ kernel_address=0x80000
 enable_uart=1
 uart_2ndstage=1
 dtparam=uart0=on
+# Pin the PL011 reference clock to 48 MHz so the kernel's hardcoded IBRD=26/
+# FBRD=3 divisor yields a true 115200 (without this the firmware left UARTCLK
+# at a rate that garbled the serial cable).
+init_uart_clock=48000000
 
 # Ask firmware to pre-allocate a 640x480x32 HDMI framebuffer.  Even
 # with the KMS overlay above, these legacy hints make firmware also
