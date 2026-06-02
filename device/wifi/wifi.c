@@ -787,6 +787,7 @@ static u8  wl_txseq;
 static u8  wl_txwindow = 1;
 static u8  wl_fcmask = 0;
 static u16 wl_reqid;
+static char wifi_cur_ssid[40] = "";   /* last joined SSID (desktop indicator) */
 /* directed-join target (set before wifi_scan to capture bssid+chanspec) */
 static char wifi_tgt_ssid[33];
 static int  wifi_tgt_slen = 0, wifi_tgt_set = 0, wifi_tgt_found = 0;
@@ -1103,6 +1104,7 @@ static int wifi_do_join(const char *ssid, const char *pass)
     int sl = 0, i, ev, secured = (pass && pass[0]), pl = 0, jsz;
     while (ssid[sl] && sl < 32) sl++;
     if (pass) while (pass[pl] && pl < 63) pl++;
+    { int k; for (k = 0; k < sl && k < 39; k++) wifi_cur_ssid[k] = ssid[k]; wifi_cur_ssid[k] = 0; }
     wifi_log("[wifi] join: ssid=\"%s\" %s\r\n", ssid, secured ? "WPA2-PSK" : "open");
 
     wifi_radio_up();
@@ -1234,6 +1236,9 @@ static u16 ip_cksum(const u8 *p, int n, u32 sum)
 static u8 wifi_ip[4], wifi_mask[4], wifi_gw[4], wifi_dns[4], wifi_mac[6];
 static int wifi_have_ip = 0;
 int wifi_connected(void) { return wifi_have_ip; }
+/* Desktop WiFi indicator accessors (M10). */
+const char *wifi_ssid(void) { return wifi_cur_ssid; }
+void wifi_ipaddr(u8 *o) { int i; for (i = 0; i < 4; i++) o[i] = wifi_ip[i]; }
 static int dhcp_build(u8 *out, const u8 *mac, u32 xid, const u8 *reqip, const u8 *srvid)
 {
     u8 *e = out, *ip, *udp, *bootp, *opt; int dhcplen, udplen, iplen, i;
@@ -1421,10 +1426,16 @@ int wifi_serve(int secs)
  * Only active once associated + DHCP'd (wifi_have_ip); a no-op otherwise. */
 void wifi_net_poll(void)
 {
-    static u8 fr[2048]; int chan, doff, n;
+    static u8 fr[2048]; int chan, doff, n, budget;
     if (!wifi_have_ip) return;
-    n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
-    if (n > 0 && chan == 2 && n > doff + 4) wifi_handle_frame(fr, n, doff);
+    /* Drain all queued RX frames this tick (bounded so we never monopolize the
+     * wm frame loop) — at the wm frame rate a single frame/tick dropped pings;
+     * draining the FIFO each tick keeps the responder reliable. */
+    for (budget = 0; budget < 16; budget++) {
+        n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+        if (n <= 0) break;                       /* FIFO empty */
+        if (chan == 2 && n > doff + 4) wifi_handle_frame(fr, n, doff);
+    }
 }
 
 /* ================================================================== *

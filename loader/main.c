@@ -592,6 +592,51 @@ static void win_runtime(window_t *self, unsigned int frame)
     line++;
 }
 
+/* WiFi indicator (M10): signal-bar icon (green=connected, gray=down) + SSID
+ * + leased IP.  Reads the live driver state. */
+static void win_wifi(window_t *self, unsigned int frame)
+{
+    extern int wifi_connected(void);
+    extern const char *wifi_ssid(void);
+    extern void wifi_ipaddr(unsigned char *o);
+    (void)frame;
+    int fs = self->font_scale > 0 ? self->font_scale : 1;
+    int xb = self->x + 8;
+    int yb = self->y + WM_TITLEBAR_H + 6;
+    int LH = 12 * fs;
+    unsigned int bg = self->content_bg;
+    int up = wifi_connected();
+    unsigned int on = 0xFF40E060U, off = 0xFF606060U;   /* green / gray */
+    int i, bx = xb, by = yb + 4*fs;
+
+    /* 4 signal bars of increasing height */
+    for (i = 0; i < 4; i++) {
+        int h = (i + 1) * 4 * fs, w = 5 * fs;
+        fill_rect(bx + i*(w+2*fs), by - h, w, h, up ? on : off);
+    }
+    draw_string_at(xb + 30*fs, yb, up ? "WiFi: connected" : "WiFi: down",
+                   up ? on : off, bg);
+
+    /* SSID */
+    { const char *s = wifi_ssid();
+      draw_string_at(xb, yb + 2*LH, "SSID:", 0xFFFFFFFFU, bg);
+      draw_string_at(xb + 44*fs, yb + 2*LH, (s && s[0]) ? s : "-", 0xFFCCE0FFU, bg); }
+
+    /* IP a.b.c.d */
+    { unsigned char ip[4]; char l[20]; int n = 0; char t[8]; char *d; int k;
+      wifi_ipaddr(ip);
+      if (up) {
+          for (k = 0; k < 4; k++) {
+              d = u_to_dec((unsigned long)ip[k], t, sizeof t);
+              while (*d) l[n++] = *d++;
+              if (k < 3) l[n++] = '.';
+          }
+      } else { l[n++] = '-'; }
+      l[n] = 0;
+      draw_string_at(xb, yb + 3*LH, "IP:", 0xFFFFFFFFU, bg);
+      draw_string_at(xb + 44*fs, yb + 3*LH, l, 0xFFCCE0FFU, bg); }
+}
+
 static void win_anim(window_t *self, unsigned int frame)
 {
     /* A 24x24 square that bounces back and forth in the content area.
@@ -961,6 +1006,7 @@ static window_t banner_win;
 static window_t actors_win;
 static window_t gfx_win;
 static window_t runtime_win;
+static window_t wifi_win;
 static window_t status_win;
 
 /* Graphics window — replays the actor-drawn line/circle command list (the
@@ -1355,6 +1401,20 @@ void kernel_main(void)
         runtime_win.content_bg   = 0xFF14100AU;
         runtime_win.draw_content = win_runtime;
         wm_add(&runtime_win);
+
+        /* WiFi indicator: bottom-right corner of the screen, front-most. */
+        wifi_win.x = 626;
+        wifi_win.y = 90;
+        wifi_win.width  = 200;
+        wifi_win.height = 96;
+        wifi_win.font_scale = 1;
+        { const char *wt = "WiFi"; int i; for (i = 0; i < WM_TITLE_MAX && wt[i]; i++) wifi_win.title[i] = wt[i]; }
+        wifi_win.chrome_color = 0xFF60FF60U;
+        wifi_win.title_bg     = 0xFF205020U;
+        wifi_win.title_fg     = 0xFFFFFFFFU;
+        wifi_win.content_bg   = 0xFF0A140AU;
+        wifi_win.draw_content = win_wifi;
+        wm_add(&wifi_win);
 
         /* Start the cursor at the centre of the *screen* (not the
          * virtual desktop) so it stays in view as the viewport
