@@ -1340,3 +1340,76 @@ int wifi_dhcp(void)
              wifi_gw[0],wifi_gw[1],wifi_gw[2],wifi_gw[3], wifi_dns[0],wifi_dns[1],wifi_dns[2],wifi_dns[3]);
     return 0;
 }
+
+/* ================================================================== *
+ *  M4 — minimal IP responder: ARP who-has + ICMP echo (host can ping) *
+ * ================================================================== */
+static int wifi_ip_eq(const u8 *p)
+{ return p[0]==wifi_ip[0] && p[1]==wifi_ip[1] && p[2]==wifi_ip[2] && p[3]==wifi_ip[3]; }
+
+/* Answer one received 802.3 frame: ARP-who-has-us -> ARP reply, ICMP echo
+ * request -> echo reply.  All over the WLAN data channel. */
+static void wifi_handle_frame(u8 *fr, int len, int doff)
+{
+    int bdc = 4 + (fr[doff + 3] << 2);
+    u8 *e = fr + doff + bdc;
+    int elen = len - (doff + bdc), et, i;
+    if (elen < 14) return;
+    et = (e[12] << 8) | e[13];
+    if (et == 0x0806 && elen >= 42) {                /* ARP */
+        u8 *a = e + 14;
+        int op = (a[6] << 8) | a[7];
+        if (op == 1 && wifi_ip_eq(a + 24)) {         /* who-has our IP */
+            static u8 tx[42];
+            for (i = 0; i < 6; i++) tx[i]     = e[6 + i];
+            for (i = 0; i < 6; i++) tx[6 + i] = wifi_mac[i];
+            tx[12] = 0x08; tx[13] = 0x06;
+            { u8 *r = tx + 14;
+              r[0]=0;r[1]=1; r[2]=0x08;r[3]=0; r[4]=6;r[5]=4; r[6]=0;r[7]=2;
+              for (i=0;i<6;i++) r[8+i]  = wifi_mac[i];
+              for (i=0;i<4;i++) r[14+i] = wifi_ip[i];
+              for (i=0;i<6;i++) r[18+i] = a[8+i];
+              for (i=0;i<4;i++) r[24+i] = a[14+i]; }
+            wifi_data_tx(tx, 42);
+            wifi_log("[wifi] -> ARP reply to %02x:%02x:%02x:%02x:%02x:%02x\r\n",
+                     e[6],e[7],e[8],e[9],e[10],e[11]);
+        }
+    } else if (et == 0x0800 && elen >= 14 + 20 + 8) {/* IPv4 */
+        u8 *ip = e + 14;
+        int ihl = (ip[0] & 0x0F) * 4;
+        if (ip[9] == 1 && wifi_ip_eq(ip + 16)) {     /* ICMP to us */
+            u8 *ic = ip + ihl;
+            int iptot = (ip[2] << 8) | ip[3];
+            int iclen = iptot - ihl;
+            if (ic[0] == 8 && iclen >= 8 && 14 + iptot <= elen) {  /* echo request */
+                u8 m[6]; u16 c;
+                for (i=0;i<6;i++){ m[i]=e[i]; e[i]=e[6+i]; e[6+i]=m[i]; }
+                for (i=0;i<4;i++){ u8 t=ip[12+i]; ip[12+i]=ip[16+i]; ip[16+i]=t; }
+                ic[0] = 0;
+                ic[2]=ic[3]=0; c = ip_cksum(ic, iclen, 0); ic[2]=c>>8; ic[3]=c&0xFF;
+                ip[10]=ip[11]=0; c = ip_cksum(ip, ihl, 0); ip[10]=c>>8; ip[11]=c&0xFF;
+                wifi_data_tx(e, 14 + iptot);
+                wifi_log("[wifi] -> ICMP echo reply\r\n");
+            }
+        }
+    }
+}
+
+/* Bounded ARP/ICMP responder: poll the WLAN RX FIFO for `secs` seconds and
+ * answer.  Single-threaded (no thread/sem like Pi3) — runs on the shell/main
+ * context, so the host can `ping <our-ip>` during the window.  shell: wifi serve */
+int wifi_serve(int secs)
+{
+    static u8 fr[2048]; int chan, doff;
+    u32 t0 = SYSTIMER_CLO, dur = (u32)secs * 1000000u;
+    if (!wifi_have_ip) { wifi_log("[wifi] serve: no IP yet (run wifi dhcp)\r\n"); return -1; }
+    wifi_log("[wifi] serve: ARP/ICMP responder %ds on %d.%d.%d.%d\r\n",
+             secs, wifi_ip[0], wifi_ip[1], wifi_ip[2], wifi_ip[3]);
+    while ((SYSTIMER_CLO - t0) < dur) {
+        int n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+        if (n > 0 && chan == 2 && n > doff + 4) wifi_handle_frame(fr, n, doff);
+        else if (n <= 0) wifi_delay_us(2000);
+    }
+    wifi_log("[wifi] serve: window ended\r\n");
+    return 0;
+}

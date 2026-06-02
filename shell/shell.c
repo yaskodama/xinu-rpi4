@@ -686,14 +686,24 @@ static int cmd_wifi(int argc, char **argv)
     extern int wifi_scan_run(void);
     extern int wifi_join_run(const char *ssid, const char *pass);
     extern int wifi_dhcp(void);
-    if (argc < 2) { uart_puts("usage: wifi probe | scan | join <ssid> <pass> | dhcp\n"); return 0; }
+    extern int wifi_serve(int secs);
+    if (argc < 2) { uart_puts("usage: wifi probe|scan|join <ssid> <pass>|dhcp|serve [s]|up <ssid> <pass>\n"); return 0; }
     if (str_eq(argv[1], "probe"))      wifi_probe();
     else if (str_eq(argv[1], "scan"))  wifi_scan_run();
     else if (str_eq(argv[1], "dhcp"))  wifi_dhcp();
+    else if (str_eq(argv[1], "serve")) {
+        int s = 30;
+        if (argc >= 3) { const char *p = argv[2]; s = 0; while (*p>='0'&&*p<='9') s = s*10 + (*p++ - '0'); }
+        wifi_serve(s);
+    }
     else if (str_eq(argv[1], "join")) {
         if (argc < 3) { uart_puts("usage: wifi join <ssid> <pass>\n"); return 0; }
         wifi_join_run(argv[2], argc >= 4 ? argv[3] : "");
-    } else uart_puts("wifi: unknown subcommand (probe|scan|join|dhcp)\n");
+    } else if (str_eq(argv[1], "up")) {            /* join + dhcp + serve, one shot */
+        if (argc < 3) { uart_puts("usage: wifi up <ssid> <pass>\n"); return 0; }
+        if (wifi_join_run(argv[2], argc >= 4 ? argv[3] : "") == 0 && wifi_dhcp() == 0)
+            wifi_serve(60);
+    } else uart_puts("wifi: unknown subcommand (probe|scan|join|dhcp|serve|up)\n");
     return 0;
 }
 
