@@ -725,6 +725,14 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, "net_preempt=");
         bl = s_put(body, bl, g_net_preempt ? "on" : "off");
         bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "GET /wifi-probe") || starts_with(req, "POST /wifi-probe")) {
+        /* BCM43455 SDIO bring-up (M0): power the chip, init the Arasan host,
+         * enumerate SDIO, read the chip-id + cores.  Dumps the trace log. */
+        extern int wifi_probe(void);
+        extern const char *wifi_trace(void);
+        ctype = "text/plain";
+        wifi_probe();
+        bl = s_put(body, bl, wifi_trace());
     } else if (starts_with(req, "GET /netstat") || starts_with(req, "POST /netstat")) {
         /* App-handoff state: IDLE/QUEUED/WORKING/DONE + served count + preempt. */
         ctype = "text/plain";

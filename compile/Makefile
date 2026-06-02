@@ -46,7 +46,7 @@ OBJCOPY  = $(GCCPATH)/bin/$(CROSS)objcopy
 # ----- source discovery -----------------------------------------------
 COMPONENTS = loader mem system shell fs cc llm \
              device/uart device/mbox device/video device/sd device/usb \
-             device/usb/xhci device/gic device/timer device/genet \
+             device/usb/xhci device/gic device/timer device/genet device/wifi \
              network/arp network/net network/netaddr network/ipv4 network/icmp
 # Step 2 of NET-E: building xinu-raz network/{arp,net,netaddr,ipv4,icmp}
 # on top of the xinu_compat layer.
