@@ -268,7 +268,9 @@ static void net_irq_handler(void *arg)
 static void net_yield_tick(void)
 {
     extern void shellwin_step(void);   /* drain UART RX -> interactive shell */
+    extern void wifi_net_poll(void);   /* persistent WiFi ARP/ICMP responder */
     shellwin_step();
+    wifi_net_poll();
     proc_yield();
 }
 

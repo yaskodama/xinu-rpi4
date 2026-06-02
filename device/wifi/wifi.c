@@ -1414,6 +1414,19 @@ int wifi_serve(int secs)
     return 0;
 }
 
+/* Persistent (M9) background responder: poll ONE WLAN RX frame and answer
+ * ARP/ICMP.  Called once per wm frame from net_yield_tick (loader/main.c).
+ * Single-threaded: a shell client op (ping/http/dns/ntp) runs on the same
+ * tick's call stack and blocks the frame loop, so this never races it.
+ * Only active once associated + DHCP'd (wifi_have_ip); a no-op otherwise. */
+void wifi_net_poll(void)
+{
+    static u8 fr[2048]; int chan, doff, n;
+    if (!wifi_have_ip) return;
+    n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+    if (n > 0 && chan == 2 && n > doff + 4) wifi_handle_frame(fr, n, doff);
+}
+
 /* ================================================================== *
  *  M5 — ping CLIENT (ARP resolve + next-hop routing + ICMP echo)     *
  * ================================================================== */

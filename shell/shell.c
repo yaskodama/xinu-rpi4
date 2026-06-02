@@ -703,10 +703,10 @@ static int cmd_wifi(int argc, char **argv)
     else if (str_eq(argv[1], "join")) {
         if (argc < 3) { uart_puts("usage: wifi join <ssid> <pass>\n"); return 0; }
         wifi_join_run(argv[2], argc >= 4 ? argv[3] : "");
-    } else if (str_eq(argv[1], "up")) {            /* join + dhcp + serve, one shot */
+    } else if (str_eq(argv[1], "up")) {            /* join + dhcp (responder is now persistent) */
         if (argc < 3) { uart_puts("usage: wifi up <ssid> <pass>\n"); return 0; }
         if (wifi_join_run(argv[2], argc >= 4 ? argv[3] : "") == 0 && wifi_dhcp() == 0)
-            wifi_serve(60);
+            uart_puts("wifi up: connected; ARP/ICMP responder is now persistent.\n");
     } else if (str_eq(argv[1], "ping")) {          /* ping a host: wifi ping <ip> [count] */
         unsigned char ip[4] = {0,0,0,0}; int oct = 0, val = 0, cnt = 4; const char *p;
         if (argc < 3) { uart_puts("usage: wifi ping <a.b.c.d> [count]\n"); return 0; }
