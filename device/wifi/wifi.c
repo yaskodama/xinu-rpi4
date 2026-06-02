@@ -1689,3 +1689,100 @@ int wifi_http(const u8 *ip, const char *host)
     uart_puts("\r\n---- end ----\r\n");
     return wifi_http_len;
 }
+
+/* ================================================================== *
+ *  M8 — minimal DNS resolver (UDP/53 -> first A record)              *
+ * ================================================================== */
+/* Skip a DNS name at offset `o` in message `m` (len `mlen`); handles
+ * compression pointers (0xC0).  Returns the offset just past the name. */
+static int dns_skip_name(const u8 *m, int mlen, int o)
+{
+    while (o < mlen) {
+        u8 b = m[o];
+        if ((b & 0xC0) == 0xC0) return o + 2;   /* compression pointer ends the name */
+        if (b == 0) return o + 1;               /* root label */
+        o += 1 + b;                             /* label: len + bytes */
+    }
+    return mlen;
+}
+/* Resolve `host` to an IPv4 via the DHCP-provided DNS server (wifi_dns).
+ * Returns 0 + fills out[4] on success. */
+int wifi_resolve(const char *host, u8 *out)
+{
+    static u8 fr[2048], tx[400];
+    u8 nh[6], *msg; int i, chan, doff, w, qn, qlen, sport = 0xD0E5;
+    u16 id = 0x1234;
+    wifi_tn = 0;
+    wifi_log("[wifi] === DNS resolve %s via %d.%d.%d.%d ===\r\n",
+             host, wifi_dns[0],wifi_dns[1],wifi_dns[2],wifi_dns[3]);
+    if (!wifi_have_ip) { wifi_log("[wifi] dns: no IP yet\r\n"); return -1; }
+    if (wifi_dns[0]==0 && wifi_dns[1]==0) { wifi_log("[wifi] dns: no DNS server\r\n"); return -1; }
+    if (wifi_nexthop_mac(wifi_dns, nh) != 0) { wifi_log("[wifi] dns: next-hop ARP failed\r\n"); return -1; }
+
+    /* build the DNS query message into a scratch, then frame it */
+    { static u8 q[300]; const char *p;
+      q[0]=id>>8; q[1]=id; q[2]=0x01; q[3]=0x00;       /* RD=1 */
+      q[4]=0;q[5]=1; q[6]=0;q[7]=0; q[8]=0;q[9]=0; q[10]=0;q[11]=0;  /* qd=1 */
+      qn = 12;
+      for (p = host; *p; ) {
+          const char *s = p; int l = 0;
+          while (*p && *p != '.') { p++; l++; }
+          q[qn++] = (u8)l;
+          for (i = 0; i < l; i++) q[qn++] = s[i];
+          if (*p == '.') p++;
+      }
+      q[qn++] = 0; q[qn++]=0; q[qn++]=1; q[qn++]=0; q[qn++]=1;   /* QTYPE A, QCLASS IN */
+      qlen = qn;
+      /* eth + IP(20) + UDP(8) + DNS(qlen) */
+      { int udplen = 8 + qlen, iptot = 20 + udplen, framelen = 14 + iptot;
+        u8 *ip4 = tx + 14, *udp;
+        for (i=0;i<6;i++) tx[i] = nh[i];
+        for (i=0;i<6;i++) tx[6+i] = wifi_mac[i];
+        tx[12]=0x08; tx[13]=0x00;
+        for (i=0;i<20;i++) ip4[i]=0;
+        ip4[0]=0x45; ip4[2]=iptot>>8; ip4[3]=iptot&0xFF; ip4[5]=1; ip4[8]=64; ip4[9]=17;
+        for (i=0;i<4;i++) ip4[12+i]=wifi_ip[i];
+        for (i=0;i<4;i++) ip4[16+i]=wifi_dns[i];
+        { u16 c=ip_cksum(ip4,20,0); ip4[10]=c>>8; ip4[11]=c&0xFF; }
+        udp = ip4 + 20;
+        udp[0]=sport>>8; udp[1]=sport&0xFF; udp[2]=0; udp[3]=53;
+        udp[4]=udplen>>8; udp[5]=udplen&0xFF; udp[6]=0; udp[7]=0;
+        for (i=0;i<qlen;i++) udp[8+i] = q[i];
+        wifi_data_tx(tx, framelen); } }
+
+    for (w = 0; w < 300; w++) {
+        int n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+        if (n <= 0) { wifi_delay_us(5000); continue; }
+        if (chan != 2 || n < doff + 4) continue;
+        { int bdc = 4 + (fr[doff+3]<<2); u8 *e = fr+doff+bdc; int el = n-(doff+bdc);
+          if (el < 14+20+8+12 || e[12]!=0x08 || e[13]!=0x00) continue;
+          { u8 *ip4 = e+14; int ihl=(ip4[0]&0xF)*4; u8 *udp = ip4+ihl;
+            int dport = (udp[2]<<8)|udp[3];
+            if (ip4[9]!=17 || dport!=sport) continue;
+            if (!(ip4[12]==wifi_dns[0]&&ip4[13]==wifi_dns[1]&&ip4[14]==wifi_dns[2]&&ip4[15]==wifi_dns[3])) continue;
+            msg = udp + 8;
+            { int mlen = el - (int)(msg - e);
+              int an = (msg[6]<<8)|msg[7], o = 12, a;
+              o = dns_skip_name(msg, mlen, o) + 4;     /* question: name + qtype + qclass */
+              for (a = 0; a < an && o + 10 <= mlen; a++) {
+                  int type, rdl;
+                  o = dns_skip_name(msg, mlen, o);
+                  if (o + 10 > mlen) break;
+                  type = (msg[o]<<8)|msg[o+1];
+                  rdl  = (msg[o+8]<<8)|msg[o+9];
+                  o += 10;
+                  if (type == 1 && rdl == 4 && o + 4 <= mlen) {
+                      for (i = 0; i < 4; i++) out[i] = msg[o+i];
+                      wifi_log("[wifi] *** DNS %s -> %d.%d.%d.%d ***\r\n",
+                               host, out[0],out[1],out[2],out[3]);
+                      return 0;
+                  }
+                  o += rdl;
+              } }
+            wifi_log("[wifi] dns: reply had no A record\r\n");
+            return -1;
+          } }
+    }
+    wifi_log("[wifi] dns: no reply (timeout)\r\n");
+    return -1;
+}

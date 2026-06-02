@@ -690,7 +690,8 @@ static int cmd_wifi(int argc, char **argv)
     extern int wifi_ping(const unsigned char *ip, int count);
     extern unsigned long wifi_ntp(const unsigned char *srv);
     extern int wifi_http(const unsigned char *ip, const char *host);
-    if (argc < 2) { uart_puts("usage: wifi probe|scan|join|dhcp|serve|up|ping <ip>|ntp [ip]|http <ip> <host>\n"); return 0; }
+    extern int wifi_resolve(const char *host, unsigned char *out);
+    if (argc < 2) { uart_puts("usage: wifi probe|scan|join|dhcp|serve|up|ping <ip>|ntp [ip]|http <ip> <host>|resolve <host>|web <host>\n"); return 0; }
     if (str_eq(argv[1], "probe"))      wifi_probe();
     else if (str_eq(argv[1], "scan"))  wifi_scan_run();
     else if (str_eq(argv[1], "dhcp"))  wifi_dhcp();
@@ -733,7 +734,15 @@ static int cmd_wifi(int argc, char **argv)
             else { if (oct < 4) ip[oct] = (unsigned char)val; oct++; val = 0; if (!*p) break; }
         }
         wifi_http(ip, argv[3]);
-    } else uart_puts("wifi: unknown subcommand (probe|scan|join|dhcp|serve|up|ping|ntp|http)\n");
+    } else if (str_eq(argv[1], "resolve")) {       /* wifi resolve <host> */
+        unsigned char ip[4];
+        if (argc < 3) { uart_puts("usage: wifi resolve <host>\n"); return 0; }
+        wifi_resolve(argv[2], ip);
+    } else if (str_eq(argv[1], "web")) {            /* wifi web <host> = DNS + HTTP GET */
+        unsigned char ip[4];
+        if (argc < 3) { uart_puts("usage: wifi web <host>\n"); return 0; }
+        if (wifi_resolve(argv[2], ip) == 0) wifi_http(ip, argv[2]);
+    } else uart_puts("wifi: unknown subcommand (probe|scan|join|dhcp|serve|up|ping|ntp|http|resolve|web)\n");
     return 0;
 }
 
