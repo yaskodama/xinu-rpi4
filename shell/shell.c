@@ -691,7 +691,8 @@ static int cmd_wifi(int argc, char **argv)
     extern unsigned long wifi_ntp(const unsigned char *srv);
     extern int wifi_http(const unsigned char *ip, const char *host);
     extern int wifi_resolve(const char *host, unsigned char *out);
-    if (argc < 2) { uart_puts("usage: wifi probe|scan|join|dhcp|serve|up|ping <ip>|ntp [ip]|http <ip> <host>|resolve <host>|web <host>\n"); return 0; }
+    extern int wifi_tftp_get(const unsigned char *srv, const char *fname, unsigned char *dst, int maxlen);
+    if (argc < 2) { uart_puts("usage: wifi ...|resolve <host>|web <host>|tftp <ip> <file>\n"); return 0; }
     if (str_eq(argv[1], "probe"))      wifi_probe();
     else if (str_eq(argv[1], "scan"))  wifi_scan_run();
     else if (str_eq(argv[1], "dhcp"))  wifi_dhcp();
@@ -742,7 +743,22 @@ static int cmd_wifi(int argc, char **argv)
         unsigned char ip[4];
         if (argc < 3) { uart_puts("usage: wifi web <host>\n"); return 0; }
         if (wifi_resolve(argv[2], ip) == 0) wifi_http(ip, argv[2]);
-    } else uart_puts("wifi: unknown subcommand (probe|scan|join|dhcp|serve|up|ping|ntp|http|resolve|web)\n");
+    } else if (str_eq(argv[1], "tftp")) {          /* wifi tftp <ip> <file> -> RAM 0x4000000 */
+        unsigned char ip[4] = {0,0,0,0}; int oct = 0, val = 0; const char *p;
+        unsigned char *dst = (unsigned char *)0x4000000UL; int got;
+        if (argc < 4) { uart_puts("usage: wifi tftp <ip> <file>\n"); return 0; }
+        for (p = argv[2]; ; p++) {
+            if (*p >= '0' && *p <= '9') val = val*10 + (*p - '0');
+            else { if (oct < 4) ip[oct] = (unsigned char)val; oct++; val = 0; if (!*p) break; }
+        }
+        got = wifi_tftp_get(ip, argv[3], dst, 8*1024*1024);
+        if (got > 0) {
+            int i;
+            uart_puts("tftp: first 16 bytes: ");
+            for (i = 0; i < 16 && i < got; i++) { puts_hex(dst[i]); uart_putc(' '); }
+            uart_puts("\n");
+        }
+    } else uart_puts("wifi: unknown subcommand (...|resolve|web|tftp)\n");
     return 0;
 }
 

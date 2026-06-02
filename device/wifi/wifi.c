@@ -1810,3 +1810,96 @@ int wifi_resolve(const char *host, u8 *out)
     wifi_log("[wifi] dns: no reply (timeout)\r\n");
     return -1;
 }
+
+/* ================================================================== *
+ *  M11 — TFTP client over WiFi (netboot transport)                  *
+ * ================================================================== */
+/* Send a UDP datagram (payload p[plen]) over WiFi to dip:dport from sport. */
+static void wifi_udp_tx(const u8 *nh, const u8 *dip, int sport, int dport, const u8 *p, int plen)
+{
+    static u8 tx[1600];
+    int i, udplen = 8 + plen, iptot = 20 + udplen, framelen = 14 + iptot;
+    u8 *ip4 = tx + 14, *udp;
+    if (framelen > (int)sizeof(tx)) return;
+    for (i=0;i<6;i++) tx[i]=nh[i];
+    for (i=0;i<6;i++) tx[6+i]=wifi_mac[i];
+    tx[12]=0x08; tx[13]=0x00;
+    for (i=0;i<20;i++) ip4[i]=0;
+    ip4[0]=0x45; ip4[2]=iptot>>8; ip4[3]=iptot&0xFF; ip4[5]=1; ip4[8]=64; ip4[9]=17;
+    for (i=0;i<4;i++) ip4[12+i]=wifi_ip[i];
+    for (i=0;i<4;i++) ip4[16+i]=dip[i];
+    { u16 c=ip_cksum(ip4,20,0); ip4[10]=c>>8; ip4[11]=c&0xFF; }
+    udp = ip4+20;
+    udp[0]=sport>>8; udp[1]=sport&0xFF; udp[2]=dport>>8; udp[3]=dport&0xFF;
+    udp[4]=udplen>>8; udp[5]=udplen&0xFF; udp[6]=0; udp[7]=0;   /* csum 0 (optional v4) */
+    for (i=0;i<plen;i++) udp[8+i]=p[i];
+    wifi_data_tx(tx, framelen);
+}
+/* TFTP RRQ (octet) over WiFi: fetch `fname` from srv into dst[maxlen].
+ * Returns total bytes on success, -1 on error/timeout. */
+int wifi_tftp_get(const u8 *srv, const char *fname, u8 *dst, int maxlen)
+{
+    static u8 fr[2048], pkt[600];
+    u8 nh[6];
+    int i, chan, doff, w, total = 0, sport = 0xB100, srv_tid = 0, nextblk = 1, finished = 0;
+    wifi_tn = 0;
+    wifi_log("[wifi] === TFTP get '%s' from %d.%d.%d.%d ===\r\n", fname, srv[0],srv[1],srv[2],srv[3]);
+    if (!wifi_have_ip) { wifi_log("[wifi] tftp: no IP yet\r\n"); return -1; }
+    if (wifi_nexthop_mac(srv, nh) != 0) { wifi_log("[wifi] tftp: next-hop ARP failed\r\n"); return -1; }
+    /* RRQ: opcode 1, filename\0, "octet"\0 */
+    { int n = 0; const char *p;
+      pkt[n++]=0; pkt[n++]=1;
+      for (p=fname; *p; p++) pkt[n++]=*p; pkt[n++]=0;
+      for (p="octet"; *p; p++) pkt[n++]=*p; pkt[n++]=0;
+      wifi_udp_tx(nh, srv, sport, 69, pkt, n); }
+
+    for (w = 0; w < 8000 && !finished; w++) {
+        int n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+        if (n <= 0) {
+            wifi_delay_us(3000);
+            if ((w % 200) == 199) {                      /* retransmit */
+                if (nextblk == 1) {                      /* re-RRQ */
+                    int m = 0; const char *p;
+                    pkt[m++]=0; pkt[m++]=1;
+                    for (p=fname; *p; p++) pkt[m++]=*p; pkt[m++]=0;
+                    for (p="octet"; *p; p++) pkt[m++]=*p; pkt[m++]=0;
+                    wifi_udp_tx(nh, srv, sport, 69, pkt, m);
+                } else if (srv_tid) {                     /* re-ACK last block */
+                    u8 a[4]; a[0]=0; a[1]=4; a[2]=(nextblk-1)>>8; a[3]=(nextblk-1);
+                    wifi_udp_tx(nh, srv, sport, srv_tid, a, 4);
+                }
+            }
+            continue;
+        }
+        if (chan != 2 || n < doff + 4) continue;
+        { int bdc = 4 + (fr[doff+3]<<2); u8 *e = fr+doff+bdc; int el = n-(doff+bdc);
+          if (el < 14+20+8 || e[12]!=0x08 || e[13]!=0x00) continue;
+          { u8 *ip4 = e+14; int ihl=(ip4[0]&0xF)*4; u8 *udp = ip4+ihl;
+            int dport = (udp[2]<<8)|udp[3], ssport = (udp[0]<<8)|udp[1];
+            u8 *tf; int op, blk, tlen, dlen;
+            if (ip4[9]!=17 || dport!=sport) continue;
+            if (!(ip4[12]==srv[0]&&ip4[13]==srv[1]&&ip4[14]==srv[2]&&ip4[15]==srv[3])) continue;
+            tf = udp + 8; tlen = ((udp[4]<<8)|udp[5]) - 8;
+            if (tlen < 4) continue;
+            op = (tf[0]<<8)|tf[1];
+            if (op == 5) { wifi_log("[wifi] tftp: server ERROR code=%d\r\n", (tf[2]<<8)|tf[3]); return -1; }
+            if (op != 3) continue;                        /* want DATA */
+            blk = (tf[2]<<8)|tf[3];
+            dlen = tlen - 4;
+            if (blk == nextblk) {
+                srv_tid = ssport;
+                for (i = 0; i < dlen && total < maxlen; i++) dst[total++] = tf[4+i];
+                { u8 a[4]; a[0]=0; a[1]=4; a[2]=blk>>8; a[3]=blk; wifi_udp_tx(nh, srv, sport, srv_tid, a, 4); }
+                if ((nextblk & 127) == 0) wifi_log("[wifi] tftp: blk %d (%d B)\r\n", nextblk, total);
+                nextblk++;
+                if (dlen < 512) finished = 1;             /* last block */
+                w = 0;                                    /* reset idle window on progress */
+            } else if (srv_tid) {                         /* dup/reorder: re-ACK last */
+                u8 a[4]; a[0]=0; a[1]=4; a[2]=(nextblk-1)>>8; a[3]=(nextblk-1);
+                wifi_udp_tx(nh, srv, sport, srv_tid, a, 4);
+            }
+          } }
+    }
+    wifi_log("[wifi] *** TFTP '%s': %d bytes (%s) ***\r\n", fname, total, finished ? "complete" : "timeout");
+    return finished ? total : -1;
+}
