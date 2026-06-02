@@ -689,7 +689,8 @@ static int cmd_wifi(int argc, char **argv)
     extern int wifi_serve(int secs);
     extern int wifi_ping(const unsigned char *ip, int count);
     extern unsigned long wifi_ntp(const unsigned char *srv);
-    if (argc < 2) { uart_puts("usage: wifi probe|scan|join <ssid> <pass>|dhcp|serve [s]|up <ssid> <pass>|ping <ip> [n]|ntp [ip]\n"); return 0; }
+    extern int wifi_http(const unsigned char *ip, const char *host);
+    if (argc < 2) { uart_puts("usage: wifi probe|scan|join|dhcp|serve|up|ping <ip>|ntp [ip]|http <ip> <host>\n"); return 0; }
     if (str_eq(argv[1], "probe"))      wifi_probe();
     else if (str_eq(argv[1], "scan"))  wifi_scan_run();
     else if (str_eq(argv[1], "dhcp"))  wifi_dhcp();
@@ -724,7 +725,15 @@ static int cmd_wifi(int argc, char **argv)
             }
         }
         wifi_ntp(srv);
-    } else uart_puts("wifi: unknown subcommand (probe|scan|join|dhcp|serve|up|ping|ntp)\n");
+    } else if (str_eq(argv[1], "http")) {          /* wifi http <a.b.c.d> <host> */
+        unsigned char ip[4] = {0,0,0,0}; int oct = 0, val = 0; const char *p;
+        if (argc < 4) { uart_puts("usage: wifi http <ip> <host>\n"); return 0; }
+        for (p = argv[2]; ; p++) {
+            if (*p >= '0' && *p <= '9') val = val*10 + (*p - '0');
+            else { if (oct < 4) ip[oct] = (unsigned char)val; oct++; val = 0; if (!*p) break; }
+        }
+        wifi_http(ip, argv[3]);
+    } else uart_puts("wifi: unknown subcommand (probe|scan|join|dhcp|serve|up|ping|ntp|http)\n");
     return 0;
 }
 

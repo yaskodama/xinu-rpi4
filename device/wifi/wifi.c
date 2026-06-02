@@ -1568,3 +1568,124 @@ unsigned long wifi_ntp(const u8 *srv)
     } else wifi_log("[wifi] ntp: no reply (timeout)\r\n");
     return secs;
 }
+
+/* ================================================================== *
+ *  M7 — minimal TCP + HTTP/1.0 client over WiFi (plaintext fetch)    *
+ * ================================================================== */
+static char wifi_http_buf[12288];
+static int  wifi_http_len = 0;
+int wifi_http_get_buf(char **p) { *p = wifi_http_buf; return wifi_http_len; }
+
+/* Send one TCP segment (eth+IP+TCP[+data]) to dip via next-hop nh. */
+static void wifi_tcp_send(const u8 *nh, const u8 *dip, int sport, int dport,
+                          u32 seq, u32 ack, int flags, const u8 *data, int dlen)
+{
+    static u8 tx[700];
+    int i, tcplen = 20 + dlen, iptot = 20 + tcplen, framelen = 14 + iptot;
+    u8 *ip4, *tcp; u32 psum; u16 c;
+    if (framelen > (int)sizeof(tx)) return;
+    for (i = 0; i < 6; i++) tx[i] = nh[i];
+    for (i = 0; i < 6; i++) tx[6 + i] = wifi_mac[i];
+    tx[12] = 0x08; tx[13] = 0x00;
+    ip4 = tx + 14;
+    for (i = 0; i < 20; i++) ip4[i] = 0;
+    ip4[0]=0x45; ip4[2]=iptot>>8; ip4[3]=iptot&0xFF; ip4[5]=1; ip4[8]=64; ip4[9]=6;
+    for (i = 0; i < 4; i++) ip4[12+i] = wifi_ip[i];
+    for (i = 0; i < 4; i++) ip4[16+i] = dip[i];
+    c = ip_cksum(ip4, 20, 0); ip4[10]=c>>8; ip4[11]=c&0xFF;
+    tcp = ip4 + 20;
+    for (i = 0; i < 20; i++) tcp[i] = 0;
+    tcp[0]=sport>>8; tcp[1]=sport&0xFF; tcp[2]=dport>>8; tcp[3]=dport&0xFF;
+    tcp[4]=seq>>24; tcp[5]=seq>>16; tcp[6]=seq>>8; tcp[7]=seq;
+    tcp[8]=ack>>24; tcp[9]=ack>>16; tcp[10]=ack>>8; tcp[11]=ack;
+    tcp[12]=5<<4; tcp[13]=flags; tcp[14]=0x20; tcp[15]=0x00;
+    for (i = 0; i < dlen; i++) tcp[20+i] = data[i];
+    psum = ((u32)wifi_ip[0]<<8|wifi_ip[1]) + ((u32)wifi_ip[2]<<8|wifi_ip[3])
+         + ((u32)dip[0]<<8|dip[1]) + ((u32)dip[2]<<8|dip[3]) + 6 + tcplen;
+    c = ip_cksum(tcp, tcplen, psum); tcp[16]=c>>8; tcp[17]=c&0xFF;
+    wifi_data_tx(tx, framelen);
+}
+
+/* HTTP/1.0 GET http://<host>/ at ip:80.  Response (capped) -> wifi_http_buf,
+ * mirrored to the serial console. */
+int wifi_http(const u8 *ip, const char *host)
+{
+    static u8 fr[2048];
+    static char req[256];
+    u8 nh[6];
+    u32 iss = 0x015A0000, our_seq, our_ack = 0, their_seq;
+    int chan, doff, w, sport = 0xC0DE, reqn, got_synack = 0, fin = 0, idle = 0, i;
+    wifi_http_len = 0; wifi_tn = 0;
+    wifi_log("[wifi] === HTTP GET http://%s/ (%d.%d.%d.%d:80) ===\r\n", host, ip[0],ip[1],ip[2],ip[3]);
+    if (!wifi_have_ip) { wifi_log("[wifi] http: no IP yet\r\n"); return -1; }
+    if (wifi_nexthop_mac(ip, nh) != 0) { wifi_log("[wifi] http: next-hop ARP failed\r\n"); return -1; }
+
+    wifi_tcp_send(nh, ip, sport, 80, iss, 0, 0x02, 0, 0);          /* SYN */
+    for (w = 0; w < 600 && !got_synack; w++) {
+        int n;
+        if (w && (w % 60) == 0) wifi_tcp_send(nh, ip, sport, 80, iss, 0, 0x02, 0, 0); /* retransmit SYN (WiFi loss) */
+        n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+        if (n <= 0) { wifi_delay_us(5000); continue; }
+        if (chan != 2 || n < doff + 4) continue;
+        { int bdc = 4 + (fr[doff+3]<<2); u8 *e = fr+doff+bdc; int el = n-(doff+bdc);
+          if (el >= 14+20+20 && e[12]==0x08 && e[13]==0x00) {
+            u8 *ip4 = e+14; int ihl=(ip4[0]&0xF)*4; u8 *tcp = ip4+ihl;
+            int dport = (tcp[2]<<8)|tcp[3];
+            if (ip4[9]==6 && dport==sport && (tcp[13] & 0x12)==0x12) {
+                their_seq = ((u32)tcp[4]<<24)|((u32)tcp[5]<<16)|((u32)tcp[6]<<8)|tcp[7];
+                got_synack = 1;
+            }
+          } }
+    }
+    if (!got_synack) { wifi_log("[wifi] http: no SYN-ACK (timeout)\r\n"); return -1; }
+    our_seq = iss + 1; our_ack = their_seq + 1;
+    wifi_tcp_send(nh, ip, sport, 80, our_seq, our_ack, 0x10, 0, 0);  /* ACK */
+    wifi_log("[wifi] http: connected, sending GET\r\n");
+
+    { const char *a = "GET / HTTP/1.0\r\nHost: "; const char *t = "\r\nConnection: close\r\n\r\n"; const char *p;
+      reqn = 0;
+      for (p = a; *p; p++) req[reqn++] = *p;
+      for (p = host; *p; p++) req[reqn++] = *p;
+      for (p = t; *p; p++) req[reqn++] = *p; }
+    wifi_tcp_send(nh, ip, sport, 80, our_seq, our_ack, 0x18, (u8*)req, reqn);  /* PSH|ACK */
+    our_seq += reqn;
+
+    for (w = 0; w < 2000 && !fin; w++) {
+        int n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+        if (n <= 0) { wifi_delay_us(3000); if (++idle > 400) break; continue; }
+        idle = 0;
+        if (chan != 2 || n < doff + 4) continue;
+        { int bdc = 4 + (fr[doff+3]<<2); u8 *e = fr+doff+bdc; int el = n-(doff+bdc);
+          if (el < 14+20+20 || e[12]!=0x08 || e[13]!=0x00) continue;
+          { u8 *ip4 = e+14; int ihl=(ip4[0]&0xF)*4;
+            int iptot = (ip4[2]<<8)|ip4[3];
+            u8 *tcp = ip4+ihl; int thl = (tcp[12]>>4)*4;
+            int dport = (tcp[2]<<8)|tcp[3]; u32 sseq; int dlen;
+            if (ip4[9]!=6 || dport!=sport) continue;
+            sseq = ((u32)tcp[4]<<24)|((u32)tcp[5]<<16)|((u32)tcp[6]<<8)|tcp[7];
+            dlen = iptot - ihl - thl; if (dlen < 0) dlen = 0;
+            if (dlen > 0 && sseq == our_ack) {
+                u8 *payload = tcp + thl; int k;
+                for (k = 0; k < dlen && wifi_http_len < (int)sizeof(wifi_http_buf)-1; k++)
+                    wifi_http_buf[wifi_http_len++] = payload[k];
+                our_ack += dlen;
+                wifi_tcp_send(nh, ip, sport, 80, our_seq, our_ack, 0x10, 0, 0);
+            } else if (dlen > 0) {
+                wifi_tcp_send(nh, ip, sport, 80, our_seq, our_ack, 0x10, 0, 0);
+            }
+            if (tcp[13] & 0x01) {
+                our_ack += 1;
+                wifi_tcp_send(nh, ip, sport, 80, our_seq, our_ack, 0x11, 0, 0);  /* FIN|ACK */
+                fin = 1;
+            }
+            if (wifi_http_len >= (int)sizeof(wifi_http_buf)-1) break;
+          } }
+    }
+    wifi_http_buf[wifi_http_len] = '\0';
+    wifi_log("[wifi] *** HTTP got %d bytes from %s (fin=%d) ***\r\n", wifi_http_len, host, fin);
+    /* mirror the page to serial */
+    uart_puts("\r\n---- http://"); uart_puts(host); uart_puts("/ ----\r\n");
+    for (i = 0; i < wifi_http_len; i++) uart_putc(wifi_http_buf[i]);
+    uart_puts("\r\n---- end ----\r\n");
+    return wifi_http_len;
+}
