@@ -1413,3 +1413,93 @@ int wifi_serve(int secs)
     wifi_log("[wifi] serve: window ended\r\n");
     return 0;
 }
+
+/* ================================================================== *
+ *  M5 — ping CLIENT (ARP resolve + next-hop routing + ICMP echo)     *
+ * ================================================================== */
+/* Resolve an IP to a MAC via ARP (single-threaded: we own the RX FIFO). */
+static int wifi_arp_resolve(const u8 *ip, u8 *mac)
+{
+    static u8 fr[2048], tx[42];
+    int i, chan, doff, tries, w;
+    for (tries = 0; tries < 12; tries++) {
+        for (i = 0; i < 6; i++) tx[i] = 0xFF;
+        for (i = 0; i < 6; i++) tx[6 + i] = wifi_mac[i];
+        tx[12] = 0x08; tx[13] = 0x06;
+        { u8 *a = tx + 14;
+          a[0]=0;a[1]=1;a[2]=0x08;a[3]=0;a[4]=6;a[5]=4;a[6]=0;a[7]=1;
+          for (i=0;i<6;i++) a[8+i]  = wifi_mac[i];
+          for (i=0;i<4;i++) a[14+i] = wifi_ip[i];
+          for (i=0;i<6;i++) a[18+i] = 0;
+          for (i=0;i<4;i++) a[24+i] = ip[i]; }
+        wifi_data_tx(tx, 42);
+        for (w = 0; w < 40; w++) {
+            int n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+            if (n <= 0) { wifi_delay_us(5000); continue; }
+            if (chan != 2 || n < doff + 4) continue;
+            { int bdc = 4 + (fr[doff+3]<<2); u8 *e = fr+doff+bdc; int el = n-(doff+bdc);
+              if (el >= 42 && e[12]==0x08 && e[13]==0x06) {
+                u8 *a = e + 14; int op = (a[6]<<8)|a[7];
+                if (op == 2 && a[14]==ip[0]&&a[15]==ip[1]&&a[16]==ip[2]&&a[17]==ip[3]) {
+                    for (i=0;i<6;i++) mac[i] = a[8+i];
+                    return 0;
+                }
+              } }
+        }
+    }
+    return -1;
+}
+/* On-subnet -> ARP the host; off-subnet -> ARP the default gateway. */
+static int wifi_nexthop_mac(const u8 *dst, u8 *mac)
+{
+    int i, onsub = 1;
+    for (i = 0; i < 4; i++)
+        if ((dst[i] & wifi_mask[i]) != (wifi_ip[i] & wifi_mask[i])) onsub = 0;
+    return wifi_arp_resolve(onsub ? dst : wifi_gw, mac);
+}
+/* ICMP echo client: ping `ip` `count` times.  Returns # replies. */
+int wifi_ping(const u8 *ip, int count)
+{
+    static u8 fr[2048], tx[128];
+    u8 nh[6];
+    int i, chan, doff, seq, w, replies = 0, paylen = 32; u16 c;
+    wifi_tn = 0;
+    wifi_log("[wifi] === PING %d.%d.%d.%d (%d) ===\r\n", ip[0],ip[1],ip[2],ip[3], count);
+    if (!wifi_have_ip) { wifi_log("[wifi] ping: no IP yet\r\n"); return -1; }
+    if (wifi_nexthop_mac(ip, nh) != 0) { wifi_log("[wifi] ping: ARP/next-hop failed\r\n"); return -1; }
+    wifi_log("[wifi] ping: next-hop %02x:%02x:%02x:%02x:%02x:%02x\r\n", nh[0],nh[1],nh[2],nh[3],nh[4],nh[5]);
+    for (seq = 0; seq < count; seq++) {
+        int icmplen = 8 + paylen, iptot = 20 + icmplen, framelen = 14 + iptot, rcvd = 0;
+        for (i=0;i<6;i++) tx[i] = nh[i];
+        for (i=0;i<6;i++) tx[6+i] = wifi_mac[i];
+        tx[12]=0x08; tx[13]=0x00;
+        { u8 *ip4 = tx + 14, *ic;
+          for (i=0;i<20;i++) ip4[i]=0;
+          ip4[0]=0x45; ip4[2]=iptot>>8; ip4[3]=iptot&0xFF; ip4[5]=seq+1; ip4[8]=64; ip4[9]=1;
+          for (i=0;i<4;i++) ip4[12+i]=wifi_ip[i];
+          for (i=0;i<4;i++) ip4[16+i]=ip[i];
+          c=ip_cksum(ip4,20,0); ip4[10]=c>>8; ip4[11]=c&0xFF;
+          ic = ip4 + 20;
+          for (i=0;i<icmplen;i++) ic[i]=0;
+          ic[0]=8; ic[4]=0xBE; ic[5]=0xEF; ic[6]=seq>>8; ic[7]=seq&0xFF;
+          for (i=0;i<paylen;i++) ic[8+i]=(u8)(0x61+(i%26));
+          c=ip_cksum(ic,icmplen,0); ic[2]=c>>8; ic[3]=c&0xFF; }
+        wifi_data_tx(tx, framelen);
+        for (w = 0; w < 60 && !rcvd; w++) {
+            int n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+            if (n <= 0) { wifi_delay_us(5000); continue; }
+            if (chan != 2 || n < doff + 4) continue;
+            { int bdc = 4 + (fr[doff+3]<<2); u8 *e = fr+doff+bdc; int el = n-(doff+bdc);
+              if (el >= 14+20+8 && e[12]==0x08 && e[13]==0x00) {
+                u8 *ip4 = e+14; int ihl = (ip4[0]&0xF)*4; u8 *ic = ip4+ihl;
+                if (ip4[9]==1 && ip4[12]==ip[0]&&ip4[13]==ip[1]&&ip4[14]==ip[2]&&ip4[15]==ip[3]
+                    && ic[0]==0 && (((ic[6]<<8)|ic[7])==seq)) rcvd = 1;
+              } }
+        }
+        if (rcvd) { replies++; wifi_log("[wifi] ping: reply seq=%d\r\n", seq); }
+        else        wifi_log("[wifi] ping: timeout seq=%d\r\n", seq);
+        wifi_delay_us(300000);
+    }
+    wifi_log("[wifi] *** ping %d.%d.%d.%d: %d/%d replies ***\r\n", ip[0],ip[1],ip[2],ip[3], replies, count);
+    return replies;
+}
