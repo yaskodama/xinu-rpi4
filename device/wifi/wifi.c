@@ -1503,3 +1503,68 @@ int wifi_ping(const u8 *ip, int count)
     wifi_log("[wifi] *** ping %d.%d.%d.%d: %d/%d replies ***\r\n", ip[0],ip[1],ip[2],ip[3], replies, count);
     return replies;
 }
+
+/* ================================================================== *
+ *  M6 — NTP client (UDP/123 via gateway) -> Unix time + JST date     *
+ * ================================================================== */
+/* Query NTP server `srv` (off-subnet -> routed via gw); returns Unix secs. */
+unsigned long wifi_ntp(const u8 *srv)
+{
+    static u8 fr[2048], tx[90];
+    u8 nh[6]; int i, chan, doff, w; u16 c;
+    unsigned long secs = 0;
+    wifi_tn = 0;
+    wifi_log("[wifi] === NTP %d.%d.%d.%d ===\r\n", srv[0],srv[1],srv[2],srv[3]);
+    if (!wifi_have_ip) { wifi_log("[wifi] ntp: no IP yet\r\n"); return 0; }
+    if (wifi_nexthop_mac(srv, nh) != 0) { wifi_log("[wifi] ntp: next-hop ARP failed\r\n"); return 0; }
+    { int udplen = 8 + 48, iptot = 20 + udplen, framelen = 14 + iptot;
+      u8 *ip4 = tx + 14, *udp, *ntp;
+      for (i=0;i<6;i++) tx[i] = nh[i];
+      for (i=0;i<6;i++) tx[6+i] = wifi_mac[i];
+      tx[12]=0x08; tx[13]=0x00;
+      for (i=0;i<framelen-14;i++) ip4[i]=0;
+      ip4[0]=0x45; ip4[2]=iptot>>8; ip4[3]=iptot&0xFF; ip4[5]=1; ip4[8]=64; ip4[9]=17;
+      for (i=0;i<4;i++) ip4[12+i]=wifi_ip[i];
+      for (i=0;i<4;i++) ip4[16+i]=srv[i];
+      c=ip_cksum(ip4,20,0); ip4[10]=c>>8; ip4[11]=c&0xFF;
+      udp = ip4 + 20;
+      udp[0]=0x00; udp[1]=0x7b; udp[2]=0x00; udp[3]=0x7b;
+      udp[4]=udplen>>8; udp[5]=udplen&0xFF; udp[6]=0; udp[7]=0;
+      ntp = udp + 8;
+      ntp[0] = 0x1b;                     /* LI=0 VN=3 Mode=3 (client) */
+      wifi_data_tx(tx, framelen); }
+    for (w = 0; w < 120; w++) {
+        int n = wifi_read_frame(fr, sizeof(fr), &chan, &doff);
+        if (n <= 0) { wifi_delay_us(5000); continue; }
+        if (chan != 2 || n < doff + 4) continue;
+        { int bdc = 4 + (fr[doff+3]<<2); u8 *e = fr+doff+bdc; int el = n-(doff+bdc);
+          if (el >= 14+20+8+48 && e[12]==0x08 && e[13]==0x00) {
+            u8 *ip4 = e+14; int ihl = (ip4[0]&0xF)*4; u8 *udp = ip4+ihl, *ntp = udp+8;
+            if (ip4[9]==17 && udp[2]==0x00 && udp[3]==0x7b
+                && ip4[12]==srv[0]&&ip4[13]==srv[1]&&ip4[14]==srv[2]&&ip4[15]==srv[3]) {
+                unsigned long ntp_secs = ((unsigned long)ntp[40]<<24)|((unsigned long)ntp[41]<<16)
+                                       | ((unsigned long)ntp[42]<<8)|ntp[43];
+                secs = ntp_secs - 2208988800UL;   /* 1900 -> 1970 epoch */
+                break;
+            }
+          } }
+    }
+    if (secs) {
+        /* civil JST (UTC+9) date via Howard Hinnant's algorithm */
+        unsigned long jst = secs + 9UL*3600;
+        long z = (long)(jst / 86400) + 719468;
+        long era = (z >= 0 ? z : z - 146096) / 146097;
+        unsigned doe = (unsigned)(z - era*146097);
+        unsigned yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+        long yy = (long)yoe + era*400;
+        unsigned doy = doe - (365*yoe + yoe/4 - yoe/100);
+        unsigned mp = (5*doy + 2)/153;
+        unsigned dd = doy - (153*mp+2)/5 + 1;
+        unsigned mm = mp < 10 ? mp+3 : mp-9;
+        int Y = (int)(yy + (mm <= 2)), tod = (int)(jst % 86400);
+        /* wifi_log is 32-bit only -> cast (unix secs fit in u32 until 2106). */
+        wifi_log("[wifi] *** NTP unix=%u  JST=%04d-%02u-%02u %02d:%02d:%02d ***\r\n",
+                 (u32)secs, Y, mm, dd, tod/3600, (tod%3600)/60, tod%60);
+    } else wifi_log("[wifi] ntp: no reply (timeout)\r\n");
+    return secs;
+}

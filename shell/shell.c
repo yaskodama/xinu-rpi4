@@ -688,7 +688,8 @@ static int cmd_wifi(int argc, char **argv)
     extern int wifi_dhcp(void);
     extern int wifi_serve(int secs);
     extern int wifi_ping(const unsigned char *ip, int count);
-    if (argc < 2) { uart_puts("usage: wifi probe|scan|join <ssid> <pass>|dhcp|serve [s]|up <ssid> <pass>|ping <ip> [n]\n"); return 0; }
+    extern unsigned long wifi_ntp(const unsigned char *srv);
+    if (argc < 2) { uart_puts("usage: wifi probe|scan|join <ssid> <pass>|dhcp|serve [s]|up <ssid> <pass>|ping <ip> [n]|ntp [ip]\n"); return 0; }
     if (str_eq(argv[1], "probe"))      wifi_probe();
     else if (str_eq(argv[1], "scan"))  wifi_scan_run();
     else if (str_eq(argv[1], "dhcp"))  wifi_dhcp();
@@ -713,7 +714,17 @@ static int cmd_wifi(int argc, char **argv)
         }
         if (argc >= 4) { cnt = 0; for (p = argv[3]; *p>='0'&&*p<='9'; p++) cnt = cnt*10 + (*p-'0'); }
         wifi_ping(ip, cnt);
-    } else uart_puts("wifi: unknown subcommand (probe|scan|join|dhcp|serve|up|ping)\n");
+    } else if (str_eq(argv[1], "ntp")) {           /* wifi ntp [a.b.c.d] (default NICT) */
+        unsigned char srv[4] = {162,159,200,1};     /* time.cloudflare.com (NICT/gw無応答) */
+        if (argc >= 3) {
+            int oct = 0, val = 0; const char *p;
+            for (p = argv[2]; ; p++) {
+                if (*p >= '0' && *p <= '9') val = val*10 + (*p - '0');
+                else { if (oct < 4) srv[oct] = (unsigned char)val; oct++; val = 0; if (!*p) break; }
+            }
+        }
+        wifi_ntp(srv);
+    } else uart_puts("wifi: unknown subcommand (probe|scan|join|dhcp|serve|up|ping|ntp)\n");
     return 0;
 }
 
