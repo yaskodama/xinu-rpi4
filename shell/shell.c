@@ -694,7 +694,8 @@ static int cmd_wifi(int argc, char **argv)
     extern int wifi_tftp_get(const unsigned char *srv, const char *fname, unsigned char *dst, int maxlen);
     extern int wifi_netboot(const unsigned char *srv, const char *fname);
     extern int wifi_adhoc(const char *ssid, int channel, int n);
-    if (argc < 2) { uart_puts("usage: wifi ...|netboot <ip> <file>|adhoc <ssid> <ch> <n>\n"); return 0; }
+    extern int wifi_aodv(const unsigned char *dst);
+    if (argc < 2) { uart_puts("usage: wifi ...|adhoc <ssid> <ch> <n>|aodv <ip>\n"); return 0; }
     if (str_eq(argv[1], "probe"))      wifi_probe();
     else if (str_eq(argv[1], "scan"))  wifi_scan_run();
     else if (str_eq(argv[1], "dhcp"))  wifi_dhcp();
@@ -774,7 +775,15 @@ static int cmd_wifi(int argc, char **argv)
         if (argc >= 4) { ch = 0; for (p = argv[3]; *p>='0'&&*p<='9'; p++) ch = ch*10 + (*p-'0'); }
         if (argc >= 5) { node = 0; for (p = argv[4]; *p>='0'&&*p<='9'; p++) node = node*10 + (*p-'0'); }
         wifi_adhoc(argv[2], ch, node);
-    } else uart_puts("wifi: unknown subcommand (...|netboot|adhoc)\n");
+    } else if (str_eq(argv[1], "aodv")) {          /* wifi aodv <a.b.c.d> — discover route */
+        unsigned char ip[4] = {0,0,0,0}; int oct = 0, val = 0; const char *p;
+        if (argc < 3) { uart_puts("usage: wifi aodv <ip>\n"); return 0; }
+        for (p = argv[2]; ; p++) {
+            if (*p >= '0' && *p <= '9') val = val*10 + (*p - '0');
+            else { if (oct < 4) ip[oct] = (unsigned char)val; oct++; val = 0; if (!*p) break; }
+        }
+        wifi_aodv(ip);
+    } else uart_puts("wifi: unknown subcommand (...|adhoc|aodv)\n");
     return 0;
 }
 
