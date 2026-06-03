@@ -189,6 +189,8 @@ const char *wifi_trace(void) { return wifi_tbuf; }
 #define WLC_DOWN        3
 #define WLC_SET_INFRA   20
 #define WLC_GET_BSSID   23
+#define WLC_SET_SSID    26
+#define WLC_SET_CHANNEL 30
 #define WLC_SET_WSEC_PMK 268
 #define SDIO_CCCR_INT_ENABLE 0x04
 
@@ -1938,4 +1940,64 @@ int wifi_netboot(const u8 *srv, const char *fname)
     wifi_cache_flush((unsigned long)safe, (unsigned long)stublen, 1);/* stub: I-coherent */
     ((chain_fn)safe)((unsigned long)stage, 0x80000UL, (unsigned long)got);
     return 0;   /* unreachable */
+}
+
+/* ================================================================== *
+ *  M12 — MANET ad-hoc (IBSS) mode: peer-to-peer, no AP, static IP    *
+ * ================================================================== */
+/* Create/join an IBSS cell `ssid` on 2.4GHz `channel`, assign static IP
+ * 10.0.0.<n>/24.  All nodes use a FIXED cell BSSID so they share one cell
+ * immediately (deterministic for MANET).  After this the existing data
+ * path (responder/ping/udp) works peer-to-peer with no AP/DHCP. */
+int wifi_adhoc(const char *ssid, int channel, int n)
+{
+    static u8 jp[64];
+    int sl = 0, i; u16 chanspec; u8 bss[6];
+    while (ssid[sl] && sl < 32) sl++;
+    wifi_tn = 0;
+    wifi_log("[wifi] === ADHOC/IBSS \"%s\" ch=%d ip=10.0.0.%d ===\r\n", ssid, channel, n);
+    if (!wifi_ready) { if (wifi_bringup() != 0) { wifi_log("[wifi] adhoc: bringup failed\r\n"); return -1; } }
+    wifi_radio_up();
+    wifi_cmd_int(WLC_DOWN, 1);
+    wifi_set_iovar_int("wsec", 0);          /* open cell (no crypto) */
+    wifi_set_iovar_int("wpa_auth", 0);
+    wifi_set_iovar_int("auth", 0);
+    wifi_cmd_int(WLC_SET_INFRA, 0);         /* ★ IBSS (ad-hoc) mode */
+    wifi_cmd_int(2, 1);                     /* WLC_UP */
+    wifi_delay_us(100000);
+    wifi_cmd_int(WLC_SET_CHANNEL, (u32)channel);  /* set home channel (avoids chanspec encoding) */
+    (void)chanspec;
+    /* brcmf_join_params: ssid_le[36] + assoc{bssid[6]@36, chanspec_num@44=0} */
+    for (i = 0; i < (int)sizeof(jp); i++) jp[i] = 0;
+    jp[0] = sl; for (i = 0; i < sl; i++) jp[4+i] = ssid[i];
+    jp[36]=0x02; jp[37]=0x4d; jp[38]=0x41; jp[39]=0x4e; jp[40]=0x45; jp[41]=0x54; /* 02:4d:41:4e:45:54 "MANET" */
+    jp[44]=0; jp[45]=0; jp[46]=0; jp[47]=0;  /* chanspec_num = 0 (channel set via SET_CHANNEL) */
+    if (wifi_wlcmd(1, WLC_SET_SSID, jp, 48, 0, 0) != 0) { wifi_log("[wifi] adhoc: SET_SSID failed\r\n"); return -1; }
+    wifi_delay_us(400000);
+    /* static IP (no DHCP in ad-hoc); enables responder + ping/udp */
+    wifi_get_iovar("cur_etheraddr", wifi_mac, 6);
+    wifi_ip[0]=10; wifi_ip[1]=0; wifi_ip[2]=0; wifi_ip[3]=(u8)n;
+    wifi_mask[0]=255; wifi_mask[1]=255; wifi_mask[2]=255; wifi_mask[3]=0;
+    wifi_gw[0]=10; wifi_gw[1]=0; wifi_gw[2]=0; wifi_gw[3]=1;
+    for (i=0;i<4;i++){ wifi_dns[i]=0; }
+    for (i = 0; i < sl && i < 39; i++) wifi_cur_ssid[i] = ssid[i]; wifi_cur_ssid[i] = 0;
+    wifi_have_ip = 1;
+    /* IBSS cell formation: the fw scans for the cell then creates it — poll
+     * GET_BSSID until it reports the cell BSSID (~up to 12s). */
+    { int t, up = 0;
+      for (t = 0; t < 24; t++) {
+          if (wifi_wlcmd(0, WLC_GET_BSSID, 0, 0, bss, 6) == 0) {
+              int nz = 0, k; for (k = 0; k < 6; k++) if (bss[k] && bss[k] != 0xFF) nz = 1;
+              if (nz) { up = 1;
+                  wifi_log("[wifi] adhoc: *** IBSS cell up, BSSID %02x:%02x:%02x:%02x:%02x:%02x ***\r\n",
+                           bss[0],bss[1],bss[2],bss[3],bss[4],bss[5]); break; }
+          }
+          wifi_delay_us(500000);
+      }
+      if (!up) wifi_log("[wifi] adhoc: IBSS not associated yet (no peer / still forming)\r\n");
+    }
+    wifi_log("[wifi] mac %02x:%02x:%02x:%02x:%02x:%02x\r\n",
+             wifi_mac[0],wifi_mac[1],wifi_mac[2],wifi_mac[3],wifi_mac[4],wifi_mac[5]);
+    wifi_log("[wifi] *** ADHOC up: \"%s\" ch=%d ip=10.0.0.%d (peer-to-peer, no AP) ***\r\n", ssid, channel, n);
+    return 0;
 }
