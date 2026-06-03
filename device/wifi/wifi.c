@@ -1903,3 +1903,39 @@ int wifi_tftp_get(const u8 *srv, const char *fname, u8 *dst, int maxlen)
     wifi_log("[wifi] *** TFTP '%s': %d bytes (%s) ***\r\n", fname, total, finished ? "complete" : "timeout");
     return finished ? total : -1;
 }
+
+/* ================================================================== *
+ *  M11 (2b) — netboot: TFTP a kernel over WiFi, then chainload it    *
+ * ================================================================== */
+extern char chainload_stub[], chainload_stub_end[];
+/* Clean+invalidate D-cache (and optionally I-cache) over a VA range, MMU on. */
+static void wifi_cache_flush(unsigned long addr, unsigned long len, int icache)
+{
+    unsigned long line = 64, end = addr + len, a;
+    for (a = addr & ~(line - 1); a < end; a += line) {
+        __asm__ volatile ("dc civac, %0" :: "r"(a) : "memory");
+        if (icache) __asm__ volatile ("ic ivau, %0" :: "r"(a) : "memory");
+    }
+    __asm__ volatile ("dsb sy; isb" ::: "memory");
+}
+/* Fetch `fname` from srv over WiFi (TFTP) and boot it (chainload to 0x80000).
+ * On success this never returns; returns -1 on fetch failure. */
+int wifi_netboot(const u8 *srv, const char *fname)
+{
+    u8 *stage = (u8 *)0x4000000UL;          /* staging (64 MB) */
+    void *safe = (void *)0x10000000UL;      /* trampoline (256 MB) — off 0x80000 */
+    int got, i, stublen = (int)(chainload_stub_end - chainload_stub);
+    typedef void (*chain_fn)(unsigned long, unsigned long, unsigned long);
+
+    got = wifi_tftp_get(srv, fname, stage, 16 * 1024 * 1024);
+    if (got <= 0) { wifi_log("[wifi] netboot: fetch failed\r\n"); return -1; }
+    wifi_log("[wifi] netboot: %d B fetched -> chainloading to 0x80000 (no return)\r\n", got);
+
+    __asm__ volatile ("msr daifset, #0xf" ::: "memory");   /* mask IRQ/FIQ */
+    for (i = 0; i < stublen; i++) ((u8 *)safe)[i] = ((u8 *)chainload_stub)[i];
+    wifi_cache_flush((unsigned long)stage, (unsigned long)got, 0);   /* src -> RAM */
+    wifi_cache_flush(0x80000UL, (unsigned long)got, 0);             /* dst: flush stale */
+    wifi_cache_flush((unsigned long)safe, (unsigned long)stublen, 1);/* stub: I-coherent */
+    ((chain_fn)safe)((unsigned long)stage, 0x80000UL, (unsigned long)got);
+    return 0;   /* unreachable */
+}

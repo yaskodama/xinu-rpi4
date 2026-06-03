@@ -692,7 +692,8 @@ static int cmd_wifi(int argc, char **argv)
     extern int wifi_http(const unsigned char *ip, const char *host);
     extern int wifi_resolve(const char *host, unsigned char *out);
     extern int wifi_tftp_get(const unsigned char *srv, const char *fname, unsigned char *dst, int maxlen);
-    if (argc < 2) { uart_puts("usage: wifi ...|resolve <host>|web <host>|tftp <ip> <file>\n"); return 0; }
+    extern int wifi_netboot(const unsigned char *srv, const char *fname);
+    if (argc < 2) { uart_puts("usage: wifi ...|tftp <ip> <file>|netboot <ip> <file>\n"); return 0; }
     if (str_eq(argv[1], "probe"))      wifi_probe();
     else if (str_eq(argv[1], "scan"))  wifi_scan_run();
     else if (str_eq(argv[1], "dhcp"))  wifi_dhcp();
@@ -758,7 +759,15 @@ static int cmd_wifi(int argc, char **argv)
             for (i = 0; i < 16 && i < got; i++) { puts_hex(dst[i]); uart_putc(' '); }
             uart_puts("\n");
         }
-    } else uart_puts("wifi: unknown subcommand (...|resolve|web|tftp)\n");
+    } else if (str_eq(argv[1], "netboot")) {       /* wifi netboot <ip> <file> — fetch + chainload */
+        unsigned char ip[4] = {0,0,0,0}; int oct = 0, val = 0; const char *p;
+        if (argc < 4) { uart_puts("usage: wifi netboot <ip> <file>\n"); return 0; }
+        for (p = argv[2]; ; p++) {
+            if (*p >= '0' && *p <= '9') val = val*10 + (*p - '0');
+            else { if (oct < 4) ip[oct] = (unsigned char)val; oct++; val = 0; if (!*p) break; }
+        }
+        wifi_netboot(ip, argv[3]);                 /* never returns on success */
+    } else uart_puts("wifi: unknown subcommand (...|resolve|web|tftp|netboot)\n");
     return 0;
 }
 
