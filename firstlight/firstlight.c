@@ -109,9 +109,9 @@ static void put_hex32(unsigned int v)
 }
 
 /* ---- HDMI framebuffer (VideoCore mailbox) ------------------------- */
-#define FB_W   640u
-#define FB_H   480u
-#define SCALE  1u    /* 8x8 font at 1x — 2x looked oversized on the real panel */
+#define FB_W   1920u   /* request the panel's native 1080p (firmware FB0 was 1920x1080) */
+#define FB_H   1080u   /* so the desktop fills the whole screen, no bottom margin */
+#define SCALE  2u      /* 8x8 font at 2x — readable on a 1080p desktop */
 
 static volatile unsigned char *fb;
 static unsigned int fb_pitch, fb_w, fb_h, fb_bpp;
@@ -132,6 +132,14 @@ static void fb_pixel(unsigned int x, unsigned int y, unsigned int rgb)
 static void fb_clear(unsigned int rgb)
 {
     unsigned int x, y;
+    if (fb_bpp == 4) {                       /* fast path: 32-bit row stores */
+        for (y = 0; y < fb_h; y++) {
+            volatile unsigned int *row =
+                (volatile unsigned int *)(fb + (unsigned long)y * fb_pitch);
+            for (x = 0; x < fb_w; x++) row[x] = rgb;
+        }
+        return;
+    }
     for (y = 0; y < fb_h; y++)
         for (x = 0; x < fb_w; x++)
             fb_pixel(x, y, rgb);
@@ -141,9 +149,28 @@ static void fb_fill(unsigned int x0, unsigned int y0,
                     unsigned int w, unsigned int h, unsigned int rgb)
 {
     unsigned int x, y;
+    if (fb_bpp == 4) {                       /* fast path: 32-bit row stores */
+        for (y = 0; y < h; y++) {
+            volatile unsigned int *row =
+                (volatile unsigned int *)(fb + (unsigned long)(y0 + y) * fb_pitch
+                                             + (unsigned long)x0 * 4);
+            for (x = 0; x < w; x++) row[x] = rgb;
+        }
+        return;
+    }
     for (y = 0; y < h; y++)
         for (x = 0; x < w; x++)
             fb_pixel(x0 + x, y0 + y, rgb);
+}
+
+/* 1-pixel rectangle outline (window chrome border). */
+static void fb_rect(unsigned int x, unsigned int y,
+                    unsigned int w, unsigned int h, unsigned int rgb)
+{
+    fb_fill(x, y, w, 1, rgb);                /* top    */
+    fb_fill(x, y + h - 1, w, 1, rgb);        /* bottom */
+    fb_fill(x, y, 1, h, rgb);                /* left   */
+    fb_fill(x + w - 1, y, 1, h, rgb);        /* right  */
 }
 
 static void fb_char(unsigned int px, unsigned int py, char ch, unsigned int rgb)
@@ -228,10 +255,14 @@ static int fb_try(unsigned int bus_or)
     addr &= 0x3FFFFFFFu;
     fb = (volatile unsigned char *)(unsigned long)addr;
     fb_pitch = pitch;
-    fb_w = w;
     fb_h = h;
-    fb_bpp = (w ? pitch / w : 4);
-    if (fb_bpp == 0) fb_bpp = 4;
+    /* bytes-per-pixel comes from the requested DEPTH (32 -> 4), like circle —
+     * NOT pitch/w (the Pi 5 firmware returns an over-aligned pitch: 7680 for a
+     * 1280-wide 32bpp FB, so pitch/w would wrongly give 6).  The real buffer
+     * width is pitch/bpp; use it so we paint the whole panel, not the left part. */
+    fb_bpp = 4;
+    fb_w = pitch / fb_bpp;
+    if (fb_w < w) fb_w = w;
     fb_bus_or_used = bus_or;
     return 0;
 }
@@ -257,6 +288,28 @@ static void delay(unsigned long n)
     }
 }
 
+/* ---- minimal window manager (same titled-chrome look as the Pi 4 wm) --- */
+#define WM_TBAR_H  (10u * SCALE)            /* title-bar height */
+
+typedef struct {
+    unsigned int x, y, w, h;
+    const char  *title;
+    unsigned int chrome, tbar, tfg, cbg;    /* border / title-bar / title fg / content bg */
+} win_t;
+
+/* Draw a window's chrome: content bg, title bar, title text, then the border. */
+static void draw_win(const win_t *win)
+{
+    fb_fill(win->x, win->y, win->w, win->h, win->cbg);
+    fb_fill(win->x + 1, win->y + 1, win->w - 2, WM_TBAR_H, win->tbar);
+    fb_string(win->x + 4, win->y + 1, win->title, win->tfg);
+    fb_rect(win->x, win->y, win->w, win->h, win->chrome);
+}
+
+/* Top-left of a window's content area (just below the title bar). */
+static unsigned int win_cx(const win_t *w) { return w->x + 6; }
+static unsigned int win_cy(const win_t *w) { return w->y + WM_TBAR_H + 4; }
+
 #define DELAY_FRAME  40000000UL   /* ~ full-screen colour, human-visible */
 #define DELAY_BEAT    8000000UL   /* heartbeat cadence (~few/sec)        */
 
@@ -266,6 +319,7 @@ void kernel_main(void)
     unsigned long el;
     unsigned int tick = 0;
     int have_fb;
+    win_t hb; int have_hb = 0;        /* the live Heartbeat window (updated in the loop) */
 
     __asm__ volatile ("mrs %0, CurrentEL" : "=r"(el));
     el >>= 2;
@@ -285,27 +339,48 @@ void kernel_main(void)
     put_s("\n");
 
     if (have_fb) {
-        unsigned int row;
+        unsigned int cx, cy;
 
-        fb_clear(0xFF0000); delay(DELAY_FRAME);        /* red   */
-        fb_clear(0x00FF00); delay(DELAY_FRAME);        /* green */
-        fb_clear(0x0000FF); delay(DELAY_FRAME);        /* blue  */
+        /* straight to the desktop — no rainbow/delay (HDMI is proven working,
+         * and the 3 extra full-screen clears + 3 long delays dominated boot) */
+        fb_clear(0x102035);                            /* desktop wallpaper */
 
-        fb_clear(0x001020);                            /* dark navy */
-        row = 40;
-        fb_string(40, row, "Xinu Pi 5 first-light", 0x00FF66);          row += 12 * SCALE;
-        fb_string(40, row, "HDMI framebuffer is LIVE", 0xFFFFFF);        row += 10 * SCALE;
-        fb_string(40, row, "kernel is running on the Pi 5", 0xFFFF00);   row += 10 * SCALE;
-        fb_char(40, row, (char)('0' + (int)(el & 7)), 0xAAAAAA);
-        fb_string(40 + 8 * SCALE, row, " = CurrentEL", 0xAAAAAA);        row += 12 * SCALE;
-        /* which mailbox bus convention worked (top nibble: C/4/0) */
-        fb_string(40, row, "mbox bus = 0x", 0xAAAAAA);
-        {
-            unsigned int nib = (fb_bus_or_used >> 28) & 0xF;
-            char hc = (char)(nib < 10 ? '0' + nib : 'A' + (nib - 10));
-            fb_char(40 + 13 * 8 * SCALE, row, hc, 0xFFFFFF);
-        }                                                               row += 14 * SCALE;
-        fb_string(40, row, "heartbeat:", 0x66CCFF);
+        /* ---- the window manager: four titled chrome windows ---- */
+        win_t banner = { 16, 16, fb_w - 32, 44, "Xinu Pi 5",
+                         0xAACCEE, 0x0040A0, 0xFFFFFF, 0x0A1420 };
+        win_t sys    = { 16,  80, 608, fb_h - 96, "System",
+                         0x60FF60, 0x205020, 0xFFFFFF, 0x0A140A };
+        win_t ser    = { 656, 80, 608, fb_h - 96, "Serial (debug UART)",
+                         0x60D0FF, 0x205070, 0xFFFFFF, 0x0A1018 };
+        hb = (win_t){ 1296, 80, 608, fb_h - 96, "Heartbeat",
+                      0xFFD060, 0x504010, 0xFFFFFF, 0x14100A };
+
+        draw_win(&banner);
+        fb_string(win_cx(&banner), banner.y + WM_TBAR_H + 2,
+                  "BCM2712 Cortex-A76 - first-light kernel", 0x66FF99);
+
+        draw_win(&sys);
+        cx = win_cx(&sys); cy = win_cy(&sys);
+        fb_string(cx, cy, "CurrentEL = ", 0xAAAAAA);
+        fb_char(cx + 12u * 8u * SCALE, cy, (char)('0' + (int)(el & 7)), 0xFFFFFF);
+        cy += 12 * SCALE;
+        fb_string(cx, cy, "FB 1920x1080 32bpp", 0xAAAAAA);             cy += 10 * SCALE;
+        fb_string(cx, cy, "mbox bus = 0x", 0xAAAAAA);
+        { unsigned int nib = (fb_bus_or_used >> 28) & 0xF;
+          fb_char(cx + 13u * 8u * SCALE, cy,
+                  (char)(nib < 10 ? '0' + nib : 'A' + (nib - 10)), 0xFFFFFF); }
+        cy += 12 * SCALE;
+        fb_string(cx, cy, "kernel running on Pi 5", 0xFFFF00);
+
+        draw_win(&ser);
+        cx = win_cx(&ser); cy = win_cy(&ser);
+        fb_string(cx, cy, "@ 0x107D001000", 0xAAAAAA);                 cy += 12 * SCALE;
+        fb_string(cx, cy, "115200 8N1", 0xAAAAAA);                     cy += 10 * SCALE;
+        fb_string(cx, cy, "RX echo: ON (type here)", 0x66CCFF);
+
+        draw_win(&hb);
+        fb_string(win_cx(&hb), win_cy(&hb), "tick:", 0x66CCFF);
+        have_hb = 1;
     }
 
     /* ---- SERIAL on the dedicated debug UART (0x107D001000) ----------- */
@@ -325,18 +400,24 @@ void kernel_main(void)
     for (;;) {
         tick++;
 
-        if (have_fb) {
-            /* blinking square: green on even ticks, dark on odd */
+        if (have_hb) {
+            /* live content inside the Heartbeat window: blinking square + counter */
+            unsigned int cx = win_cx(&hb), cy = win_cy(&hb) + 12u * SCALE;
             unsigned int beat = (tick & 1) ? 0x103040 : 0x00FF66;
-            fb_fill(40 + 11u * 8u * SCALE, 40 + 56u * SCALE,
-                    10u * SCALE, 10u * SCALE, beat);
-            /* ticking counter just right of the square */
-            fb_decimal(40 + 14u * 8u * SCALE, 40 + 56u * SCALE,
-                       tick, 0xFFFFFF, 0x001020);
+            fb_fill(cx, cy, 8u * SCALE, 8u * SCALE, beat);
+            fb_decimal(cx + 2u * 8u * SCALE, cy, tick, 0xFFFFFF, hb.cbg);
         }
 
         put_c('.');                                    /* serial heartbeat */
-        if ((tick % 50u) == 0) put_s("\n");
+        if ((tick % 50u) == 0) {
+            /* periodic geometry print so a capture of the RUNNING system (no
+             * reboot-timing needed) reveals the actual FB the firmware gave us */
+            put_s("\n[fb w=0x"); put_hex32(fb_w);
+            put_s(" h=0x");      put_hex32(fb_h);
+            put_s(" pitch=0x");  put_hex32(fb_pitch);
+            put_s(" bpp=0x");    put_hex32(fb_bpp);
+            put_s("]\n");
+        }
 
         /* echo any keystrokes (debug UART RX FIFO; empty if no cable) */
         if (!(UART_FR & FR_RXFE)) {
