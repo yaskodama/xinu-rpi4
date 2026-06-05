@@ -97,6 +97,13 @@ static void put_s(const char *s)
     }
 }
 
+static void put_hex32(unsigned int v)
+{
+    static const char hx[] = "0123456789ABCDEF";
+    int i;
+    for (i = 28; i >= 0; i -= 4) put_c(hx[(v >> i) & 0xF]);
+}
+
 /* ---- HDMI framebuffer (VideoCore mailbox) ------------------------- */
 #define FB_W   640u
 #define FB_H   480u
@@ -261,6 +268,18 @@ void kernel_main(void)
 
     /* ---- HDMI: the primary, PCIe-independent liveness channel ------- */
     have_fb = (fb_init() == 0);
+
+    /* Mirror the FB-allocation result to SERIAL so we can tell "mailbox
+     * returned no framebuffer" (have_fb=0) from "FB allocated but HDMI shows
+     * no signal" (have_fb=1) — the HDMI itself can't report its own failure. */
+    put_s("\nfb_init: have_fb=");  put_c((char)('0' + have_fb));
+    put_s(" bus=0x");   put_hex32(fb_bus_or_used);
+    put_s(" w=0x");     put_hex32(fb_w);
+    put_s(" h=0x");     put_hex32(fb_h);
+    put_s(" pitch=0x"); put_hex32(fb_pitch);
+    put_s(" base=0x");  put_hex32((unsigned int)(unsigned long)fb);
+    put_s("\n");
+
     if (have_fb) {
         unsigned int row;
 
