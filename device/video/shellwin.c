@@ -215,11 +215,11 @@ void shellwin_step(void)
 {
     if (!inited) return;
 
-    /* Drain whatever the UART RX FIFO has accumulated since the last
-     * frame.  USB keyboard input enters via shellwin_handle_key()
-     * from the USPi handler — same code path after the dispatcher. */
-    int c;
-    while ((c = uart_poll_char()) >= 0) {
-        shellwin_handle_key((char)c);
-    }
+    /* NOTE: the UART RX FIFO belongs to the *serial line shell*
+     * (shell_main() / uart_getc()).  This used to also drain it here and
+     * feed shellwin_handle_key(); but shellwin_step() runs every wm tick, so
+     * it raced the serial shell for each keystroke and won — the serial line
+     * shell then received nothing.  The wm/HDMI shell window now takes input
+     * only from the USB keyboard (xhci_keyboard_event -> shellwin_handle_key).
+     * Serial input -> serial shell. */
 }
