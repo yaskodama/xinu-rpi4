@@ -1238,6 +1238,19 @@ static u16 ip_cksum(const u8 *p, int n, u32 sum)
 static u8 wifi_ip[4], wifi_mask[4], wifi_gw[4], wifi_dns[4], wifi_mac[6];
 static int wifi_have_ip = 0;
 int wifi_connected(void) { return wifi_have_ip; }
+
+/* Disconnect: bring the MAC down (leaves the AP / ad-hoc cell) and clear state.
+ * Clearing wifi_have_ip also quiesces the persistent ARP/ICMP responder (it
+ * early-returns when there's no IP), so no separate thread stop is needed.  A
+ * later `wifi up`/`wifi adhoc` re-UPs the radio, so this is fully reversible. */
+void wifi_off(void)
+{
+    wifi_cmd_int(WLC_DOWN, 1);
+    wifi_have_ip = 0;
+    wifi_cur_ssid[0] = 0;
+    wifi_log("[wifi] off: radio down, disconnected\r\n");
+}
+
 /* Desktop WiFi indicator accessors (M10). */
 const char *wifi_ssid(void) { return wifi_cur_ssid; }
 void wifi_ipaddr(u8 *o) { int i; for (i = 0; i < 4; i++) o[i] = wifi_ip[i]; }

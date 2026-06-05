@@ -698,6 +698,7 @@ static int cmd_wifi(int argc, char **argv)
     if (argc < 2) { uart_puts("usage: wifi ...|adhoc <ssid> <ch> <n>|aodv <ip>\n"); return 0; }
     if (str_eq(argv[1], "probe"))      wifi_probe();
     else if (str_eq(argv[1], "scan"))  wifi_scan_run();
+    else if (str_eq(argv[1], "off"))   { extern void wifi_off(void); wifi_off(); uart_puts("wifi: off (radio down, disconnected)\n"); }
     else if (str_eq(argv[1], "dhcp"))  wifi_dhcp();
     else if (str_eq(argv[1], "serve")) {
         int s = 30;
