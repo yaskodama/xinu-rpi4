@@ -41,7 +41,11 @@ extern const unsigned char font8x8[96][8];           /* device/video/...   */
  * need the 0xC0000000 uncached alias.  We don't know which the Pi 5
  * wants, so fb_init() tries several conventions in one boot. */
 #ifndef MBOX_BASE
-#define MBOX_BASE 0x107C00B880UL   /* BCM2712 VideoCore mailbox (Pi 5) */
+/* BCM2712 (Pi 5) VideoCore mailbox.  Per circle's bcm2835.h, the mailbox
+ * offset is 0x13880 on RASPPI>4 (it was 0xB880 on Pi 1-4) — so the Pi 5
+ * mailbox is ARM_IO_BASE(0x107C000000) + 0x13880.  The 0xB880 offset
+ * (wrong here on Pi 5) made every fb_init() mailbox call fail (have_fb=0). */
+#define MBOX_BASE 0x107C013880UL
 #endif
 #define MBOX_REG(off)  (*(volatile unsigned int *)(MBOX_BASE + (off)))
 #define MBOX_STATUS    MBOX_REG(0x18)
@@ -107,7 +111,7 @@ static void put_hex32(unsigned int v)
 /* ---- HDMI framebuffer (VideoCore mailbox) ------------------------- */
 #define FB_W   640u
 #define FB_H   480u
-#define SCALE  2u
+#define SCALE  1u    /* 8x8 font at 1x — 2x looked oversized on the real panel */
 
 static volatile unsigned char *fb;
 static unsigned int fb_pitch, fb_w, fb_h, fb_bpp;

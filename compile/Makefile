@@ -85,7 +85,7 @@ COMMON  = -Wall -O2 -ffreestanding -nostdinc -nostdlib -nostartfiles \
 # config.txt).  HEAP_END 1 GiB conservative for the smallest Pi 5.
 PI5_CFLAGS  = $(COMMON) -mcpu=cortex-a76 \
               -DUART0_BASE=0x1F00030000UL \
-              -DMBOX_BASE=0x107C00B880UL \
+              -DMBOX_BASE=0x107C013880UL \
               -DHEAP_END=0x40000000UL \
               -DBOARD_NAME=\"Pi5\" \
               -DSOC_NAME=\"BCM2712\" \
