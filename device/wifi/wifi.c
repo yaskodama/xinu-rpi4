@@ -2061,6 +2061,27 @@ int wifi_netboot(const u8 *srv, const char *fname)
     return 0;   /* unreachable */
 }
 
+/* Chainload an already-staged kernel image (e.g. uploaded over HTTP into the
+ * 0x4000000 staging area by the /chainload route).  Same proven sequence as
+ * wifi_netboot's tail: relocate the trampoline stub, flush caches, jump.
+ * RAM-only — does not touch the SD, so a bad image just needs a power cycle.
+ * Never returns. */
+void kernel_chainload(unsigned long stage, unsigned long len)
+{
+    void *safe = (void *)0x10000000UL;      /* trampoline (256 MB) — off 0x80000 */
+    int i, stublen = (int)(chainload_stub_end - chainload_stub);
+    typedef void (*chain_fn)(unsigned long, unsigned long, unsigned long);
+
+    wifi_log("[wifi] /chainload: %lu B staged -> boot 0x80000 (no return)\r\n", len);
+    __asm__ volatile ("msr daifset, #0xf" ::: "memory");   /* mask IRQ/FIQ */
+    for (i = 0; i < stublen; i++) ((u8 *)safe)[i] = ((u8 *)chainload_stub)[i];
+    wifi_cache_flush(stage, len, 0);                 /* staged image -> RAM */
+    wifi_cache_flush(0x80000UL, len, 0);             /* dst: flush stale */
+    wifi_cache_flush((unsigned long)safe, (unsigned long)stublen, 1);  /* stub: I-coherent */
+    ((chain_fn)safe)(stage, 0x80000UL, len);
+    /* unreachable */
+}
+
 /* ================================================================== *
  *  M12 — MANET ad-hoc (IBSS) mode: peer-to-peer, no AP, static IP    *
  * ================================================================== */

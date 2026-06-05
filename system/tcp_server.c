@@ -189,6 +189,7 @@ static volatile int g_app_state;
 static int          g_app_conn_idx = -1;   /* which g_conns[] slot owns this request */
 static char         g_app_req[32768];   /* matches per-conn httpreq[] */
 static int          g_app_req_len;
+static int          g_chain_len;         /* bytes staged at 0x4000000 by /chainload */
 static char         g_app_resp[16384];  /* matches http_build's body[] cap */
 static int          g_app_resp_len;
 static unsigned long g_app_served;     /* responses flushed (diagnostic)     */
@@ -1409,6 +1410,40 @@ static int http_build(const char *req, char *out, int max)
             bl = s_put(body, bl, "}");
         }
         bl = s_put(body, bl, "]}\n");
+    } else if (starts_with(req, "POST /chainload") || starts_with(req, "GET /chainload")) {
+        /* Remote kernel chainload — RAM-only, so a bad image just needs a
+         * power cycle (no SD write, no brick risk).  Two phases:
+         *   POST /chainload?off=<byte>   body = a chunk of the kernel image
+         *                                (<=24KB; httpreq is 32KB)
+         *   GET  /chainload?go=1&len=<N> relocate + jump -> boots staged kernel
+         * The Mac client splits kernel8.img into chunks, POSTs each to its
+         * offset into staging RAM 0x4000000, then GET ?go. */
+        ctype = "text/plain";
+        volatile unsigned char *STAGE = (volatile unsigned char *)0x4000000UL;
+        if (req[0] == 'P') {
+            int off = q_int(req, "off", -1);
+            int cl  = content_length(req);
+            int he  = find_header_end(req);
+            if (off == 0) g_chain_len = 0;                 /* new upload */
+            if (off >= 0 && cl > 0 && he >= 0) {
+                const unsigned char *b = (const unsigned char *)(req + he);
+                for (int i = 0; i < cl; i++) STAGE[off + i] = b[i];   /* binary-safe */
+                if (off + cl > g_chain_len) g_chain_len = off + cl;
+                bl = s_put(body, bl, "ok off="); bl = s_putdec(body, bl, off);
+                bl = s_put(body, bl, " n=");      bl = s_putdec(body, bl, cl);
+                bl = s_put(body, bl, " total=");  bl = s_putdec(body, bl, g_chain_len);
+                bl = s_put(body, bl, "\n");
+            } else {
+                bl = s_put(body, bl, "usage: POST /chainload?off=<byte>  body=<chunk>\n");
+            }
+        } else if (q_int(req, "go", 0)) {
+            int len = q_int(req, "len", g_chain_len);
+            extern void kernel_chainload(unsigned long stage, unsigned long len);
+            kernel_chainload(0x4000000UL, (unsigned long)len);   /* never returns */
+        } else {
+            bl = s_put(body, bl, "staged="); bl = s_putdec(body, bl, g_chain_len);
+            bl = s_put(body, bl, " bytes.  GET /chainload?go=1&len=<N> to boot it.\n");
+        }
     } else if (path_eq(req, "/shell")) {
         /* Remote login: run a Xinu shell command and return its console
          * output.  e.g.  GET /shell?cmd=help   ·   /shell?cmd=wifi%20scan
@@ -1435,6 +1470,7 @@ static int http_build(const char *req, char *out, int max)
                              "GET  /api/actors\n"
                              "GET  /send?to=<id>&m=<bump|add|set|get|reset>&arg=<n>\n"
                              "GET  /shell?cmd=<command>   (remote login: run a Xinu shell command)\n"
+                             "POST /chainload?off=<byte> + GET /chainload?go=1&len=<N>  (remote kernel chainload, RAM)\n"
                              "POST /compile      (body = C source; JIT-run, output + => retval)\n"
                              "POST /actor/load   (body = AIPL-generated C; spawns resident actors)\n"
                              "GET  /actor/send?to=<id>&m=<method>&arg=<n>  (message a resident actor)\n");
