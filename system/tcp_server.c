@@ -1409,11 +1409,32 @@ static int http_build(const char *req, char *out, int max)
             bl = s_put(body, bl, "}");
         }
         bl = s_put(body, bl, "]}\n");
+    } else if (path_eq(req, "/shell")) {
+        /* Remote login: run a Xinu shell command and return its console
+         * output.  e.g.  GET /shell?cmd=help   ·   /shell?cmd=wifi%20scan
+         * Same trust model as /compile (which JIT-runs arbitrary C) — the
+         * box trusts the LAN; no auth.  Not reentrant (shared capture buf). */
+        extern int  shell_dispatch_line(char *line);
+        extern void uart_capture_begin(void);
+        extern int  uart_capture_end(char *dst, int max);
+        static char cmdenc[512], cmd[512], cap[8192];
+        ctype = "text/plain";
+        if (q_param(req, "cmd", cmdenc, sizeof cmdenc)) {
+            url_decode(cmdenc, cmd, sizeof cmd);
+            uart_capture_begin();
+            shell_dispatch_line(cmd);                  /* runs the command; output is teed */
+            int cn = uart_capture_end(cap, (int)sizeof cap - 1);
+            cap[cn] = 0;
+            bl = s_put(body, bl, cap);
+        } else {
+            bl = s_put(body, bl, "usage: /shell?cmd=<command>   e.g. /shell?cmd=help\n");
+        }
     } else if (path_eq(req, "/")) {
         ctype = "text/plain";
         bl = s_put(body, bl, "xinu-rpi4 (Pi 4) actor HTTP gateway\n"
                              "GET  /api/actors\n"
                              "GET  /send?to=<id>&m=<bump|add|set|get|reset>&arg=<n>\n"
+                             "GET  /shell?cmd=<command>   (remote login: run a Xinu shell command)\n"
                              "POST /compile      (body = C source; JIT-run, output + => retval)\n"
                              "POST /actor/load   (body = AIPL-generated C; spawns resident actors)\n"
                              "GET  /actor/send?to=<id>&m=<method>&arg=<n>  (message a resident actor)\n");

@@ -134,8 +134,28 @@ void uart_rebaud(unsigned int clk)
     UART_CR = CR_UARTEN | CR_TXE | CR_RXE;
 }
 
+/* ---- remote-shell output capture (used by the /shell HTTP route) ----
+ * When capture is on, every byte written to the console is also appended to
+ * a buffer so the HTTP gateway can run a shell command and return its output.
+ * The console (UART/HDMI/wm) still receives the bytes — capture is a tee. */
+static char uart_cap[8192];
+static int  uart_cap_n  = 0;
+static int  uart_cap_on = 0;
+void uart_capture_begin(void) { uart_cap_n = 0; uart_cap_on = 1; }
+int  uart_capture_end(char *dst, int max)
+{
+    int n = uart_cap_n, i;
+    if (n > max) n = max;
+    for (i = 0; i < n; i++) dst[i] = uart_cap[i];
+    uart_cap_on = 0;
+    return n;
+}
+
 void uart_putc(char c)
 {
+    if (uart_cap_on && uart_cap_n < (int)sizeof uart_cap)
+        uart_cap[uart_cap_n++] = c;        /* tee into the capture buffer */
+
     /* Busy-wait until the TX FIFO has room. */
     while (UART_FR & FR_TXFF) {
         /* spin */
