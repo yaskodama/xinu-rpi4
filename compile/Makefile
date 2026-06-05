@@ -79,11 +79,12 @@ INCLUDE = -I../include -I../extern/xinu-raz-include
 COMMON  = -Wall -O2 -ffreestanding -nostdinc -nostdlib -nostartfiles \
           -mgeneral-regs-only -mstrict-align $(INCLUDE) -MMD -MP
 
-# Pi 5 (BCM2712, Cortex-A76).  Peripheral base 0x107C000000; PL011 at
-# 0x107D001000; mailbox at 0x107C00B880 (best-effort, unverified on
-# real silicon).  HEAP_END 1 GiB is conservative for the smallest Pi 5.
+# Pi 5 (BCM2712, Cortex-A76).  Peripheral base 0x107C000000; mailbox at
+# 0x107C00B880 (best-effort).  Serial console = GPIO14/15 = RP1 UART0 at
+# BCM2712-side 0x1F00030000 (PCIe window to RP1; needs pciex4_reset=0 in
+# config.txt).  HEAP_END 1 GiB conservative for the smallest Pi 5.
 PI5_CFLAGS  = $(COMMON) -mcpu=cortex-a76 \
-              -DUART0_BASE=0x107D001000UL \
+              -DUART0_BASE=0x1F00030000UL \
               -DMBOX_BASE=0x107C00B880UL \
               -DHEAP_END=0x40000000UL \
               -DBOARD_NAME=\"Pi5\" \
@@ -159,6 +160,19 @@ pi4 kernel8.img: $(PI4_OBJS) link.ld
 	$(OBJCOPY) -O binary kernel8.elf kernel8.img
 	@ls -la kernel8.img
 
+# ----- minimal Pi 5 first-light kernel (serial bring-up only) --------
+# Just boot.S + firstlight.c.  No video / mbox / RP1 / net — the smallest
+# possible image that proves the BCM2712 dedicated debug UART works.
+# Output image is kernel_xinu.img so it never clobbers a Linux/full image.
+obj/pi5/firstlight.o: ../firstlight/firstlight.c | obj/pi5
+	$(CC) $(PI5_CFLAGS) -c $< -o $@
+
+PI5MIN_OBJS = obj/pi5/firstlight.o obj/pi5/boot.o obj/pi5/mbox.o obj/pi5/font8x8.o
+pi5-min kernel_xinu.img: $(PI5MIN_OBJS) link.ld
+	$(LD) -nostdlib $(PI5MIN_OBJS) -T link.ld -o kernel_xinu.elf
+	$(OBJCOPY) -O binary kernel_xinu.elf kernel_xinu.img
+	@ls -la kernel_xinu.img
+
 qemu kernel_virt.img: $(QEMU_OBJS) link_virt.ld
 	$(LD) -nostdlib $(QEMU_OBJS) -T link_virt.ld -o kernel_virt.elf
 	$(OBJCOPY) -O binary kernel_virt.elf kernel_virt.img
@@ -204,7 +218,7 @@ install: install_pi5
 clean:
 	rm -rf obj kernel_*.elf kernel_*.img kernel8.elf kernel8.img qemu-smoke.log
 
-.PHONY: all pi4 pi5 qemu qemu-run qemu-smoke install install_pi4 install_pi5 clean
+.PHONY: all pi4 pi5 pi5-min qemu qemu-run qemu-smoke install install_pi4 install_pi5 clean
 
 # Auto-generated header dependencies (-MMD): a change to e.g. a struct in a
 # header now recompiles every .c that includes it, instead of leaving stale

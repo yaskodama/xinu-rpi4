@@ -570,4 +570,7 @@ int xhci_pcie_fw_probe(char *out, int max)
 { const char *s = "fw-probe: not supported\n"; int p=0; while(*s && p<max-1) out[p++]=*s++; if(p<max) out[p]=0; return p; }
 int xhci_pcie_fw_gate_force(char *out, int max)
 { const char *s = "fw-gate-force: not supported\n"; int p=0; while(*s && p<max-1) out[p++]=*s++; if(p<max) out[p]=0; return p; }
+int xhci_pcie_clk_full_sequence(void)              { return -1; }
+int xhci_pcie_fw_probe_one(char *out, int max, unsigned int addr)
+{ (void)addr; const char *s="probe: not supported\n"; int p=0; while(*s && p<max-1) out[p++]=*s++; if(p<max) out[p]=0; return p; }
 #endif
