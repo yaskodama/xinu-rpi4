@@ -33,4 +33,9 @@ int  uart_poll_char(void);
  * (0x0A) both terminate input. */
 int uart_getline(char *buf, int max);
 
+/* Format a one-line RX hardware/drain snapshot (count of bytes pulled from
+ * the FIFO, FR/CR/GPFSEL register state, last 16 raw bytes) into `buf`.
+ * Returns bytes written.  Backs the /uartrx HTTP bisect route. */
+int uart_rx_debug(char *buf, int max);
+
 #endif /* XINU_RPI4_UART_H */

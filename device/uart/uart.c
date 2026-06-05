@@ -53,6 +53,25 @@
 #define CR_TXE       (1u << 8)
 #define CR_RXE       (1u << 9)
 
+/* ---- RX diagnostics (for the /uartrx HTTP bisect route) -------------
+ * Every byte actually pulled out of the RX FIFO (by uart_poll_char, the
+ * single live drainer in shellwin_step, or by the blocking uart_getc)
+ * bumps g_uart_rx_count and is stashed in a 16-byte ring.  This lets the
+ * HTTP gateway answer the one question serial can't answer about itself:
+ * "are the user's keystrokes physically reaching the Pi's RX at all?"
+ *   count climbs while typing  -> bytes arrive, bug is in dispatch (SW)
+ *   count stays 0 while typing  -> bytes never arrive (wiring/baud/mux) */
+volatile unsigned int  g_uart_rx_count = 0;
+static volatile unsigned char g_uart_rx_ring[16];
+static volatile unsigned int  g_uart_rx_head = 0;
+
+static inline void uart_rx_note(unsigned char c)
+{
+    g_uart_rx_count++;
+    g_uart_rx_ring[g_uart_rx_head & 15] = c;
+    g_uart_rx_head++;
+}
+
 void uart_init(void)
 {
 #ifdef GPIO_BASE
@@ -201,13 +220,63 @@ char uart_getc(void)
     while (UART_FR & FR_RXFE) {
         /* spin */
     }
-    return (char)(UART_DR & 0xFF);
+    unsigned char c = (unsigned char)(UART_DR & 0xFF);
+    uart_rx_note(c);
+    return (char)c;
 }
 
 int uart_poll_char(void)
 {
     if (UART_FR & FR_RXFE) return -1;
-    return (int)(UART_DR & 0xFF);
+    unsigned char c = (unsigned char)(UART_DR & 0xFF);
+    uart_rx_note(c);
+    return (int)c;
+}
+
+/* Format a one-line snapshot of the RX hardware + drain state for the
+ * /uartrx HTTP route.  All the PL011 (and Pi-4 GPIO) register macros are
+ * file-local, so the formatting lives here and the gateway just calls it.
+ * Reads are non-destructive (FR/CR/GPFSEL are status regs; we do NOT touch
+ * DR here so we never steal a byte from shellwin_step's drain). */
+int uart_rx_debug(char *buf, int max)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    int p = 0;
+    unsigned int fr = UART_FR, cr = UART_CR;
+    unsigned int cnt = g_uart_rx_count, head = g_uart_rx_head;
+#define PUT(ch)   do { if (p < max - 1) buf[p++] = (ch); } while (0)
+#define PUTS(str) do { const char *_s=(str); while(*_s) PUT(*_s++); } while (0)
+#define PUTHEX(v) do { unsigned int _v=(v); for(int _i=7;_i>=0;_i--) PUT(hex[(_v>>(_i*4))&0xF]); } while (0)
+    PUTS("rx_count=");  { char d[12]; int n=0,v=cnt; if(!v)d[n++]='0'; while(v){d[n++]='0'+v%10;v/=10;} while(n)PUT(d[--n]); }
+    PUTS(" fr=0x");  PUTHEX(fr);
+    PUTS(" (RXFE=");  PUT(fr & FR_RXFE ? '1':'0'); PUT(')');
+    PUTS(" cr=0x");  PUTHEX(cr);
+    PUTS(" (RXE=");  PUT(cr & CR_RXE ? '1':'0'); PUTS(" TXE="); PUT(cr & CR_TXE ? '1':'0'); PUT(')');
+#ifdef GPIO_BASE
+    {
+        unsigned int gpfsel1 = *(volatile unsigned int *)(GPIO_BASE + 0x04);
+        /* FSEL15 = bits 17:15 (RXD0), FSEL14 = bits 14:12 (TXD0); ALT0 = 0b100. */
+        PUTS(" gpfsel1=0x"); PUTHEX(gpfsel1);
+        PUTS(" (fsel14="); PUT('0'+((gpfsel1>>12)&7));
+        PUTS(" fsel15=");  PUT('0'+((gpfsel1>>15)&7)); PUT(')');
+    }
+#endif
+    PUTS(" last16=");
+    {
+        unsigned int seen = head < 16 ? head : 16;
+        unsigned int start = head - seen;
+        for (unsigned int i = 0; i < seen; i++) {
+            unsigned char c = g_uart_rx_ring[(start + i) & 15];
+            PUTHEX(c); PUT(i + 1 < seen ? ',' : ' ');
+        }
+        if (!seen) PUTS("(none)");
+    }
+    PUTS("\n");
+#undef PUT
+#undef PUTS
+#undef PUTHEX
+    if (p < max) buf[p] = 0;
+    return p;
 }
 
 /* Line editor: blocking, echo + backspace + DEL.  CR/LF terminates. */

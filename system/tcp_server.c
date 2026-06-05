@@ -711,6 +711,20 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, "genet_irq=");
         bl = s_putdec(body, bl, (long)genet_irq_count());
         bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "GET /uartrx") || starts_with(req, "POST /uartrx")) {
+        /* Diagnostic: bisect the serial-shell "input dead, output fine" bug.
+         * uart_rx_debug reports rx_count (bytes pulled from the PL011 RX FIFO
+         * by shellwin_step's drain), the live FR/CR register state, the GPIO
+         * FSEL14/15 mux (ALT0=4 means TXD0/RXD0 reach header pins 8/10), and
+         * the last 16 raw bytes.  Curl this, then type a few keys on the
+         * serial console, then curl again:
+         *   rx_count grew  -> keystrokes ARE reaching the Pi; bug is in the
+         *                     shellwin dispatch/echo path (software).
+         *   rx_count = 0   -> nothing arrives; check fsel15 (must be 4), RXE,
+         *                     and the adapter TX->pin10 wiring / baud. */
+        extern int uart_rx_debug(char *buf, int max);
+        ctype = "text/plain";
+        bl += uart_rx_debug(body + bl, (int)sizeof(body) - bl);
     } else if (starts_with(req, "GET /netpreempt") || starts_with(req, "POST /netpreempt")) {
         /* Toggle preemptive networking: with it ON the timer can preempt the
          * app-worker (mid cc/llm) to run the net process, so RX/ICMP/TCP stay
