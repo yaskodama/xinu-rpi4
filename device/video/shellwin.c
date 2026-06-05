@@ -215,11 +215,13 @@ void shellwin_step(void)
 {
     if (!inited) return;
 
-    /* NOTE: the UART RX FIFO belongs to the *serial line shell*
-     * (shell_main() / uart_getc()).  This used to also drain it here and
-     * feed shellwin_handle_key(); but shellwin_step() runs every wm tick, so
-     * it raced the serial shell for each keystroke and won — the serial line
-     * shell then received nothing.  The wm/HDMI shell window now takes input
-     * only from the USB keyboard (xhci_keyboard_event -> shellwin_handle_key).
-     * Serial input -> serial shell. */
+    /* Drain the UART RX FIFO and feed shellwin_handle_key() — this IS the
+     * serial shell: shellwin_handle_key() prints the xinu-pi4$ prompt, echoes
+     * input, and dispatches commands, all to the UART.  (shell_main() in
+     * shell.c is never reached — wm_run() above it never returns.)  USB
+     * keyboard input enters via the same shellwin_handle_key() path. */
+    int c;
+    while ((c = uart_poll_char()) >= 0) {
+        shellwin_handle_key((char)c);
+    }
 }

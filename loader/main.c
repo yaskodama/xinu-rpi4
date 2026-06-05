@@ -1421,6 +1421,10 @@ void kernel_main(void)
          * pans.  USPi (later) will drive it from mouse reports. */
         wm_cursor_set((int)sw / 2, (int)sh / 2, 1);
 
+        /* Initial serial-shell prompt: shellwin_handle_key() only re-prints
+         * xinu-pi4$ after each command, so without this the serial (screen)
+         * user sees no prompt at boot and thinks the shell never came up. */
+        uart_puts("\nxinu-pi4$ ");
         wm_run();   /* never returns */
     }
 
