@@ -269,8 +269,10 @@ static void net_yield_tick(void)
 {
     extern void shellwin_step(void);   /* drain UART RX -> interactive shell */
     extern void wifi_net_poll(void);   /* persistent WiFi ARP/ICMP responder */
+    extern void xhci_mouse_pump(void); /* drain USB HID reports -> cursor */
     shellwin_step();
     wifi_net_poll();
+    xhci_mouse_pump();
     proc_yield();
 }
 
@@ -1179,8 +1181,11 @@ void kernel_main(void)
                 delay_ms(200);
                 xhci_pcie_enum_vl805();      /* re-program BAR/cmd after the reset */
                 if (xhci_vl805_init() == 0) {       /* M4: reset + rings + run */
-                    extern int xhci_vl805_enum_mouse(void);
-                    xhci_vl805_enum_mouse();        /* M5: port scan + slot + addr + dev desc */
+                    extern int xhci_vl805_enum_full(void);
+                    extern void xhci_mouse_pump(void);
+                    extern void wm_set_tick(void (*)(void));
+                    xhci_vl805_enum_full();         /* M5/M5.5/M6: enum hubs + HID setup */
+                    wm_set_tick(xhci_mouse_pump);   /* drive the cursor from the wm loop */
                 }
             }
         } else {

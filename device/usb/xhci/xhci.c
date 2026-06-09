@@ -833,6 +833,408 @@ int xhci_vl805_enum_mouse(void)
     return 0;
 }
 
+/* ===== M5.5: USB hub enumeration + TT (the VL805 root ports are internal
+ * hubs; the mouse/keyboard sit downstream).  Per-slot EP0 ring + output ctx so
+ * a hub and its child can be addressed concurrently. ===== */
+#define XMAXSLOT 8
+static unsigned char   x_devctx_s[XMAXSLOT][33*64] __attribute__((aligned(64)));
+static struct xhci_trb x_ep0_s[XMAXSLOT][16]       __attribute__((aligned(64)));
+static int             x_ep0idx_s[XMAXSLOT], x_ep0cyc_s[XMAXSLOT];
+static unsigned char   x_hbuf[256] __attribute__((aligned(64)));   /* hub ctrl-IN buf */
+
+static void xs_ep0_push(int slot, unsigned int p0, unsigned int p1, unsigned int status, unsigned int control)
+{
+    struct xhci_trb *r = x_ep0_s[slot];
+    struct xhci_trb *t = &r[x_ep0idx_s[slot]];
+    t->p0=p0;t->p1=p1;t->status=status;
+    t->control=(control & ~1u)|(x_ep0cyc_s[slot]&1u);
+    __asm__ volatile("dsb sy":::"memory");
+    x_ep0idx_s[slot]++;
+    if (x_ep0idx_s[slot]==15){ r[15].control=(r[15].control&~1u)|(x_ep0cyc_s[slot]&1u); __asm__ volatile("dsb sy":::"memory"); x_ep0idx_s[slot]=0; x_ep0cyc_s[slot]^=1; }
+}
+/* control transfer with a data-IN stage into x_hbuf; returns bytes or -1. */
+static int xs_control_in(int slot, unsigned bmReq, unsigned bReq, unsigned wValue, unsigned wIndex, int len)
+{
+    if (len > (int)sizeof x_hbuf) len = sizeof x_hbuf;
+    for (int i=0;i<len;i++) x_hbuf[i]=0;
+    xs_ep0_push(slot, bmReq|(bReq<<8)|(wValue<<16), (wIndex)|((unsigned)len<<16), 8, (2u<<10)|(1u<<6)|(3u<<16));
+    unsigned long ba=XDA(x_hbuf);
+    xs_ep0_push(slot, (unsigned)(ba&0xffffffff),(unsigned)(ba>>32),(unsigned)len,(3u<<10)|(1u<<16));
+    xs_ep0_push(slot, 0,0,0,(4u<<10)|(1u<<5));
+    XR(x_db, slot*4)=1; __asm__ volatile("dsb sy":::"memory");
+    struct xhci_trb ev=x_event_wait(32);
+    unsigned cc=(ev.status>>24)&0xff;
+    return (cc==1||cc==13)?(int)((unsigned)len-(ev.status&0xffffff)):-1;
+}
+static int xs_control_nodata(int slot, unsigned bmReq, unsigned bReq, unsigned wValue, unsigned wIndex)
+{
+    xs_ep0_push(slot, bmReq|(bReq<<8)|(wValue<<16), wIndex, 8, (2u<<10)|(1u<<6)|(0u<<16));
+    xs_ep0_push(slot, 0,0,0,(4u<<10)|(1u<<16)|(1u<<5));
+    XR(x_db, slot*4)=1; __asm__ volatile("dsb sy":::"memory");
+    struct xhci_trb ev=x_event_wait(32);
+    return ((ev.status>>24)&0xff)==1?0:-1;
+}
+
+/* Address a device.  route=0 + tt_hub=0 for a root-port device; for a device on
+ * downstream port `dport` of hub `tt_hub` (slot id), route=dport and (for LS/FS)
+ * tt_hub/tt_port carry the TT.  root_port = the VL805 root port the chain hangs
+ * off.  Builds a per-slot EP0 ring + output ctx. */
+static int xs_address(int slot, int root_port, unsigned route, int speed, int tt_hub, int tt_port)
+{
+    struct xhci_trb *r = x_ep0_s[slot];
+    for (int i=0;i<16;i++){ r[i].p0=r[i].p1=r[i].status=r[i].control=0; }
+    r[15].p0=(unsigned)(XDA(r)&0xffffffff); r[15].p1=(unsigned)(XDA(r)>>32);
+    r[15].control=(6u<<10)|(1u<<1)|1u;
+    x_ep0idx_s[slot]=0; x_ep0cyc_s[slot]=1;
+
+    unsigned char *dctx = x_devctx_s[slot];
+    for (unsigned i=0;i<sizeof x_input_ctx;i++) x_input_ctx[i]=0;
+    for (unsigned i=0;i<33*64;i++)              dctx[i]=0;
+    unsigned int *icc=xctx(x_input_ctx,0); icc[1]=(1u<<0)|(1u<<1);
+    unsigned int *sc=xctx(x_input_ctx,1);
+    sc[0]=(1u<<27)|((unsigned)speed<<20)|(route&0xfffff);       /* entries=1, speed, route */
+    sc[1]=((unsigned)root_port&0xff)<<16;                      /* root hub port */
+    if (tt_hub){ sc[2]=((unsigned)tt_hub&0xff)|(((unsigned)tt_port&0xff)<<8); } /* TT hub slot + port */
+    int mps=(speed==4)?512:(speed==3)?64:8;
+    unsigned int *ep0=xctx(x_input_ctx,2);
+    ep0[1]=(4u<<3)|(3u<<1)|((unsigned)mps<<16);
+    unsigned long trd=XDA(r)|1u;
+    ep0[2]=(unsigned)(trd&0xffffffff); ep0[3]=(unsigned)(trd>>32); ep0[4]=8;
+    x_dcbaa[slot]=XDA(dctx);
+    __asm__ volatile("dsb sy":::"memory");
+    unsigned long ic=XDA(x_input_ctx);
+    x_cmd_push((unsigned)(ic&0xffffffff),(unsigned)(ic>>32),0,(11u<<10)|((unsigned)slot<<24));
+    struct xhci_trb ev=x_event_wait(33);
+    unsigned cc=(ev.status>>24)&0xff;
+    return (cc==1)?0:-(int)cc;
+}
+
+/* Get the 18-byte device descriptor of `slot` into x_hbuf; logs VID/PID/class. */
+static int xs_dev_desc(int slot, unsigned *vid, unsigned *pid, unsigned *cls)
+{
+    int got = xs_control_in(slot, 0x80, 6, (1u<<8), 0, 18);
+    if (got < 12) return -1;
+    *vid=x_hbuf[8]|(x_hbuf[9]<<8); *pid=x_hbuf[10]|(x_hbuf[11]<<8); *cls=x_hbuf[4];
+    return 0;
+}
+
+/* Mark slot `slot` as a USB hub in its context (Hub=1, NumPorts, MTT/TTT) via a
+ * Configure-Endpoint with only the slot context updated. */
+static int xs_make_hub(int slot, int nports, int speed)
+{
+    unsigned char *dctx = x_devctx_s[slot];
+    for (unsigned i=0;i<sizeof x_input_ctx;i++) x_input_ctx[i]=0;
+    unsigned int *icc=xctx(x_input_ctx,0); icc[1]=(1u<<0);          /* add slot ctx only */
+    /* copy current slot ctx from output, then OR in hub fields */
+    unsigned int *src=xctx(dctx,1), *sc=xctx(x_input_ctx,1);
+    sc[0]=src[0] | (1u<<26);                                       /* Hub = 1 */
+    sc[1]=src[1] | (((unsigned)nports&0xff)<<24);                  /* NumberOfPorts */
+    sc[2]=src[2] | (speed==3 ? (1u<<25) : 0u);                     /* MTT for HS hub (best-effort) */
+    sc[3]=src[3];
+    x_dcbaa[slot]=XDA(dctx); __asm__ volatile("dsb sy":::"memory");
+    unsigned long ic=XDA(x_input_ctx);
+    x_cmd_push((unsigned)(ic&0xffffffff),(unsigned)(ic>>32),0,(12u<<10)|((unsigned)slot<<24));
+    struct xhci_trb ev=x_event_wait(33);
+    return ((ev.status>>24)&0xff)==1?0:-1;
+}
+
+/* Hub class requests (wIndex = downstream port, 1-based). */
+#define HUB_SET_PORT_FEATURE  (0)   /* bmReq 0x23, bReq 3 */
+#define HUB_FEAT_PORT_POWER   8
+#define HUB_FEAT_PORT_RESET   4
+static int xs_hub_set_port(int slot, int port, int feat){ return xs_control_nodata(slot, 0x23, 3, (unsigned)feat, (unsigned)port); }
+static unsigned xs_hub_port_status(int slot, int port)
+{
+    if (xs_control_in(slot, 0xA3, 0, 0, (unsigned)port, 4) < 4) return 0;
+    return x_hbuf[0] | (x_hbuf[1]<<8) | (x_hbuf[2]<<16) | (x_hbuf[3]<<24);
+}
+
+/* Enumerate one USB hub at `hub_slot` (already addressed) on VL805 root port
+ * `root_port`: configure it, power+scan its downstream ports, and for each
+ * connected port reset + Enable Slot + Address (routed, with TT) + dev-desc.
+ * Reports each downstream device's VID/PID/class.  Returns devices found. */
+static int x_next_slot = 3;     /* hub used slots 1,2; children start at 3 */
+int xhci_hid_setup(int slot, int root_port, unsigned route, int speed, int tt_hub, int tt_port);  /* M6, below */
+int xhci_hub_enumerate(int hub_slot, int root_port, int hub_speed)
+{
+    uart_puts("[xhci] hub: configuring slot="); puts_hex32((unsigned)hub_slot); uart_puts("\n");
+    if (xs_control_nodata(hub_slot, 0x00, 9, 1, 0) != 0)           /* SET_CONFIGURATION(1) */
+        uart_puts("[xhci] hub: SET_CONFIG failed (continuing)\n");
+    /* hub descriptor: bmReq 0xA0, GET_DESCRIPTOR, wValue 0x29<<8 (hub) */
+    int hd = xs_control_in(hub_slot, 0xA0, 6, (0x29u<<8), 0, 9);
+    int nports = (hd >= 3) ? x_hbuf[2] : 0;
+    uart_puts("[xhci] hub: nports="); puts_hex32((unsigned)nports); uart_puts("\n");
+    if (nports <= 0 || nports > 15) { uart_puts("[xhci] hub: bad nports\n"); return 0; }
+    xs_make_hub(hub_slot, nports, hub_speed);
+
+    int found = 0;
+    for (int dp=1; dp<=nports; dp++) {
+        xs_hub_set_port(hub_slot, dp, HUB_FEAT_PORT_POWER);
+        delay_ms(20);
+    }
+    delay_ms(120);                                                /* PWRON2PWRGOOD */
+    for (int dp=1; dp<=nports; dp++) {
+        unsigned st = xs_hub_port_status(hub_slot, dp);
+        if (!(st & 0x1)) continue;                                /* PORT_CONNECTION */
+        uart_puts("[xhci] hub port"); uart_putc((char)('0'+dp));
+        uart_puts(" connected, status="); puts_hex32(st); uart_puts("\n");
+        xs_hub_set_port(hub_slot, dp, HUB_FEAT_PORT_RESET);
+        for (int i=0;i<20;i++){ delay_ms(10); st=xs_hub_port_status(hub_slot, dp); if (st & (1u<<4)) break; } /* PORT_ENABLE */
+        delay_ms(20);
+        st = xs_hub_port_status(hub_slot, dp);
+        /* USB2 hub port status: bit9=low-speed, bit10=high-speed (else full). */
+        int speed = (st & (1u<<10)) ? 3 /*HS*/ : (st & (1u<<9)) ? 2 /*LS*/ : 1 /*FS*/;
+        if (x_next_slot >= XMAXSLOT) break;
+        x_cmd_push(0,0,0,(9u<<10));                               /* Enable Slot */
+        struct xhci_trb ev=x_event_wait(33);
+        if (((ev.status>>24)&0xff)!=1) { uart_puts("[xhci] hub: enable-slot failed\n"); continue; }
+        int cslot=(ev.control>>24)&0xff;
+        /* TT: LS/FS device behind a HS hub needs the hub's slot+port as TT. */
+        int tt_hub = (speed!=3) ? hub_slot : 0;
+        int rc = xs_address(cslot, root_port, (unsigned)dp, speed, tt_hub, dp);
+        if (rc != 0) { uart_puts("[xhci] hub: address-device failed cc="); puts_hex32((unsigned)(-rc)); uart_puts("\n"); continue; }
+        unsigned vid=0,pid=0,cls=0;
+        if (xs_dev_desc(cslot,&vid,&pid,&cls)==0) {
+            uart_puts("[xhci] *** HID? dev hubport"); uart_putc((char)('0'+dp));
+            uart_puts(" slot="); puts_hex32((unsigned)cslot);
+            uart_puts(" speed="); puts_hex32((unsigned)speed);
+            uart_puts(" VID="); puts_hex32(vid);
+            uart_puts(" PID="); puts_hex32(pid);
+            uart_puts(" class="); puts_hex32(cls); uart_puts(" ***\n");
+            found++;
+            /* M6: bring up its HID interrupt endpoint (route=dp, TT if LS/FS). */
+            xhci_hid_setup(cslot, root_port, (unsigned)dp, speed, tt_hub, dp);
+        }
+    }
+    uart_puts("[xhci] hub: enumerate done, found="); puts_hex32((unsigned)found); uart_puts("\n");
+    return found;
+}
+
+/* Top-level: scan VL805 root ports, address each (already done in enum_mouse but
+ * redone here standalone), and for any that is a hub (class 9) recurse into it. */
+int xhci_vl805_enum_full(void)
+{
+    if (!x_running) { uart_puts("[xhci] full: not running\n"); return -1; }
+    int nports=(int)((XR(x_base,XCAP_HCSPARAMS1)>>24)&0xff);
+    x_next_slot = 1;
+    for (int p=1;p<=nports && p<=5;p++) {
+        unsigned long psc=x_oper+0x400+(p-1)*0x10;
+        XR(psc,0)=(1u<<9)|(1u<<4);
+        for (int i=0;i<100;i++){ delay_ms(1); if(!(XR(psc,0)&(1u<<4))) break; }
+        delay_ms(30);
+        unsigned v=XR(psc,0);
+        if (!(v&1u)) continue;
+        int speed=(int)((v>>10)&0xf);
+        if (x_next_slot>=XMAXSLOT) break;
+        x_cmd_push(0,0,0,(9u<<10));
+        struct xhci_trb ev=x_event_wait(33);
+        if (((ev.status>>24)&0xff)!=1) continue;
+        int slot=(ev.control>>24)&0xff;
+        if (slot >= x_next_slot) x_next_slot = slot+1;
+        if (xs_address(slot, p, 0, speed, 0, 0)!=0) continue;
+        unsigned vid=0,pid=0,cls=0;
+        if (xs_dev_desc(slot,&vid,&pid,&cls)!=0) continue;
+        uart_puts("[xhci] root port"); uart_putc((char)('0'+p));
+        uart_puts(" slot="); puts_hex32((unsigned)slot);
+        uart_puts(" VID="); puts_hex32(vid); uart_puts(" PID="); puts_hex32(pid);
+        uart_puts(" class="); puts_hex32(cls); uart_puts("\n");
+        if (cls == 9) xhci_hub_enumerate(slot, p, speed);          /* recurse into hub */
+    }
+    return 0;
+}
+
+/* ===== M6: HID setup (config-desc walk -> interrupt-IN EP -> Configure
+ * Endpoint with route/TT -> SET_PROTOCOL boot) + interrupt pump -> cursor. == */
+static struct xhci_trb x_int_ring[XMAXSLOT][16] __attribute__((aligned(64)));
+static int             x_int_idx[XMAXSLOT], x_int_cyc[XMAXSLOT];
+static unsigned char   x_hid_buf[XMAXSLOT][8]   __attribute__((aligned(64)));
+static int x_mouse_slot=-1, x_mouse_dci, x_mouse_iface, x_kbd_slot=-1, x_kbd_dci, x_kbd_iface;
+static unsigned char x_kbd_prev[8];
+static unsigned long x_mouse_reports, x_kbd_reports;
+static int x_poll_mode = 1;   /* 1 = poll HID via EP0 GET_REPORT (interrupt EP silent via TT) */
+
+static void x_hid_arm(int slot, int dci)
+{
+    struct xhci_trb *r=x_int_ring[slot];
+    struct xhci_trb *t=&r[x_int_idx[slot]];
+    unsigned long ba=XDA(x_hid_buf[slot]);
+    t->p0=(unsigned)(ba&0xffffffff); t->p1=(unsigned)(ba>>32);
+    t->status=8;
+    t->control=(1u<<10)|(1u<<5)|(x_int_cyc[slot]&1u);          /* Normal + IOC */
+    __asm__ volatile("dsb sy":::"memory");
+    x_int_idx[slot]++;
+    if (x_int_idx[slot]==15){ r[15].control=(r[15].control&~1u)|(x_int_cyc[slot]&1u); __asm__ volatile("dsb sy":::"memory"); x_int_idx[slot]=0; x_int_cyc[slot]^=1; }
+    XR(x_db, slot*4)=(unsigned)dci;
+    __asm__ volatile("dsb sy":::"memory");
+}
+
+/* Configure a HID device's interrupt-IN endpoint and start it.  Re-supplies the
+ * slot ctx (route/speed/root_port/TT) so Configure Endpoint preserves the path. */
+int xhci_hid_setup(int slot, int root_port, unsigned route, int speed, int tt_hub, int tt_port)
+{
+    /* config descriptor: header then full. */
+    int got = xs_control_in(slot, 0x80, 6, (2u<<8), 0, 9);
+    if (got < 4 || x_hbuf[1] != 2) { uart_puts("[xhci] hid: no config desc\n"); return -1; }
+    int wtot = x_hbuf[2] | (x_hbuf[3]<<8);
+    if (wtot > (int)sizeof x_hbuf) wtot = sizeof x_hbuf;
+    xs_control_in(slot, 0x80, 6, (2u<<8), 0, wtot);
+
+    int pos=0, cur_class=-1, cur_proto=-1, found=0, epaddr=0, mps=0, interval=1, iface=0;
+    while (pos+2 <= wtot) {
+        int blen=x_hbuf[pos], btype=x_hbuf[pos+1];
+        if (blen<2) break;
+        if (btype==4){ iface=x_hbuf[pos+2]; cur_class=x_hbuf[pos+5]; cur_proto=x_hbuf[pos+7]; }
+        else if (btype==5 && cur_class==3){
+            int ea=x_hbuf[pos+2], attr=x_hbuf[pos+3];
+            if ((attr&3)==3 && (ea&0x80)){ epaddr=ea; mps=x_hbuf[pos+4]|(x_hbuf[pos+5]<<8); interval=x_hbuf[pos+6]; found=1; break; }
+        }
+        pos+=blen;
+    }
+    if (!found){ uart_puts("[xhci] hid: no interrupt-IN EP\n"); return -2; }
+    int dci=(epaddr&0xf)*2+1, proto=cur_proto;
+    uart_puts("[xhci] hid: slot="); puts_hex32((unsigned)slot);
+    uart_puts(" iface_proto="); puts_hex32((unsigned)proto);
+    uart_puts(" epaddr="); puts_hex32((unsigned)epaddr);
+    uart_puts(" mps="); puts_hex32((unsigned)mps);
+    uart_puts(" dci="); puts_hex32((unsigned)dci); uart_puts("\n");
+
+    if (xs_control_nodata(slot, 0x00, 9, 1, 0)!=0) uart_puts("[xhci] hid: SET_CONFIG failed\n");
+
+    /* interrupt-IN transfer ring */
+    struct xhci_trb *r=x_int_ring[slot];
+    for (int i=0;i<16;i++){ r[i].p0=r[i].p1=r[i].status=r[i].control=0; }
+    r[15].p0=(unsigned)(XDA(r)&0xffffffff); r[15].p1=(unsigned)(XDA(r)>>32);
+    r[15].control=(6u<<10)|(1u<<1)|1u;
+    x_int_idx[slot]=0; x_int_cyc[slot]=1;
+
+    unsigned char *dctx=x_devctx_s[slot];
+    for (unsigned i=0;i<sizeof x_input_ctx;i++) x_input_ctx[i]=0;
+    unsigned int *icc=xctx(x_input_ctx,0); icc[1]=(1u<<0)|(1u<<dci);
+    unsigned int *sc=xctx(x_input_ctx,1);
+    sc[0]=((unsigned)dci<<27)|((unsigned)speed<<20)|(route&0xfffff);
+    sc[1]=((unsigned)root_port&0xff)<<16;
+    if (tt_hub) sc[2]=((unsigned)tt_hub&0xff)|(((unsigned)tt_port&0xff)<<8);
+    unsigned int *ep=xctx(x_input_ctx,dci+1);
+    unsigned iv=3; { int b=interval; while (b>1 && iv<10){ b>>=1; iv++; } }
+    ep[0]=(iv<<16);
+    ep[1]=(7u<<3)|(3u<<1)|((unsigned)mps<<16);                 /* Interrupt-IN, CErr=3, MPS */
+    unsigned long trd=XDA(r)|1u;
+    ep[2]=(unsigned)(trd&0xffffffff); ep[3]=(unsigned)(trd>>32);
+    ep[4]=((unsigned)mps<<16)|((unsigned)mps);
+    x_dcbaa[slot]=XDA(dctx); __asm__ volatile("dsb sy":::"memory");
+    unsigned long ic=XDA(x_input_ctx);
+    x_cmd_push((unsigned)(ic&0xffffffff),(unsigned)(ic>>32),0,(12u<<10)|((unsigned)slot<<24));
+    struct xhci_trb ev=x_event_wait(33);
+    unsigned cc=(ev.status>>24)&0xff;
+    uart_puts("[xhci] hid: configure-ep cc="); puts_hex32(cc); uart_puts("\n");
+    if (cc!=1) return -3;
+
+    xs_control_nodata(slot, 0x21, 0x0A, 0, iface);             /* SET_IDLE(0) */
+    xs_control_nodata(slot, 0x21, 0x0B, 0, iface);             /* SET_PROTOCOL boot */
+
+    x_hid_arm(slot, dci); x_hid_arm(slot, dci);                /* prime two transfers */
+    if (proto==1){ x_kbd_slot=slot; x_kbd_dci=dci; x_kbd_iface=iface; uart_puts("[xhci] hid: keyboard armed\n"); }
+    else         { x_mouse_slot=slot; x_mouse_dci=dci; x_mouse_iface=iface; uart_puts("[xhci] hid: mouse armed\n"); }
+    return 0;
+}
+
+/* HID GET_REPORT(Input) on EP0 — for LS/FS devices behind a hub whose periodic
+ * (interrupt) transfers don't deliver via the TT, this control-pipe poll
+ * reliably reads the current report (control transfers are proven working).
+ * Returns bytes read into x_hbuf, or <=0. */
+static int xs_get_report(int slot, int iface, int len)
+{
+    return xs_control_in(slot, 0xA1, 0x01, 0x0100, (unsigned)iface, len);
+}
+
+static const char x_km[64] = {
+    [0x04]='a',[0x05]='b',[0x06]='c',[0x07]='d',[0x08]='e',[0x09]='f',[0x0a]='g',[0x0b]='h',
+    [0x0c]='i',[0x0d]='j',[0x0e]='k',[0x0f]='l',[0x10]='m',[0x11]='n',[0x12]='o',[0x13]='p',
+    [0x14]='q',[0x15]='r',[0x16]='s',[0x17]='t',[0x18]='u',[0x19]='v',[0x1a]='w',[0x1b]='x',
+    [0x1c]='y',[0x1d]='z',[0x1e]='1',[0x1f]='2',[0x20]='3',[0x21]='4',[0x22]='5',[0x23]='6',
+    [0x24]='7',[0x25]='8',[0x26]='9',[0x27]='0',[0x28]='\n',[0x2b]='\t',[0x2c]=' ',
+    [0x2d]='-',[0x2e]='=',[0x2f]='[',[0x30]=']',[0x33]=';',[0x34]='\'',[0x36]=',',[0x37]='.',[0x38]='/',
+};
+
+/* Called periodically (wm tick): drain the event ring, deliver HID reports. */
+static unsigned long x_pump_calls;
+void xhci_mouse_pump(void)
+{
+    extern void xhci_mouse_event(unsigned, int, int);
+    extern void xhci_keyboard_event(char);
+    x_pump_calls++;
+    if (!x_running) return;
+    if (x_mouse_slot<0 && x_kbd_slot<0) return;
+
+    if (x_poll_mode) {
+        /* Control-pipe poll: the interrupt EP is silent (LS device, hub TT), but
+         * EP0 GET_REPORT works.  Read the mouse, then the keyboard. */
+        if (x_mouse_slot>=0) {
+            int n = xs_get_report(x_mouse_slot, x_mouse_iface, 4);
+            if (n >= 3) {
+                unsigned char *b=x_hbuf;
+                unsigned btn=b[0]; int dx=(int)(signed char)b[1]; int dy=(int)(signed char)b[2];
+                for (int i=0;i<4 && i<8;i++) x_hid_buf[x_mouse_slot][i]=b[i];
+                x_mouse_reports++;
+                if (dx||dy||btn) xhci_mouse_event(btn,dx,dy);
+            }
+        }
+        if (x_kbd_slot>=0) {
+            int n = xs_get_report(x_kbd_slot, x_kbd_iface, 8);
+            if (n >= 3) {
+                unsigned char *b=x_hbuf;
+                int shift=(b[0]&0x22)!=0;
+                for (int i=2;i<8;i++){ unsigned u=b[i]; if (!u||u>=0x40) continue;
+                    int held=0; for (int j=2;j<8;j++) if (x_kbd_prev[j]==u){held=1;break;}
+                    if (held) continue; char c=x_km[u]; if(c){ if(shift&&c>='a'&&c<='z') c-=32; xhci_keyboard_event(c);} }
+                for (int i=0;i<8;i++) x_kbd_prev[i]=b[i];
+                x_kbd_reports++;
+            }
+        }
+        return;
+    }
+
+    for (int guard=0; guard<32; guard++) {
+        struct xhci_trb *e=&x_evt[x_evt_idx];
+        __asm__ volatile("dsb sy":::"memory");
+        if ((e->control & 1u) != (unsigned)x_evt_cycle) break;
+        struct xhci_trb ev=*e;
+        x_evt_idx++;
+        if (x_evt_idx==XEVT_N){ x_evt_idx=0; x_evt_cycle^=1; }
+        unsigned long erdp=XDA(&x_evt[x_evt_idx]);
+        XR(x_rt,XIR0_ERDP)  =(unsigned)((erdp&0xffffffff)|(1u<<3));
+        XR(x_rt,XIR0_ERDP+4)=(unsigned)(erdp>>32);
+        if (((ev.control>>10)&0x3f)!=32) continue;             /* Transfer Event */
+        int eslot=(int)((ev.control>>24)&0xff);
+        int edci =(int)((ev.control>>16)&0x1f);
+        if (eslot==x_mouse_slot && edci==x_mouse_dci){
+            unsigned char *b=x_hid_buf[x_mouse_slot];
+            unsigned btn=b[0]; int dx=(int)(signed char)b[1]; int dy=(int)(signed char)b[2];
+            x_mouse_reports++;
+            if (dx||dy||btn) xhci_mouse_event(btn,dx,dy);
+            x_hid_arm(x_mouse_slot, x_mouse_dci);
+        } else if (eslot==x_kbd_slot && edci==x_kbd_dci){
+            unsigned char *b=x_hid_buf[x_kbd_slot];
+            int shift=(b[0]&0x22)!=0;
+            for (int i=2;i<8;i++){ unsigned u=b[i]; if (!u||u>=0x40) continue;
+                int held=0; for (int j=2;j<8;j++) if (x_kbd_prev[j]==u){held=1;break;}
+                if (held) continue; char c=x_km[u]; if(c){ if(shift&&c>='a'&&c<='z') c-=32; xhci_keyboard_event(c);} }
+            for (int i=0;i<8;i++) x_kbd_prev[i]=b[i];
+            x_kbd_reports++;
+            x_hid_arm(x_kbd_slot, x_kbd_dci);
+        }
+    }
+}
+unsigned long xhci_mouse_reports(void){ return x_mouse_reports; }
+unsigned long xhci_kbd_reports(void)  { return x_kbd_reports; }
+int           xhci_mouse_ok(void)     { return x_mouse_slot>=0; }
+unsigned long xhci_pump_calls(void)   { return x_pump_calls; }
+unsigned int  xhci_mfindex(void)      { return x_running ? (XR(x_rt,0)&0x3fff) : 0; }
+int           xhci_mouse_slot_dbg(void){ return x_mouse_slot; }
+unsigned int  xhci_mouse_bufbyte(int i){ return (x_mouse_slot>=0 && i>=0 && i<8) ? x_hid_buf[x_mouse_slot][i] : 0; }
+/* EP1/interrupt endpoint state of the mouse slot (0=disabled,1=running,2=halted,3=stopped,4=error) */
+unsigned int  xhci_mouse_ep_state(void){ return (x_mouse_slot>=0) ? (xctx(x_devctx_s[x_mouse_slot], x_mouse_dci)[0] & 0x7) : 0; }
+
 /* Firmware-proxied probe of the addresses our start4.elf disassembly
  * identified as PCIe-init gating points.  Each row reports the value AND
  * the mailbox response code: 0x80000004 = firmware handled (value valid),
@@ -987,6 +1389,17 @@ int xhci_pcie_bring_up(void)                       { return -1; }
 int xhci_pcie_enum_vl805(void)                     { return -1; }
 int xhci_vl805_init(void)                          { return -1; }
 int xhci_vl805_enum_mouse(void)                    { return -1; }
+int xhci_vl805_enum_full(void)                     { return -1; }
+int xhci_hub_enumerate(int a,int b,int c)          { (void)a;(void)b;(void)c; return -1; }
+int xhci_hid_setup(int a,int b,unsigned c,int d,int e,int f){ (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; return -1; }
+void xhci_mouse_pump(void)                          { }
+unsigned long xhci_pump_calls(void)                 { return 0; }
+unsigned long xhci_mouse_reports(void)              { return 0; }
+unsigned long xhci_kbd_reports(void)                { return 0; }
+unsigned int  xhci_mfindex(void)                    { return 0; }
+int           xhci_mouse_slot_dbg(void)             { return -1; }
+unsigned int  xhci_mouse_ep_state(void)             { return 0; }
+unsigned int  xhci_mouse_bufbyte(int i)             { (void)i; return 0; }
 int xhci_periph_read(unsigned int a, unsigned int *o, unsigned int *r)
                                                    { (void)a; if (o) *o = 0; if (r) *r = 0; return -1; }
 int xhci_periph_write(unsigned int a, unsigned int v)  { (void)a; (void)v; return -1; }

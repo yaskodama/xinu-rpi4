@@ -1337,6 +1337,25 @@ static int http_build(const char *req, char *out, int max)
             bl = s_put(body, bl, " (link not up; skipping enum)");
         }
         bl = s_put(body, bl, ". See serial for detail.\n");
+    } else if (starts_with(req, "GET /usbdiag") || starts_with(req, "POST /usbdiag")) {
+        /* HID pump diagnostics: are reports arriving + the cursor pump running? */
+        extern unsigned long xhci_pump_calls(void);
+        extern unsigned long xhci_mouse_reports(void);
+        extern unsigned long xhci_kbd_reports(void);
+        extern unsigned int  xhci_mfindex(void);
+        extern int           xhci_mouse_slot_dbg(void);
+        extern unsigned int  xhci_mouse_ep_state(void);
+        extern unsigned int  xhci_mouse_bufbyte(int);
+        ctype = "text/plain";
+        bl = s_put(body, bl, "pump_calls=");   bl = s_putdec(body, bl, (long)xhci_pump_calls());
+        bl = s_put(body, bl, " mfindex=");     bl = s_putdec(body, bl, (long)xhci_mfindex());
+        bl = s_put(body, bl, " mouse_slot=");  bl = s_putdec(body, bl, (long)xhci_mouse_slot_dbg());
+        bl = s_put(body, bl, " ep_state=");    bl = s_putdec(body, bl, (long)xhci_mouse_ep_state());
+        bl = s_put(body, bl, " mouse_reports="); bl = s_putdec(body, bl, (long)xhci_mouse_reports());
+        bl = s_put(body, bl, " kbd_reports=");   bl = s_putdec(body, bl, (long)xhci_kbd_reports());
+        bl = s_put(body, bl, " buf=");
+        for (int i=0;i<4;i++){ bl = s_putdec(body, bl, (long)xhci_mouse_bufbyte(i)); bl = s_put(body, bl, ","); }
+        bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "GET /xhci-reset") || starts_with(req, "POST /xhci-reset")) {
         /* On-demand VC mailbox notify-xhci-reset call.  Isolated so a hung
          * mailbox can't wedge the boot (the original failure mode). */
