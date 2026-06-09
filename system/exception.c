@@ -107,6 +107,31 @@ static void dump_and_halt(const char *kind)
     for (;;) __asm__ volatile ("wfe");
 }
 
+/* Synchronous-exception dispatch via sync_entry (which saved full context, so
+ * we may RETURN to re-execute the faulting instruction).  Demand paging: a
+ * translation abort whose FAR is in the demand window is fixed by vm_fault()
+ * and we return -> eret retries the access.  Everything else falls through to
+ * the legacy handler (probe longjmp / recover_spin), which never returns. */
+void sync_handler_default(void);    /* defined just below */
+__attribute__((used))
+void sync_dispatch_c(void)
+{
+    unsigned long esr, far;
+    __asm__ volatile ("mrs %0, esr_el1" : "=r"(esr));
+    __asm__ volatile ("mrs %0, far_el1" : "=r"(far));
+    unsigned int ec   = (unsigned int)((esr >> 26) & 0x3f);
+    unsigned int dfsc = (unsigned int)(esr & 0x3f);
+    /* EC 0x20/0x21 = instruction abort, 0x24/0x25 = data abort.
+     * DFSC 0x04..0x07 = translation fault (levels 0-3). */
+    int is_abort = (ec == 0x24 || ec == 0x25 || ec == 0x20 || ec == 0x21);
+    int is_xlate = (dfsc >= 0x04 && dfsc <= 0x07);
+    if (is_abort && is_xlate && !g_probe_active) {
+        extern int vm_fault(unsigned long);
+        if (vm_fault(far)) return;            /* page mapped -> eret retries it */
+    }
+    sync_handler_default();                   /* not demand paging -> never returns */
+}
+
 __attribute__((used))
 void sync_handler_default(void)
 {
