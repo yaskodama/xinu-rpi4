@@ -99,6 +99,17 @@ void uart_init(void)
     }
 #endif
 
+#ifdef UART_TRUST_FW_BAUD
+    /* Pi 5 dedicated DEBUG UART (0x107D001000): the firmware already
+     * configured it to 115200 8N1 — we read the firmware + BL31 boot log
+     * over it cleanly.  Its UARTCLK is NOT 48 MHz, so reprogramming the
+     * divisor below to the 48 MHz-derived 26/3 garbles the line (the
+     * banner's '=' (0x3D) arrives as '}' (0x7D) — a one-bit baud slip).
+     * So leave IBRD/FBRD/LCRH exactly as the firmware left them; just make
+     * sure TX/RX are enabled without ever disabling (UART_CR=0) and
+     * re-latching a stale divisor. */
+    UART_CR |= CR_UARTEN | CR_TXE | CR_RXE;
+#else
     /* 1. Disable while we reprogram. */
     UART_CR = 0;
 
@@ -117,6 +128,7 @@ void uart_init(void)
 
     /* 4. Re-enable TX + RX. */
     UART_CR = CR_UARTEN | CR_TXE | CR_RXE;
+#endif
 
     /* Drain any bytes the firmware / QEMU stdio pumped in before we
      * finished reprogramming — otherwise piped-stdin smoke tests

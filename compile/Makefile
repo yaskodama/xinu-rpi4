@@ -83,8 +83,16 @@ COMMON  = -Wall -O2 -ffreestanding -nostdinc -nostdlib -nostartfiles \
 # 0x107C00B880 (best-effort).  Serial console = GPIO14/15 = RP1 UART0 at
 # BCM2712-side 0x1F00030000 (PCIe window to RP1; needs pciex4_reset=0 in
 # config.txt).  HEAP_END 1 GiB conservative for the smallest Pi 5.
+# UART0_BASE = the BCM2712 on-SoC dedicated DEBUG UART (0x107D001000), NOT
+# the RP1 UART0 on GPIO14/15 (0x1F00030000).  The RP1 UART sits behind the
+# PCIe window, so uart_init() — which runs with the MMU off, before any PCIe
+# mapping — DATA-ABORTS the moment it pokes 0x1F00030000, killing the kernel
+# before its first byte of output ("nothing after BL31" over serial).  The
+# debug UART is on-SoC and PCIe-independent, so it is always safe and is the
+# one wired to the 3-pin JST-SH debug header / Debug Probe.
 PI5_CFLAGS  = $(COMMON) -mcpu=cortex-a76 \
-              -DUART0_BASE=0x1F00030000UL \
+              -DUART0_BASE=0x107D001000UL \
+              -DUART_TRUST_FW_BAUD \
               -DMBOX_BASE=0x107C00B880UL \
               -DHEAP_END=0x40000000UL \
               -DBOARD_NAME=\"Pi5\" \
@@ -139,6 +147,15 @@ obj/qemu/cc.o: cc.c | obj/qemu ; $(CC) $(QEMU_FP_CFLAGS) -c $< -o $@
 obj/pi5/llm.o:  llm.c | obj/pi5  ; $(CC) $(PI5_FP_CFLAGS)  -c $< -o $@
 obj/pi4/llm.o:  llm.c | obj/pi4  ; $(CC) $(PI4_FP_CFLAGS)  -c $< -o $@
 obj/qemu/llm.o: llm.c | obj/qemu ; $(CC) $(QEMU_FP_CFLAGS) -c $< -o $@
+
+# Pi 5 OMITS the ~1 MB embedded LLM model (blob.S -DLLM_NO_MODEL).  With the
+# model baked in, the loaded kernel image grows past ~1.5 MB and the Pi 5 no
+# longer boots: the firmware loads kernel_2712.img, BL31 runs, then the kernel
+# produces no output (confirmed over the dedicated debug UART).  llm.c is still
+# compiled so the llm/chat symbols resolve, but model_data is an empty
+# placeholder, so the llm/chat commands are inert on the Pi 5.  Pi 4 and QEMU
+# keep the full model (it both boots and runs inference there).
+obj/pi5/blob.o:  blob.S | obj/pi5  ; $(CC) $(PI5_CFLAGS) -DLLM_NO_MODEL -c $< -o $@
 
 obj/pi5/%.o: %.c  | obj/pi5  ; $(CC) $(PI5_CFLAGS)  -c $< -o $@
 obj/pi5/%.o: %.S  | obj/pi5  ; $(CC) $(PI5_CFLAGS)  -c $< -o $@
