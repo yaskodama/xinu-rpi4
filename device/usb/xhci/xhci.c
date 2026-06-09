@@ -1038,7 +1038,9 @@ int xhci_vl805_enum_full(void)
         uart_puts(" slot="); puts_hex32((unsigned)slot);
         uart_puts(" VID="); puts_hex32(vid); uart_puts(" PID="); puts_hex32(pid);
         uart_puts(" class="); puts_hex32(cls); uart_puts("\n");
-        if (cls == 9) xhci_hub_enumerate(slot, p, speed);          /* recurse into hub */
+        /* On the VL805 every root port is an internal hub; recurse into each
+         * (class 9 = hub, but the Genesys USB2 hub reports device class 0). */
+        if (cls == 9 || cls == 0) xhci_hub_enumerate(slot, p, speed);
     }
     return 0;
 }
@@ -1051,7 +1053,8 @@ static unsigned char   x_hid_buf[XMAXSLOT][8]   __attribute__((aligned(64)));
 static int x_mouse_slot=-1, x_mouse_dci, x_mouse_iface, x_kbd_slot=-1, x_kbd_dci, x_kbd_iface;
 static unsigned char x_kbd_prev[8];
 static unsigned long x_mouse_reports, x_kbd_reports;
-static int x_poll_mode = 1;   /* 1 = poll HID via EP0 GET_REPORT (interrupt EP silent via TT) */
+static int x_poll_mode = 0;   /* 0 = interrupt EP (drain event ring); 1 = EP0 GET_REPORT poll */
+static unsigned x_xfer_events, x_last_xfer_cc, x_last_xfer_slot, x_last_xfer_dci;
 
 static void x_hid_arm(int slot, int dci)
 {
@@ -1207,6 +1210,8 @@ void xhci_mouse_pump(void)
         if (((ev.control>>10)&0x3f)!=32) continue;             /* Transfer Event */
         int eslot=(int)((ev.control>>24)&0xff);
         int edci =(int)((ev.control>>16)&0x1f);
+        x_xfer_events++; x_last_xfer_cc=(ev.status>>24)&0xff;   /* diag: any transfer event */
+        x_last_xfer_slot=(unsigned)eslot; x_last_xfer_dci=(unsigned)edci;
         if (eslot==x_mouse_slot && edci==x_mouse_dci){
             unsigned char *b=x_hid_buf[x_mouse_slot];
             unsigned btn=b[0]; int dx=(int)(signed char)b[1]; int dy=(int)(signed char)b[2];
@@ -1234,6 +1239,9 @@ int           xhci_mouse_slot_dbg(void){ return x_mouse_slot; }
 unsigned int  xhci_mouse_bufbyte(int i){ return (x_mouse_slot>=0 && i>=0 && i<8) ? x_hid_buf[x_mouse_slot][i] : 0; }
 /* EP1/interrupt endpoint state of the mouse slot (0=disabled,1=running,2=halted,3=stopped,4=error) */
 unsigned int  xhci_mouse_ep_state(void){ return (x_mouse_slot>=0) ? (xctx(x_devctx_s[x_mouse_slot], x_mouse_dci)[0] & 0x7) : 0; }
+unsigned int  xhci_xfer_events(void)  { return x_xfer_events; }
+unsigned int  xhci_last_xfer_cc(void) { return x_last_xfer_cc; }
+unsigned int  xhci_last_xfer_sd(void) { return (x_last_xfer_slot<<8)|x_last_xfer_dci; }
 
 /* Firmware-proxied probe of the addresses our start4.elf disassembly
  * identified as PCIe-init gating points.  Each row reports the value AND
@@ -1400,6 +1408,9 @@ unsigned int  xhci_mfindex(void)                    { return 0; }
 int           xhci_mouse_slot_dbg(void)             { return -1; }
 unsigned int  xhci_mouse_ep_state(void)             { return 0; }
 unsigned int  xhci_mouse_bufbyte(int i)             { (void)i; return 0; }
+unsigned int  xhci_xfer_events(void)                { return 0; }
+unsigned int  xhci_last_xfer_cc(void)               { return 0; }
+unsigned int  xhci_last_xfer_sd(void)               { return 0; }
 int xhci_periph_read(unsigned int a, unsigned int *o, unsigned int *r)
                                                    { (void)a; if (o) *o = 0; if (r) *r = 0; return -1; }
 int xhci_periph_write(unsigned int a, unsigned int v)  { (void)a; (void)v; return -1; }

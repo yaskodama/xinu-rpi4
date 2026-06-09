@@ -1355,6 +1355,10 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, " kbd_reports=");   bl = s_putdec(body, bl, (long)xhci_kbd_reports());
         bl = s_put(body, bl, " buf=");
         for (int i=0;i<4;i++){ bl = s_putdec(body, bl, (long)xhci_mouse_bufbyte(i)); bl = s_put(body, bl, ","); }
+        { extern unsigned int xhci_xfer_events(void); extern unsigned int xhci_last_xfer_cc(void); extern unsigned int xhci_last_xfer_sd(void);
+          bl = s_put(body, bl, " xfer_events="); bl = s_putdec(body, bl, (long)xhci_xfer_events());
+          bl = s_put(body, bl, " last_cc=");     bl = s_putdec(body, bl, (long)xhci_last_xfer_cc());
+          bl = s_put(body, bl, " last_sd=");     bl = s_putdec(body, bl, (long)xhci_last_xfer_sd()); }
         bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "GET /xhci-reset") || starts_with(req, "POST /xhci-reset")) {
         /* On-demand VC mailbox notify-xhci-reset call.  Isolated so a hung
