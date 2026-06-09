@@ -7,6 +7,7 @@
 #define DEFAULT_FPS    20            /* 1 frame every 50 ms          */
 
 static window_t *wm_head;
+static struct window *active_win;              /* last-clicked window (highlighted border) */
 static void    (*wm_tick)(void);
 
 /* Cursor overlay state — repainted on top of all windows every
@@ -105,6 +106,34 @@ static void draw_cursor(void)
     }
 
     video_set_viewport(save_x, save_y);
+}
+
+/* ---- smooth cursor: draw straight onto the VISIBLE HDMI buffer with a 12x12
+ * save/restore backing store, so the wm loop can move the pointer many times
+ * between the (expensive) 20 fps full-scene flips. ---- */
+extern void video_vis_save(int, int, int, int, unsigned int *);
+extern void video_vis_restore(int, int, int, int, const unsigned int *);
+extern void video_vis_pixel(int, int, unsigned int);
+extern void xhci_mouse_pump(void);     /* cheap event-ring drain -> cursor_x/y */
+#define WM_CURSOR_STEP_MS 2
+static unsigned int cur_bak[12*12];
+static int          cur_bak_valid, cur_bak_x, cur_bak_y;
+
+static void cursor_vis_hide(void)
+{
+    if (cur_bak_valid) { video_vis_restore(cur_bak_x, cur_bak_y, 12, 12, cur_bak); cur_bak_valid = 0; }
+}
+static void cursor_vis_show(void)
+{
+    if (!cursor_visible) return;
+    cur_bak_x = cursor_x; cur_bak_y = cursor_y;
+    video_vis_save(cur_bak_x, cur_bak_y, 12, 12, cur_bak); cur_bak_valid = 1;
+    for (int dy = 0; dy < 12; dy++)
+        for (int dx = 0; dx < 12; dx++) {
+            char c = cursor_sprite[dy][dx];
+            if      (c == '#') video_vis_pixel(cursor_x + dx, cursor_y + dy, 0xFFFFFFFFU);
+            else if (c == '.') video_vis_pixel(cursor_x + dx, cursor_y + dy, 0xFF000000U);
+        }
 }
 
 void wm_add(window_t *w)
@@ -209,6 +238,101 @@ static void draw_chrome(window_t *w)
     int cy = w->y + WM_TITLEBAR_H + 2;
     int ch = w->height - WM_TITLEBAR_H - 3;
     fill_rect(w->x + 1, cy, w->width - 2, ch, w->content_bg);
+
+    /* resize grip: three short diagonal ticks in the bottom-right corner */
+    { int gx = w->x + w->width - 4, gy = w->y + w->height - 4;
+      for (int k = 0; k < 3; k++)
+          fill_rect(gx - k*4, gy - k*4, 2, 2, w->chrome_color); }
+
+    /* active (last-clicked) window: a thicker amber highlight border */
+    if (w == active_win) {
+        unsigned int hl = 0xFFFFD23CU;            /* amber */
+        draw_rect(w->x,     w->y,     w->width,     w->height,     hl);
+        draw_rect(w->x + 1, w->y + 1, w->width - 2, w->height - 2, hl);
+        draw_rect(w->x + 2, w->y + 2, w->width - 4, w->height - 4, hl);
+    }
+}
+
+/* ---- window drag: left-button drag on a title bar moves the window. ----
+ * Driven by xhci_mouse_event (main.c) via wm_pointer() on every mouse report.
+ * Cursor coords are SCREEN-space; windows live in desktop coords (+viewport). */
+#define WM_RESIZE_GRAB 16                      /* bottom-right grab square */
+#define WM_MIN_W       96
+#define WM_MIN_H       (WM_TITLEBAR_H + 24)
+static window_t *drag_win;
+static int       drag_mode;                    /* 1 = move, 2 = resize */
+static int       drag_off_x, drag_off_y;
+
+static window_t *window_at_titlebar(int dx, int dy)
+{
+    window_t *hit = 0;                 /* later in the list = drawn on top */
+    for (window_t *w = wm_head; w; w = w->next)
+        if (dx >= w->x && dx < w->x + w->width &&
+            dy >= w->y && dy < w->y + WM_TITLEBAR_H)
+            hit = w;
+    return hit;
+}
+
+/* Topmost window whose bottom-right corner grab square contains (dx,dy). */
+static window_t *window_at_resize(int dx, int dy)
+{
+    window_t *hit = 0;
+    for (window_t *w = wm_head; w; w = w->next) {
+        int rx = w->x + w->width, ry = w->y + w->height;
+        if (dx >= rx - WM_RESIZE_GRAB && dx < rx && dy >= ry - WM_RESIZE_GRAB && dy < ry)
+            hit = w;
+    }
+    return hit;
+}
+
+/* Bring `w` to the front of the draw order (end of the list = on top). */
+static void wm_raise(window_t *w)
+{
+    if (!wm_head || wm_head == w) { /* if head, only move when it has siblings */
+        if (wm_head == w && w->next) {
+            wm_head = w->next;
+        } else return;
+    } else {
+        window_t *p = wm_head;
+        while (p->next && p->next != w) p = p->next;
+        if (!p->next) return;          /* not found */
+        p->next = w->next;
+    }
+    window_t *t = wm_head;
+    while (t->next) t = t->next;
+    t->next = w; w->next = 0;
+}
+
+void wm_pointer(int sx, int sy, int left)
+{
+    int dx = sx + vp_x, dy = sy + vp_y;         /* screen -> desktop */
+    if (left) {
+        if (!drag_win) {
+            window_t *w = window_at_resize(dx, dy);     /* corner first (it's inside the window) */
+            if (w) { drag_win = w; drag_mode = 2; drag_off_x = dx - (w->x + w->width);
+                     drag_off_y = dy - (w->y + w->height); active_win = w; wm_raise(w); }
+            else if ((w = window_at_titlebar(dx, dy)) != 0) {
+                drag_win = w; drag_mode = 1; drag_off_x = dx - w->x; drag_off_y = dy - w->y; active_win = w; wm_raise(w);
+            }
+        } else if (drag_mode == 2) {                    /* resize bottom-right */
+            int nw = dx - drag_off_x - drag_win->x;
+            int nh = dy - drag_off_y - drag_win->y;
+            if (nw < WM_MIN_W) nw = WM_MIN_W;
+            if (nh < WM_MIN_H) nh = WM_MIN_H;
+            if (drag_win->x + nw > WM_DESKTOP_W) nw = WM_DESKTOP_W - drag_win->x;
+            if (drag_win->y + nh > WM_DESKTOP_H) nh = WM_DESKTOP_H - drag_win->y;
+            drag_win->width = nw; drag_win->height = nh;
+        } else {                                        /* move */
+            drag_win->x = dx - drag_off_x;
+            drag_win->y = dy - drag_off_y;
+            if (drag_win->x < 0) drag_win->x = 0;
+            if (drag_win->y < 0) drag_win->y = 0;
+            if (drag_win->x > WM_DESKTOP_W - 16) drag_win->x = WM_DESKTOP_W - 16;
+            if (drag_win->y > WM_DESKTOP_H - 16) drag_win->y = WM_DESKTOP_H - 16;
+        }
+    } else {
+        drag_win = 0; drag_mode = 0;                     /* button released */
+    }
 }
 
 void wm_run(void)
@@ -273,9 +397,22 @@ void wm_run(void)
             }
         }
 
-        draw_cursor();   /* screen-space overlay, always on top */
-        video_present(); /* flip the finished off-screen frame to HDMI */
-        delay_ms(1000 / DEFAULT_FPS);
+        video_present();   /* flip the finished off-screen frame to HDMI (no cursor) */
+        cur_bak_valid = 0; /* the flip overwrote the visible buffer */
+        cursor_vis_show(); /* draw the cursor straight on the visible buffer */
+
+        /* Fast cursor sub-loop for the rest of the frame interval: pump the
+         * mouse and move ONLY the cursor (backing store) at ~330 Hz, so the
+         * pointer is smooth even though the full scene repaints at 20 fps. */
+        for (int t = 0; t < 1000 / DEFAULT_FPS; t += WM_CURSOR_STEP_MS) {
+            delay_ms(WM_CURSOR_STEP_MS);
+            int px = cursor_x, py = cursor_y;
+            xhci_mouse_pump();                      /* tight: drain HID -> cursor_x/y */
+            if (cursor_x != px || cursor_y != py) { cursor_vis_hide(); cursor_vis_show(); }
+            /* let the net/shell/wifi procs run a few times per frame, not every
+             * 2 ms (proc_yield in the tick otherwise throttles cursor polling). */
+            if ((t % 10) == 0 && wm_tick) wm_tick();
+        }
         frame++;
     }
 }

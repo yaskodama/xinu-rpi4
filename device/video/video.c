@@ -230,6 +230,30 @@ void video_present(void)
     for (unsigned int i = 0; i < n; i++) dst[i] = src[i];
 }
 
+/* Direct VISIBLE-framebuffer access (bypasses the backbuffer/viewport) so the
+ * wm loop can move the mouse cursor between full-frame flips with a save/restore
+ * backing store — the pointer then tracks the mouse far above the 20 fps scene
+ * repaint rate.  All bounds-checked against the physical screen. */
+void video_vis_save(int x, int y, int w, int h, unsigned int *buf)
+{
+    for (int j = 0; j < h; j++) { int py = y + j;
+        for (int i = 0; i < w; i++) { int px = x + i;
+            buf[j*w + i] = (px < 0 || py < 0 || px >= (int)fb_width || py >= (int)fb_height)
+                         ? 0u : ((volatile unsigned int *)(fb_base + py*fb_pitch))[px]; } }
+}
+void video_vis_restore(int x, int y, int w, int h, const unsigned int *buf)
+{
+    for (int j = 0; j < h; j++) { int py = y + j; if (py < 0 || py >= (int)fb_height) continue;
+        volatile unsigned int *row = (volatile unsigned int *)(fb_base + py*fb_pitch);
+        for (int i = 0; i < w; i++) { int px = x + i; if (px < 0 || px >= (int)fb_width) continue;
+            row[px] = buf[j*w + i]; } }
+}
+void video_vis_pixel(int x, int y, unsigned int color)
+{
+    if (x < 0 || y < 0 || x >= (int)fb_width || y >= (int)fb_height) return;
+    ((volatile unsigned int *)(fb_base + y*fb_pitch))[x] = color;
+}
+
 /* Viewport offset: subtracted from every virtual-coord input
  * before it touches the framebuffer.  All primitives also clip
  * to [0, fb_width) × [0, fb_height) so off-screen geometry

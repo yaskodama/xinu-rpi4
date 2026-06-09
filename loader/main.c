@@ -298,7 +298,8 @@ void xhci_mouse_event(unsigned nButtons, int dx, int dy)
     if (g_cursor_x >= sw)      { wm_pan(g_cursor_x - sw + 1, 0); g_cursor_x = sw - 1; }
     if (g_cursor_y >= sh)      { wm_pan(0, g_cursor_y - sh + 1); g_cursor_y = sh - 1; }
     wm_cursor_set(g_cursor_x, g_cursor_y, 1);
-    (void)nButtons;
+    { extern void wm_pointer(int, int, int);          /* left-drag a title bar -> move window */
+      wm_pointer(g_cursor_x, g_cursor_y, (int)(nButtons & 1)); }
 }
 
 extern unsigned char _end[];   /* set by link.ld — top of static image */
