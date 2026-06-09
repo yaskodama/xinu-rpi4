@@ -42,21 +42,19 @@ static void puts_hex32(unsigned int v)
 
 static int xhci_notify_reset(void)
 {
-    /* Property tag 0x00030058 (notify-xhci-reset).  Previous attempt with
-     * devid=0x00100000 hung the firmware (mailbox call never returned -> all
-     * subsequent mailbox calls also dead).  Try devid=0 (firmware default,
-     * which the original comment said was the fallback): on Pi 4 firmware,
-     * VL805 is the only xHCI client of this tag, so default-targets-VL805
-     * should work — if it does we'll know the encoding was the issue, and
-     * if it hangs again the tag itself is the wrong path on this firmware
-     * and we need self-bring-up (CPRMAN + brcmstb-pcie). */
+    /* Property tag 0x00030058 (notify-xhci-reset): make the VPU (re)load the
+     * VL805 firmware after a PCI reset.  Per Linux drivers/reset/reset-
+     * raspberrypi.c the dev address is encoded PCI_BUS<<20|SLOT<<15|FUNC<<12;
+     * VL805 is hardwired at bus1/dev0/fn0 => 0x100000.  (devid=0 is a no-op;
+     * an earlier 0x100000 "hang" was with the link not yet trained — Linux
+     * uses exactly this value once the RC link is up.) */
     static volatile unsigned int __attribute__((aligned(16))) buf[8];
     buf[0] = 32;
     buf[1] = 0;
     buf[2] = 0x00030058U;        /* notify-xhci-reset */
     buf[3] = 4;
     buf[4] = 0;
-    buf[5] = 0;                  /* devid: 0 = firmware default (VL805) */
+    buf[5] = 0x00100000U;        /* devid: bus1<<20|slot0<<15|func0<<12 = VL805 */
     buf[6] = 0;
     buf[7] = 0;
     return mbox_call(buf);
@@ -336,14 +334,38 @@ extern void delay_ms(unsigned int ms);
 #define PCIE_MISC_PCIE_STATUS_OFF        0x4068
 #define PCIE_MISC_HARD_DEBUG_OFF         0x4204
 #define PCIE_EXT_CFG_INDEX               0x9000
-#define PCIE_EXT_CFG_DATA                0x9004
+#define PCIE_EXT_CFG_DATA                0x8000    /* BCM2711: 0x8000 (was wrongly 0x9004) */
+
+/* Additional brcmstb RC offsets needed for a *usable* link (inbound/outbound
+ * windows, interrupt mask, gen, endian) — see Circle bcmpciehostbridge.cpp /
+ * xinu-rpi5 rp1pcie.c.  Without these the link can train but MMIO/DMA hang. */
+#define PCIE_MISC_CPU_2_PCIE_WIN0_LO     0x400c
+#define PCIE_MISC_CPU_2_PCIE_WIN0_HI     0x4010
+#define PCIE_MISC_RC_BAR1_LO             0x402c
+#define PCIE_MISC_RC_BAR2_LO             0x4034
+#define PCIE_MISC_RC_BAR2_HI             0x4038
+#define PCIE_MISC_RC_BAR3_LO             0x403c
+#define PCIE_MISC_CPU_2_PCIE_WIN0_BLIM   0x4070
+#define PCIE_MISC_CPU_2_PCIE_WIN0_BHI    0x4080
+#define PCIE_MISC_CPU_2_PCIE_WIN0_LHI    0x4084
+#define PCIE_INTR2_CPU_BASE              0x4300
+#define PCIE_RC_CFG_VENDOR_SPEC_REG1     0x0188
+#define PCIE_CAP_REGS                    0x00ac
+#define PCI_EXP_LNKCAP                   0x0c
+#define PCI_EXP_LNKCTL2                  0x30
+
+/* CPU view of the PCIe outbound window (CPU 0x6_00000000 -> PCIe 0xC0000000,
+ * where VL805's xHCI BAR0 is mapped).  This is the xHCI MMIO base. */
+#define VL805_XHCI_MMIO                  0x600000000UL
 
 #define RGR1_SW_INIT_1_INIT_GENERIC_MASK 0x2      /* bit 1: bridge reset */
 #define RGR1_SW_INIT_1_PERST_MASK        0x1      /* bit 0: PERST# (generic) */
 #define HARD_PCIE_HARD_DEBUG_SERDES_IDDQ 0x08000000  /* bit 27 */
+#define HARD_PCIE_HARD_DEBUG_CLKREQ_EN   0x00000002  /* bit 1  */
 #define MISC_CTRL_SCB_ACCESS_EN          0x00001000
 #define MISC_CTRL_CFG_READ_UR_MODE       0x00002000
 #define MISC_CTRL_MAX_BURST_SIZE_MASK    0x00300000
+#define MISC_CTRL_SCB0_SIZE_MASK         0xf8000000
 #define PCIE_STATUS_DL_ACTIVE            0x20     /* bit 5: data-link layer up */
 #define PCIE_STATUS_PHYLINKUP            0x10     /* bit 4: physical link up   */
 
@@ -364,46 +386,451 @@ static int pcie_perst_set(unsigned int val)
     return safe_mmio_write32(PCIE_BASE + PCIE_RGR1_SW_INIT_1, tmp);
 }
 
-/* Run the BCM2711 PCIe RC bring-up.  Returns: 0 = link up, -1 = MMIO fault,
- * -2 = link never came up, -3 = controller still all-zero after setup. */
+/* ilog2 + inbound-BAR size encoding (Linux brcm_pcie_encode_ibar_size). */
+static int pcie_ilog2(unsigned long v) { int n = -1; while (v) { v >>= 1; n++; } return n; }
+static unsigned int pcie_encode_ibar(unsigned long size)
+{
+    int l = pcie_ilog2(size);
+    if (l >= 12 && l <= 15) return (unsigned int)((l - 12) + 0x1c);
+    if (l >= 16 && l <= 37) return (unsigned int)(l - 15);
+    return 0;
+}
+
+/* Outbound window 0: CPU `cpu` (40-bit) -> PCIe bus address `pci`, length
+ * `size`.  Bit math from Circle / xinu-rpi5 rp1pcie.c set_outbound_win(). */
+static void pcie_set_outbound_win(unsigned long cpu, unsigned long pci, unsigned long size)
+{
+    PCIE_REG(PCIE_MISC_CPU_2_PCIE_WIN0_LO) = (unsigned int)pci;
+    PCIE_REG(PCIE_MISC_CPU_2_PCIE_WIN0_HI) = (unsigned int)(pci >> 32);
+    unsigned long base_mb  = cpu >> 20;
+    unsigned long limit_mb = (cpu + size - 1) >> 20;
+    unsigned int bl = PCIE_REG(PCIE_MISC_CPU_2_PCIE_WIN0_BLIM);
+    bl &= ~0xfff0u;     bl |= ((unsigned int)base_mb  << 4)  & 0xfff0u;
+    bl &= ~0xfff00000u; bl |= ((unsigned int)limit_mb << 20) & 0xfff00000u;
+    PCIE_REG(PCIE_MISC_CPU_2_PCIE_WIN0_BLIM) = bl;
+    PCIE_REG(PCIE_MISC_CPU_2_PCIE_WIN0_BHI) = (unsigned int)(base_mb  >> 12) & 0xff;
+    PCIE_REG(PCIE_MISC_CPU_2_PCIE_WIN0_LHI) = (unsigned int)(limit_mb >> 12) & 0xff;
+}
+
+/* Run the FULL BCM2711 PCIe RC bring-up (Circle bcmpciehostbridge.cpp order).
+ * Logs each step over UART0 so a serial console shows exactly where it stops.
+ * Returns: 0 = link up, -1 = MMIO fault, -2 = link never came up.
+ * NOTE: touches ONLY the always-on host-wrapper registers (0x0xxx/0x4xxx/
+ * 0x9210); no downstream config/MMIO until DL_ACTIVE (that would hang). */
 int xhci_pcie_bring_up(void)
 {
     unsigned int tmp;
+    uart_puts("[pcie] bring-up start (BCM2711 @0xFD500000)\n");
 
-    /* Sanity probe: is the controller responding at all (not faulting)? */
-    if (safe_mmio_read32(PCIE_BASE + PCIE_RGR1_SW_INIT_1, &tmp) < 0) return -1;
+    /* s0: probe the bridge reg.  safe_mmio catches a synchronous abort; a true
+     * AXI hang would lock here (serial shows we never pass s0 -> RC powered down). */
+    uart_puts("[pcie] s0: read RGR1_SW_INIT_1 ...\n");
+    if (safe_mmio_read32(PCIE_BASE + PCIE_RGR1_SW_INIT_1, &tmp) < 0) {
+        uart_puts("[pcie] s0: MMIO FAULT (RC not mapped/clocked)\n"); return -1; }
+    uart_puts("[pcie] s0: RGR1="); puts_hex32(tmp); uart_puts("\n");
 
-    /* 1. Reset the bridge */
-    if (pcie_bridge_sw_init_set(1) < 0) return -1;
-    /* 2. Assert PERST# (some bootloaders may deassert it) */
-    if (pcie_perst_set(1) < 0) return -1;
-    delay_ms(1);                /* > 100us per Linux */
+    /* s1: assert bridge SW_INIT + PERST, hold, release bridge */
+    pcie_bridge_sw_init_set(1);
+    pcie_perst_set(1);
+    delay_ms(1);
+    pcie_bridge_sw_init_set(0);
+    uart_puts("[pcie] s1: bridge reset pulsed, PERST asserted\n");
 
-    /* 3. Take the bridge out of reset */
-    if (pcie_bridge_sw_init_set(0) < 0) return -1;
-
-    /* 4. Clear SerDes IDDQ — power up the SerDes block */
-    if (safe_mmio_read32(PCIE_BASE + PCIE_MISC_HARD_DEBUG_OFF, &tmp) < 0) return -1;
+    /* s2: clear SerDes IDDQ */
+    tmp = PCIE_REG(PCIE_MISC_HARD_DEBUG_OFF);
     tmp &= ~HARD_PCIE_HARD_DEBUG_SERDES_IDDQ;
-    if (safe_mmio_write32(PCIE_BASE + PCIE_MISC_HARD_DEBUG_OFF, tmp) < 0) return -1;
-    delay_ms(1);                /* SerDes stable */
+    PCIE_REG(PCIE_MISC_HARD_DEBUG_OFF) = tmp;
+    delay_ms(1);
+    uart_puts("[pcie] s2: SerDes IDDQ cleared, rev="); puts_hex32(PCIE_REG(PCIE_MISC_REVISION)); uart_puts("\n");
 
-    /* 5. MISC_CTRL: enable SCB access, CFG read UR mode, set burst=0 (BCM2711) */
-    if (safe_mmio_read32(PCIE_BASE + PCIE_MISC_MISC_CTRL_OFF, &tmp) < 0) return -1;
+    /* s3: MISC_CTRL — SCB_ACCESS_EN | CFG_READ_UR_MODE | burst=0 | SCB0=4GB */
+    tmp = PCIE_REG(PCIE_MISC_MISC_CTRL_OFF);
     tmp |= MISC_CTRL_SCB_ACCESS_EN | MISC_CTRL_CFG_READ_UR_MODE;
-    tmp &= ~MISC_CTRL_MAX_BURST_SIZE_MASK;   /* burst = 0 = 128 bytes (BCM2711) */
-    if (safe_mmio_write32(PCIE_BASE + PCIE_MISC_MISC_CTRL_OFF, tmp) < 0) return -1;
+    tmp &= ~MISC_CTRL_MAX_BURST_SIZE_MASK;                    /* 128B on BCM2711 */
+    tmp &= ~MISC_CTRL_SCB0_SIZE_MASK;
+    tmp |= ((unsigned int)(32 - 15) << 27) & MISC_CTRL_SCB0_SIZE_MASK;  /* 4GB view */
+    PCIE_REG(PCIE_MISC_MISC_CTRL_OFF) = tmp;
+    uart_puts("[pcie] s3: MISC_CTRL set\n");
 
-    /* 6. Deassert PERST# — releases VL805 from reset and starts link training */
-    if (pcie_perst_set(0) < 0) return -1;
+    /* s4: inbound RC_BAR2 = host RAM at PCIe addr 0 (Pi4 dma-ranges), 4GB;
+     * disable RC_BAR1 / RC_BAR3. */
+    PCIE_REG(PCIE_MISC_RC_BAR2_LO) = 0x0u | pcie_encode_ibar(0x100000000UL);
+    PCIE_REG(PCIE_MISC_RC_BAR2_HI) = 0x0u;
+    PCIE_REG(PCIE_MISC_RC_BAR1_LO) &= ~0x1fu;
+    PCIE_REG(PCIE_MISC_RC_BAR3_LO) &= ~0x1fu;
+    uart_puts("[pcie] s4: inbound RC_BAR2 set\n");
 
-    /* 7. Wait for DL_ACTIVE (link layer up).  Linux waits up to ~100ms.  */
+    /* s5: mask all PCIe interrupts (CLR + MASK_SET) */
+    PCIE_REG(PCIE_INTR2_CPU_BASE + 0x08) = 0xffffffffu;
+    PCIE_REG(PCIE_INTR2_CPU_BASE + 0x10) = 0xffffffffu;
+    uart_puts("[pcie] s5: interrupts masked\n");
+
+    /* s6: clamp link to Gen2 */
+    tmp = PCIE_REG(PCIE_CAP_REGS + PCI_EXP_LNKCAP);  tmp = (tmp & ~0xfu) | 2; PCIE_REG(PCIE_CAP_REGS + PCI_EXP_LNKCAP)  = tmp;
+    tmp = PCIE_REG(PCIE_CAP_REGS + PCI_EXP_LNKCTL2); tmp = (tmp & ~0xfu) | 2; PCIE_REG(PCIE_CAP_REGS + PCI_EXP_LNKCTL2) = tmp;
+    uart_puts("[pcie] s6: Gen2 set\n");
+
+    /* s7: outbound window CPU 0x6_00000000 -> PCIe 0xC0000000, 1GB (Pi4 dtsi) */
+    pcie_set_outbound_win(0x600000000UL, 0xC0000000UL, 0x40000000UL);
+    uart_puts("[pcie] s7: outbound window set\n");
+
+    /* s8: little-endian BAR2 + CLKREQ debug enable */
+    PCIE_REG(PCIE_RC_CFG_VENDOR_SPEC_REG1) &= ~0xcu;
+    PCIE_REG(PCIE_MISC_HARD_DEBUG_OFF) |= HARD_PCIE_HARD_DEBUG_CLKREQ_EN;
+    uart_puts("[pcie] s8: endian/clkreq set\n");
+
+    /* s9: deassert PERST -> start link training; CEM wants 100ms */
+    pcie_perst_set(0);
+    uart_puts("[pcie] s9: PERST deasserted, training...\n");
+    delay_ms(100);
+
+    /* s10: poll for DL_ACTIVE && PHYLINKUP (~100ms) */
     for (int i = 0; i < 100; i++) {
-        if (safe_mmio_read32(PCIE_BASE + PCIE_MISC_PCIE_STATUS_OFF, &tmp) < 0) return -1;
-        if (tmp & PCIE_STATUS_DL_ACTIVE) return 0;     /* success */
+        tmp = PCIE_REG(PCIE_MISC_PCIE_STATUS_OFF);
+        if ((tmp & PCIE_STATUS_DL_ACTIVE) && (tmp & PCIE_STATUS_PHYLINKUP)) {
+            uart_puts("[pcie] *** LINK UP *** status="); puts_hex32(tmp); uart_puts("\n");
+            return 0;
+        }
         delay_ms(1);
     }
-    return -2;                  /* timed out waiting for link */
+    uart_puts("[pcie] link DOWN status="); puts_hex32(PCIE_REG(PCIE_MISC_PCIE_STATUS_OFF)); uart_puts("\n");
+    return -2;
+}
+
+/* VL805 enumeration — call ONLY after xhci_pcie_bring_up() == 0 (link up).
+ * Sets up the RC bridge bus numbers, then reads VL805 (bus1/dev0/fn0) VID/DID
+ * via the EXT_CFG window.  Logs over UART.  Returns 0 if VL805 (0x1106:0x3483)
+ * is seen, -1 otherwise. */
+int xhci_pcie_enum_vl805(void)
+{
+    uart_puts("[pcie] enum: configuring RC bridge buses\n");
+    /* RC bridge config space lives at PCIE_BASE + reg (bus0/dev0/fn0). */
+    *(volatile unsigned char  *)(PCIE_BASE + 0x19) = 1;   /* secondary bus   = 1 */
+    *(volatile unsigned char  *)(PCIE_BASE + 0x1a) = 1;   /* subordinate bus = 1 */
+    *(volatile unsigned short *)(PCIE_BASE + 0x04) = 0x0006; /* MEMORY|MASTER     */
+
+    /* point the EXT_CFG window at bus1/dev0/fn0, then read VID/DID @0x00 */
+    PCIE_REG(PCIE_EXT_CFG_INDEX) = (1u << 20);
+    (void)PCIE_REG(PCIE_EXT_CFG_INDEX);
+    unsigned int viddid = *(volatile unsigned int *)(PCIE_BASE + PCIE_EXT_CFG_DATA + 0x00);
+    uart_puts("[pcie] enum: bus1 VID/DID = "); puts_hex32(viddid); uart_puts("\n");
+
+    if (!((viddid & 0xffff) == 0x1106 && (viddid >> 16) == 0x3483)) {
+        uart_puts("[pcie] enum: VL805 NOT found\n");
+        return -1;
+    }
+    uart_puts("[pcie] enum: *** VL805 found (1106:3483) ***\n");
+
+    /* M3: program VL805 BAR0 to the outbound-window PCIe base, enable memory
+     * decode + bus-master, then read the xHCI capability regs through the
+     * window (CPU 0x6_00000000 -> PCIe 0xC0000000 -> VL805 BAR0). */
+    {
+        volatile unsigned char *cfg = (volatile unsigned char *)(PCIE_BASE + PCIE_EXT_CFG_DATA);
+        PCIE_REG(PCIE_EXT_CFG_INDEX) = (1u << 20);              /* bus1/dev0/fn0 */
+        (void)PCIE_REG(PCIE_EXT_CFG_INDEX);
+        *(volatile unsigned int   *)(cfg + 0x10) = 0xC0000000u | 0x4u;  /* BAR0: 64-bit mem @ PCIe 0xC0000000 */
+        *(volatile unsigned int   *)(cfg + 0x14) = 0x00000000u;        /* BAR1: high dword = 0 */
+        *(volatile unsigned short *)(cfg + 0x04) = 0x0006;             /* COMMAND: MEMORY | BUS_MASTER */
+        __asm__ volatile ("dsb sy" ::: "memory");
+        uart_puts("[pcie] enum: VL805 BAR0=0xC0000000, cmd=MEM|MASTER\n");
+
+        volatile unsigned int *xh = (volatile unsigned int *)VL805_XHCI_MMIO;
+        unsigned int cap0   = xh[0];                 /* 32-bit: [7:0]=CAPLENGTH [31:16]=HCIVERSION */
+        unsigned int caplen = cap0 & 0xff;
+        unsigned int hciver = (cap0 >> 16) & 0xffff;
+        unsigned int hcs1   = xh[0x04 / 4];          /* HCSPARAMS1 */
+        uart_puts("[xhci] CAPLENGTH=");   puts_hex32(caplen);
+        uart_puts(" HCIVERSION=");        puts_hex32(hciver);
+        uart_puts(" HCSPARAMS1=");        puts_hex32(hcs1);   uart_puts("\n");
+        if (hciver == 0x0100 || hciver == 0x0110 || hciver == 0x0120)
+            uart_puts("[xhci] *** controller reachable (sane HCIVERSION) ***\n");
+        else
+            uart_puts("[xhci] WARN: HCIVERSION unexpected (window/BAR not right?)\n");
+    }
+    return 0;
+}
+
+/* ===== M4: VL805 xHCI controller init (ported from xinu-rpi5 rp1usb.c, minus
+ * the DWC3-specific quirks — VL805 is a VIA xHCI, not a Synopsys DWC3).  Pi4
+ * inbound RC_BAR2 maps PCIe addr 0 -> host RAM 0, so the device-DMA address of
+ * a buffer == its physical (== identity-mapped virtual) address: XDA is the
+ * identity.  D-cache is off (the boot log says so) so DMA is coherent. ===== */
+struct xhci_trb { unsigned int p0, p1, status, control; };
+#define XCMD_N        64
+#define XEVT_N        64
+#define XSCRATCH_MAX  64
+static unsigned long long x_dcbaa[256]                       __attribute__((aligned(64)));
+static struct xhci_trb    x_cmd[XCMD_N]                      __attribute__((aligned(64)));
+static struct xhci_trb    x_evt[XEVT_N]                      __attribute__((aligned(64)));
+static unsigned long long x_erst[4]                          __attribute__((aligned(64)));
+static unsigned long long x_scratch_arr[XSCRATCH_MAX]        __attribute__((aligned(64)));
+static unsigned char      x_scratch_buf[XSCRATCH_MAX][4096]  __attribute__((aligned(4096)));
+static unsigned long x_base, x_oper, x_rt, x_db;
+static int x_cmd_idx, x_cmd_cycle = 1, x_evt_idx, x_evt_cycle = 1, x_ctx_stride = 32;
+static unsigned int x_usbsts_after;
+static int x_running;
+
+#define XDA(p)      ((unsigned long)(p))            /* Pi4: PCIe addr == phys */
+#define XR(b,o)     (*(volatile unsigned int *)((unsigned long)(b)+(o)))
+/* operational regs (from oper = base + CAPLENGTH) */
+#define XOP_USBCMD  0x00
+#define XOP_USBSTS  0x04
+#define XOP_CRCR    0x18
+#define XOP_DCBAAP  0x30
+#define XOP_CONFIG  0x38
+/* capability regs */
+#define XCAP_HCSPARAMS1 0x04
+#define XCAP_HCSPARAMS2 0x08
+#define XCAP_HCCPARAMS1 0x10
+#define XCAP_DBOFF      0x14
+#define XCAP_RTSOFF     0x18
+/* runtime interrupter-0 (rt + offset) */
+#define XIR0_IMAN   0x20
+#define XIR0_ERSTSZ 0x28
+#define XIR0_ERSTBA 0x30
+#define XIR0_ERDP   0x38
+#define XUSBCMD_RS    (1u<<0)
+#define XUSBCMD_HCRST (1u<<1)
+#define XUSBSTS_HCH   (1u<<0)
+#define XUSBSTS_CNR   (1u<<11)
+
+/* expose the live xHCI register bases to later phases (M5/M6). */
+unsigned long xhci_oper_base(void) { return x_oper; }
+unsigned long xhci_rt_base(void)   { return x_rt; }
+unsigned long xhci_db_base(void)   { return x_db; }
+int           xhci_ctx_stride(void){ return x_ctx_stride; }
+unsigned int  xhci_usbsts(void)    { return x_usbsts_after; }
+int           xhci_is_running(void){ return x_running; }
+
+int xhci_vl805_init(void)
+{
+    unsigned long base = VL805_XHCI_MMIO;
+    x_base = base;
+    unsigned int caplen = XR(base, 0) & 0xff;
+    x_oper = base + caplen;
+    x_rt   = base + (XR(base, XCAP_RTSOFF) & ~0x1Fu);
+    x_db   = base + (XR(base, XCAP_DBOFF)  & ~0x3u);
+    x_ctx_stride = (XR(base, XCAP_HCCPARAMS1) & (1u<<2)) ? 64 : 32;   /* CSZ */
+    uart_puts("[xhci] init: oper/rt/db resolved, ctx_stride=");
+    puts_hex32((unsigned)x_ctx_stride); uart_puts("\n");
+
+    /* 0. The VL805 may still be booting its own firmware after the PERST
+     * deassert — wait for CNR (Controller Not Ready) to clear first. */
+    { int ms=0; while ((XR(x_oper,XOP_USBSTS)&XUSBSTS_CNR) && ms<3000){ delay_ms(5); ms+=5; }
+      uart_puts("[xhci] init: pre-reset CNR ");
+      uart_puts((XR(x_oper,XOP_USBSTS)&XUSBSTS_CNR) ? "STILL SET after 3s\n" : "clear\n"); }
+
+    /* 1. Stop, then reset. */
+    XR(x_oper, XOP_USBCMD) &= ~XUSBCMD_RS;
+    { int i=0; while (!(XR(x_oper,XOP_USBSTS)&XUSBSTS_HCH) && i<200){ delay_ms(1); i++; } }
+    XR(x_oper, XOP_USBCMD) |= XUSBCMD_HCRST;
+    { int i=0; while ((XR(x_oper,XOP_USBCMD)&XUSBCMD_HCRST) && i<1000){ delay_ms(1); i++; }
+      uart_puts("[xhci] init: HCRST cleared after "); puts_hex32((unsigned)i); uart_puts("ms\n"); }
+    { int i=0; while ((XR(x_oper,XOP_USBSTS)&XUSBSTS_CNR) && i<3000){ delay_ms(1); i++; }
+      uart_puts("[xhci] init: post-reset CNR ");
+      uart_puts((XR(x_oper,XOP_USBSTS)&XUSBSTS_CNR) ? "STILL SET (TIMEOUT)\n" : "clear\n"); }
+
+    /* 2. DCBAA + scratchpad. */
+    for (int i=0;i<256;i++) x_dcbaa[i]=0;
+    unsigned int hcs2 = XR(base, XCAP_HCSPARAMS2);
+    int nscratch = (int)(((hcs2>>27)&0x1f) | (((hcs2>>21)&0x1f)<<5));
+    if (nscratch > XSCRATCH_MAX) nscratch = XSCRATCH_MAX;
+    for (int i=0;i<nscratch;i++) x_scratch_arr[i] = XDA(&x_scratch_buf[i][0]);
+    if (nscratch > 0) x_dcbaa[0] = XDA(&x_scratch_arr[0]);
+    XR(x_oper, XOP_DCBAAP)   = (unsigned int)(XDA(x_dcbaa) & 0xffffffff);
+    XR(x_oper, XOP_DCBAAP+4) = (unsigned int)(XDA(x_dcbaa) >> 32);
+    uart_puts("[xhci] init: DCBAA set, scratch="); puts_hex32((unsigned)nscratch); uart_puts("\n");
+
+    /* 3. Command ring + link TRB. */
+    for (int i=0;i<XCMD_N;i++){ x_cmd[i].p0=x_cmd[i].p1=x_cmd[i].status=x_cmd[i].control=0; }
+    x_cmd[XCMD_N-1].p0 = (unsigned int)(XDA(x_cmd)&0xffffffff);
+    x_cmd[XCMD_N-1].p1 = (unsigned int)(XDA(x_cmd)>>32);
+    x_cmd[XCMD_N-1].control = (6u<<10)|(1u<<1)|1u;       /* Link TRB, TC=1, cycle */
+    x_cmd_idx=0; x_cmd_cycle=1;
+    XR(x_oper, XOP_CRCR)   = (unsigned int)((XDA(x_cmd)&0xffffffff) | 1u);  /* RCS=1 */
+    XR(x_oper, XOP_CRCR+4) = (unsigned int)(XDA(x_cmd)>>32);
+
+    /* 4. Event ring + ERST (interrupter 0). */
+    for (int i=0;i<XEVT_N;i++){ x_evt[i].p0=x_evt[i].p1=x_evt[i].status=x_evt[i].control=0; }
+    x_evt_idx=0; x_evt_cycle=1;
+    x_erst[0] = XDA(x_evt);
+    x_erst[1] = (unsigned long long)XEVT_N;
+    XR(x_rt, XIR0_ERSTSZ) = 1;
+    XR(x_rt, XIR0_ERDP)   = (unsigned int)(XDA(x_evt)&0xffffffff);
+    XR(x_rt, XIR0_ERDP+4) = (unsigned int)(XDA(x_evt)>>32);
+    XR(x_rt, XIR0_ERSTBA) = (unsigned int)(XDA(x_erst)&0xffffffff);
+    XR(x_rt, XIR0_ERSTBA+4)=(unsigned int)(XDA(x_erst)>>32);
+    XR(x_rt, XIR0_IMAN)   = 0x2;                          /* IE=0, clear IP */
+    uart_puts("[xhci] init: cmd+evt rings set\n");
+
+    /* 5. CONFIG: MaxSlotsEn = HCSPARAMS1.MaxSlots. */
+    XR(x_oper, XOP_CONFIG) = (XR(base, XCAP_HCSPARAMS1) & 0xff);
+
+    /* 6. Run. */
+    __asm__ volatile ("dsb sy" ::: "memory");
+    XR(x_oper, XOP_USBCMD) |= XUSBCMD_RS;
+    for (int i=0;i<200 && (XR(x_oper,XOP_USBSTS)&XUSBSTS_HCH);i++) delay_ms(1);
+
+    x_usbsts_after = XR(x_oper, XOP_USBSTS);
+    x_running = !(x_usbsts_after & XUSBSTS_HCH);
+    uart_puts("[xhci] init: USBSTS="); puts_hex32(x_usbsts_after);
+    uart_puts(x_running ? " *** RUNNING ***\n" : " halted\n");
+    return x_running ? 0 : -1;
+}
+
+/* ===== M5: port reset + Enable Slot + Address Device + GET_DESCRIPTOR =====
+ * Ported from xinu-rpi5 rp1usb.c (single-controller, mouse-focused). ===== */
+static int x_cmd_push(unsigned int p0, unsigned int p1, unsigned int status, unsigned int control)
+{
+    struct xhci_trb *t = &x_cmd[x_cmd_idx];
+    t->p0=p0; t->p1=p1; t->status=status;
+    t->control = (control & ~1u) | (x_cmd_cycle & 1u);
+    __asm__ volatile ("dsb sy":::"memory");
+    x_cmd_idx++;
+    if (x_cmd_idx == XCMD_N-1) {
+        x_cmd[XCMD_N-1].control = (x_cmd[XCMD_N-1].control & ~1u) | (x_cmd_cycle & 1u);
+        __asm__ volatile ("dsb sy":::"memory");
+        x_cmd_idx=0; x_cmd_cycle ^= 1;
+    }
+    XR(x_db, 0) = 0;                 /* command-ring doorbell */
+    __asm__ volatile ("dsb sy":::"memory");
+    return 0;
+}
+static struct xhci_trb x_event_wait(unsigned int want_type)
+{
+    struct xhci_trb ev; ev.p0=ev.p1=ev.status=ev.control=0;
+    for (int spin=0; spin<500; spin++) {
+        struct xhci_trb *e = &x_evt[x_evt_idx];
+        __asm__ volatile ("dsb sy":::"memory");
+        if ((e->control & 1u) == (unsigned)x_evt_cycle) {
+            ev = *e;
+            x_evt_idx++;
+            if (x_evt_idx == XEVT_N) { x_evt_idx=0; x_evt_cycle ^= 1; }
+            unsigned long erdp = XDA(&x_evt[x_evt_idx]);
+            XR(x_rt, XIR0_ERDP)   = (unsigned)((erdp & 0xffffffff) | (1u<<3));
+            XR(x_rt, XIR0_ERDP+4) = (unsigned)(erdp >> 32);
+            unsigned int type = (ev.control>>10) & 0x3f;
+            if (want_type==0 || type==want_type) return ev;
+            spin=0; continue;
+        }
+        delay_ms(1);
+    }
+    return ev;
+}
+
+/* device contexts + EP0 transfer ring (single device for now) */
+static unsigned char x_input_ctx[33*64] __attribute__((aligned(64)));
+static unsigned char x_dev_ctx[33*64]   __attribute__((aligned(64)));
+static struct xhci_trb x_ep0_ring[16]   __attribute__((aligned(64)));
+static int x_ep0_idx, x_ep0_cycle = 1;
+static unsigned char x_xfer[256] __attribute__((aligned(64)));
+static unsigned int x_enum_portsc, x_enum_slot, x_enum_cc, x_addr_cc, x_desc_cc, x_desc_len;
+static unsigned int *xctx(unsigned char *p, int idx){ return (unsigned int *)(p + idx*x_ctx_stride); }
+
+/* Reset 1-based port `p` and Enable Slot.  Returns slot id, or -1. */
+int xhci_enum_slot(int p)
+{
+    unsigned long psc = x_oper + 0x400 + (p-1)*0x10;
+    XR(psc,0) = (1u<<9)|(1u<<4);                 /* PP + PR */
+    for (int i=0;i<100;i++){ delay_ms(1); if (!(XR(psc,0)&(1u<<4))) break; }
+    delay_ms(30);
+    x_enum_portsc = XR(psc,0);
+    for (int i=0;i<20;i++){ unsigned v=XR(psc,0); if ((v&1u)&&((v>>10)&0xf)){ x_enum_portsc=v; break; } x_enum_portsc=v; delay_ms(3); }
+    if (!(x_enum_portsc & 1u)) return -1;        /* nothing connected */
+    x_cmd_push(0,0,0,(9u<<10));                  /* Enable Slot */
+    struct xhci_trb ev = x_event_wait(33);
+    x_enum_cc   = (ev.status>>24)&0xff;
+    x_enum_slot = (ev.control>>24)&0xff;
+    uart_puts("[xhci] port"); uart_putc((char)('0'+p));
+    uart_puts(" PORTSC="); puts_hex32(x_enum_portsc);
+    uart_puts(" enable-slot cc="); puts_hex32(x_enum_cc);
+    uart_puts(" slot="); puts_hex32(x_enum_slot); uart_puts("\n");
+    return (x_enum_cc==1) ? (int)x_enum_slot : -1;
+}
+
+int xhci_address_device(int slot, int port, int speed)
+{
+    for (int i=0;i<16;i++){ x_ep0_ring[i].p0=x_ep0_ring[i].p1=x_ep0_ring[i].status=x_ep0_ring[i].control=0; }
+    x_ep0_ring[15].p0=(unsigned)(XDA(x_ep0_ring)&0xffffffff);
+    x_ep0_ring[15].p1=(unsigned)(XDA(x_ep0_ring)>>32);
+    x_ep0_ring[15].control=(6u<<10)|(1u<<1)|1u;
+    x_ep0_idx=0; x_ep0_cycle=1;
+
+    for (unsigned i=0;i<sizeof x_input_ctx;i++) x_input_ctx[i]=0;
+    for (unsigned i=0;i<33*64;i++)              x_dev_ctx[i]=0;
+    unsigned int *icc=xctx(x_input_ctx,0); icc[1]=(1u<<0)|(1u<<1);     /* add slot + EP0 */
+    unsigned int *sc =xctx(x_input_ctx,1);
+    sc[0]=(1u<<27)|((unsigned)speed<<20);
+    sc[1]=((unsigned)port&0xff)<<16;
+    int mps=(speed==4)?512:(speed==3)?64:8;
+    unsigned int *ep0=xctx(x_input_ctx,2);
+    ep0[1]=(4u<<3)|(3u<<1)|((unsigned)mps<<16);
+    unsigned long trd=XDA(x_ep0_ring)|1u;
+    ep0[2]=(unsigned)(trd&0xffffffff); ep0[3]=(unsigned)(trd>>32); ep0[4]=8;
+    x_dcbaa[slot]=XDA(x_dev_ctx);
+    __asm__ volatile ("dsb sy":::"memory");
+    unsigned long ic=XDA(x_input_ctx);
+    x_cmd_push((unsigned)(ic&0xffffffff),(unsigned)(ic>>32),0,(11u<<10)|((unsigned)slot<<24));
+    struct xhci_trb ev=x_event_wait(33);
+    x_addr_cc=(ev.status>>24)&0xff;
+    uart_puts("[xhci] address-device cc="); puts_hex32(x_addr_cc); uart_puts("\n");
+    return (x_addr_cc==1)?0:-1;
+}
+
+static void x_ep0_push(unsigned int p0,unsigned int p1,unsigned int status,unsigned int control)
+{
+    struct xhci_trb *t=&x_ep0_ring[x_ep0_idx];
+    t->p0=p0;t->p1=p1;t->status=status;
+    t->control=(control & ~1u)|(x_ep0_cycle&1u);
+    __asm__ volatile ("dsb sy":::"memory");
+    x_ep0_idx++;
+    if (x_ep0_idx==15){ x_ep0_ring[15].control=(x_ep0_ring[15].control&~1u)|(x_ep0_cycle&1u); __asm__ volatile("dsb sy":::"memory"); x_ep0_idx=0; x_ep0_cycle^=1; }
+}
+int xhci_get_descriptor(int slot, int dtype, int dindex, int len)
+{
+    if (len > (int)sizeof x_xfer) len = sizeof x_xfer;
+    for (int i=0;i<len;i++) x_xfer[i]=0;
+    unsigned int wValue=((unsigned)dtype<<8)|(unsigned)dindex;
+    x_ep0_push(0x80u|(6u<<8)|(wValue<<16),((unsigned)len<<16),8,(2u<<10)|(1u<<6)|(3u<<16));
+    unsigned long ba=XDA(x_xfer);
+    x_ep0_push((unsigned)(ba&0xffffffff),(unsigned)(ba>>32),(unsigned)len,(3u<<10)|(1u<<16));
+    x_ep0_push(0,0,0,(4u<<10)|(1u<<5));
+    XR(x_db, slot*4)=1;
+    __asm__ volatile ("dsb sy":::"memory");
+    struct xhci_trb ev=x_event_wait(32);
+    x_desc_cc=(ev.status>>24)&0xff;
+    x_desc_len=(unsigned)len-(ev.status&0xffffff);
+    return (x_desc_cc==1)?(int)x_desc_len:-1;
+}
+unsigned int xhci_xfer_byte(int i){ return (i>=0&&i<256)?x_xfer[i]:0; }
+
+/* M5 driver: scan ports 1..MaxPorts, for each connected port reset+enable slot
+ * +address device + read the 18-byte device descriptor (VID/PID).  Logs all. */
+int xhci_vl805_enum_mouse(void)
+{
+    if (!x_running) { uart_puts("[xhci] enum: controller not running\n"); return -1; }
+    int nports = (int)((XR(x_base, XCAP_HCSPARAMS1) >> 24) & 0xff);
+    uart_puts("[xhci] enum: scanning "); puts_hex32((unsigned)nports); uart_puts(" ports\n");
+    for (int p=1; p<=nports && p<=5; p++) {
+        int slot = xhci_enum_slot(p);
+        if (slot < 0) continue;
+        int speed = (int)((x_enum_portsc>>10)&0xf);
+        if (xhci_address_device(slot, p, speed) != 0) continue;
+        int got = xhci_get_descriptor(slot, 1, 0, 18);    /* DEVICE descriptor */
+        if (got >= 12) {
+            unsigned vid = x_xfer[8] | (x_xfer[9]<<8);
+            unsigned pid = x_xfer[10] | (x_xfer[11]<<8);
+            unsigned cls = x_xfer[4];
+            uart_puts("[xhci] *** device on port"); uart_putc((char)('0'+p));
+            uart_puts(": VID="); puts_hex32(vid);
+            uart_puts(" PID="); puts_hex32(pid);
+            uart_puts(" class="); puts_hex32(cls); uart_puts(" ***\n");
+        } else {
+            uart_puts("[xhci] enum: get-descriptor failed cc="); puts_hex32(x_desc_cc); uart_puts("\n");
+        }
+    }
+    uart_puts("[xhci] enum: scan done\n");
+    return 0;
 }
 
 /* Firmware-proxied probe of the addresses our start4.elf disassembly
@@ -557,6 +984,9 @@ int xhci_pcie_dump_html(char *out, int max)
 /* Stubs for everything tcp_server.c calls via `extern` — without these
  * the QEMU build (which has no PCIE_BASE) won't link. */
 int xhci_pcie_bring_up(void)                       { return -1; }
+int xhci_pcie_enum_vl805(void)                     { return -1; }
+int xhci_vl805_init(void)                          { return -1; }
+int xhci_vl805_enum_mouse(void)                    { return -1; }
 int xhci_periph_read(unsigned int a, unsigned int *o, unsigned int *r)
                                                    { (void)a; if (o) *o = 0; if (r) *r = 0; return -1; }
 int xhci_periph_write(unsigned int a, unsigned int v)  { (void)a; (void)v; return -1; }

@@ -1153,6 +1153,40 @@ void kernel_main(void)
      * never came up.  Probe now lives behind /pcie + /xhci-reset HTTP
      * routes (see system/tcp_server.c) so the box always boots and we
      * can iterate without losing diagnostics. */
+    /* PCIe RC bring-up at BOOT (single-threaded): uart_puts is safe here, but
+     * DEADLOCKS in the HTTP worker context (screen/shellwin fanout lock).  The
+     * full brcmstb sequence touches only always-on wrapper regs until
+     * DL_ACTIVE, so it completes (link up or timeout) without hanging.  Serial
+     * shows the per-step [pcie] log.  Enum (downstream config) stays off until
+     * link-up is confirmed. */
+    {
+        extern int xhci_pcie_bring_up(void);
+        extern int xhci_pcie_enum_vl805(void);
+        extern int xhci_vl805_init(void);
+        extern int xhci_notify_reset_call(void);
+        int up = xhci_pcie_bring_up();
+        if (up == 0) {
+            uart_puts("[pcie] boot: *** LINK UP *** -> enumerating VL805\n");
+            if (xhci_pcie_enum_vl805() == 0) {
+                /* VL805 has no firmware after an SD (non-USB-MSD) boot — the
+                 * VPU left PCIe in reset.  Ask the firmware to reset the xHC and
+                 * (re)load VL805 firmware (Linux xhci-pci.c VL805 quirk), then
+                 * re-enumerate (the reset re-PERSTs) and init. */
+                int nr = xhci_notify_reset_call();
+                uart_puts("[pcie] boot: notify-xhci-reset rc=");
+                { char b[11]; b[0]='0';b[1]='x'; for(int i=0;i<8;i++){unsigned n=((unsigned)nr>>((7-i)*4))&0xF; b[2+i]=(char)(n<10?'0'+n:'a'+n-10);} b[10]=0; uart_puts(b);}
+                uart_puts("\n");
+                delay_ms(200);
+                xhci_pcie_enum_vl805();      /* re-program BAR/cmd after the reset */
+                if (xhci_vl805_init() == 0) {       /* M4: reset + rings + run */
+                    extern int xhci_vl805_enum_mouse(void);
+                    xhci_vl805_enum_mouse();        /* M5: port scan + slot + addr + dev desc */
+                }
+            }
+        } else {
+            uart_puts("[pcie] boot: link NOT up\n");
+        }
+    }
 #if 0
     xhci_init();
 #endif

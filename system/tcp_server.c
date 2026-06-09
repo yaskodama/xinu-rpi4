@@ -1319,7 +1319,24 @@ static int http_build(const char *req, char *out, int max)
         ctype = "text/plain";
         bl = s_put(body, bl, "pcie-init rc=");
         bl = s_putdec(body, bl, (long)rc);
-        bl = s_put(body, bl, " (0=link-up, -1=mmio fault, -2=link timeout)\n");
+        bl = s_put(body, bl, " (0=link-up, -1=mmio fault, -2=link timeout). See serial for per-step log.\n");
+    } else if (starts_with(req, "GET /pcie-enum") || starts_with(req, "POST /pcie-enum")) {
+        /* After link-up: configure RC bridge + read VL805 (1106:3483) VID/DID
+         * over the EXT_CFG window.  ONLY safe once /pcie-init reports link-up. */
+        extern int xhci_pcie_bring_up(void);
+        extern int xhci_pcie_enum_vl805(void);
+        int up = xhci_pcie_bring_up();
+        ctype = "text/plain";
+        bl = s_put(body, bl, "pcie-enum: link rc=");
+        bl = s_putdec(body, bl, (long)up);
+        if (up == 0) {
+            int er = xhci_pcie_enum_vl805();
+            bl = s_put(body, bl, " vl805 rc=");
+            bl = s_putdec(body, bl, (long)er);
+        } else {
+            bl = s_put(body, bl, " (link not up; skipping enum)");
+        }
+        bl = s_put(body, bl, ". See serial for detail.\n");
     } else if (starts_with(req, "GET /xhci-reset") || starts_with(req, "POST /xhci-reset")) {
         /* On-demand VC mailbox notify-xhci-reset call.  Isolated so a hung
          * mailbox can't wedge the boot (the original failure mode). */
