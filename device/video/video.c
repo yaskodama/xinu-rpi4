@@ -559,7 +559,7 @@ void draw_string_scaled(int px, int py, const char *s,
 
 /* Busy-wait `ms` milliseconds based on the AArch64 generic timer.
  * CNTFRQ_EL0 returns the timer frequency in Hz (usually 54 MHz on
- * Pi 4 / Pi 5 / QEMU virt -cpu cortex-a76).  Used by wm_run() between
+ * Pi 4 / QEMU virt -cpu cortex-a76).  Used by wm_run() between
  * frame redraws for animation pacing. */
 void delay_ms(unsigned int ms)
 {

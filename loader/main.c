@@ -1036,7 +1036,7 @@ void kernel_main(void)
      * on (or near) the firmware's framebuffer and visibly stamp
      * over the rainbow boot pattern — telling us simultaneously
      * "the kernel runs" and "the framebuffer lives around HERE".
-     * Safe on Pi 5 because all candidate addresses are within
+     * Safe on Pi 4 because all candidate addresses are within
      * mapped low-4-GiB RAM; QEMU virt only has 256 MiB so the
      * higher candidates fault, but with -DSKIP_MBOX we don't run
      * this in QEMU at all. */
@@ -1062,8 +1062,8 @@ void kernel_main(void)
 
     /* Try to bring up the HDMI framebuffer before printing anything,
      * so the banner appears on both UART and the monitor.  Failure
-     * is benign — on QEMU virt and on Pi 5 revisions where the VC
-     * mailbox is elsewhere this just leaves screen_putc() as a no-op. */
+     * is benign — on QEMU virt where the VC mailbox is absent this
+     * just leaves screen_putc() as a no-op. */
     video_rc = video_init();
 
     /* BOARD_NAME / SOC_NAME / KERNEL_NAME come from the Makefile
@@ -1124,7 +1124,7 @@ void kernel_main(void)
     }
 
     /* Mount the SD card's FAT32 partition under /sd/.  Silently
-     * skipped on builds where SD_BASE isn't defined (Pi 5 / QEMU) —
+     * skipped on builds where SD_BASE isn't defined (QEMU) —
      * the /sd directory will simply not appear in the VFS tree. */
     vfs_mount_sd();
     {

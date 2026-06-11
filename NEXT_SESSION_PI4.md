@@ -30,8 +30,7 @@ A full USB-A input stack **and** virtual memory, all verified on real hardware:
 
 ## Build / deploy / test
 
-- Build: `cd compile && make pi4` → `compile/kernel8.img` (Pi4 = `kernel8.img`;
-  `kernel_2712.img` is the legacy Pi5 build, ignore).
+- Build: `cd compile && make pi4` → `compile/kernel8.img` (Pi4 = `kernel8.img`).
 - **SD boot (persistent, reliable)**: SD volume `/Volumes/bootfs`, kernel file
   `kernel8.img`.  `cp compile/kernel8.img /Volumes/bootfs/kernel8.img` + md5-verify +
   eject; **preserve `config.txt`** (do not touch).  Current SD = md5 `d8302751`

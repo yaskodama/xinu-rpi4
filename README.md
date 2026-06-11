@@ -13,7 +13,7 @@ easier than ifdef-walling everything in place.
 
 ## Status
 
-| Phase (from `AIPL_XinuRPi5_Round1.aice`) | State |
+| Phase (Round 1 plan) | State |
 |------------------------------------------|-------|
 | **B0** aarch64 toolchain ready           | ⏳ user-side (`brew install aarch64-none-elf-gcc`) |
 | **B1** AArch64 boot stub (`kernel/boot.S`)| ✅ |
@@ -269,12 +269,10 @@ Subsystem dirs are individually grep-able and a new device just means a
 new directory under `device/`; the `compile/Makefile` picks it up via
 `$(wildcard ../device/*/*.c)`.
 
-## Roadmap (`AIPL_XinuRPi5_Round1.aice`)
+## Roadmap (Round 1 plan)
 
-The full Round 1 plan lives in the companion abclcp-project repo
-at `aice-pi-evolution/experiments/2026-05-22_xinu_rpi5/` (the original
-AIPL experiment directory name is retained for traceability).  Twelve
-phases across six directions:
+The full Round 1 plan lives in the companion abclcp-project repo under
+`aice-pi-evolution/experiments/`.  Twelve phases across six directions:
 
 | Direction | Phases | One-liner |
 |-----------|--------|-----------|

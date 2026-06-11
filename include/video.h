@@ -1,4 +1,4 @@
-// include/video.h — Pi 5 HDMI framebuffer console.
+// include/video.h — Pi 4 HDMI framebuffer console.
 //
 // Asks the firmware (via the VC mailbox property channel) for a
 // 32-bpp framebuffer at a fixed resolution, then renders text into

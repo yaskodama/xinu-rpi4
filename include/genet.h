@@ -69,12 +69,12 @@ void          genet_irq_enable(void);
 void          genet_irq_rearm(void);
 unsigned long genet_irq_count(void);
 
-#else  /* GENET_BASE not defined (Pi 5 / QEMU) — no built-in GENET MAC */
+#else  /* GENET_BASE not defined (QEMU) — no built-in GENET MAC */
 
 /* main.c, shell.c and the RX dispatcher reference these unconditionally
  * (the calls are not wrapped in #ifdef GENET_BASE), so provide inert
- * stubs for every non-pi4 variant.  Keeping them here is what lets the
- * pi5 and qemu targets compile cleanly. */
+ * stubs for the non-pi4 variant.  Keeping them here is what lets the
+ * qemu target compile cleanly. */
 static inline void          genet_init(void)                 {}
 static inline unsigned int  genet_sys_rev(void)              { return 0; }
 static inline unsigned int  genet_sys_port_ctrl(void)        { return 0; }

@@ -550,8 +550,7 @@ xinu-pi4$ halt
 - AArch64 boot stub の元: https://github.com/radlyeel/leex
 - シェル centry パターンの元: https://github.com/davidxyz/xinuPi
 - 開発ロードマップ (Round 1 計画書):
-  `aice-pi-evolution/experiments/2026-05-22_xinu_rpi5/AIPL_XinuRPi5_Round1.aice`
-  (AIPL 実験ディレクトリ名は traceability のため原名を保持)
+  abclcp-project リポジトリの `aice-pi-evolution/experiments/` 配下
 
 ----------------------------------------------------------------------
 

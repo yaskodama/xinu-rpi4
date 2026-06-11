@@ -1,7 +1,7 @@
-// kernel/boot.S — AArch64 boot stub for Raspberry Pi 5 (BCM2712).
+// kernel/boot.S — AArch64 boot stub for Raspberry Pi 4 (BCM2711).
 //
 // Bootstrapped from github.com/radlyeel/leex/kernel/boot.S (Pi 4 / BCM2711
-// AArch64 entry).  Pi 5 firmware loads kernel_2712.img at 0x80000 with the
+// AArch64 entry).  Pi 4 firmware loads kernel8.img at 0x80000 with the
 // processor already in EL1 (firmware drops out of EL2 for us when
 // config.txt does not request otherwise), so we don't have to do the
 // EL2->EL1 switch yourself for the first cut.
@@ -24,8 +24,8 @@
 // ============================================================
 // Linux ARM64 Image header  (Documentation/arm64/booting.rst)
 // ============================================================
-// Required by Pi 5 firmware: the EEPROM bootloader refuses to
-// jump to `kernel_2712.img` unless it sees the magic "ARM\x64"
+// Required by Pi 4 firmware: the EEPROM bootloader refuses to
+// jump to `kernel8.img` unless it sees the magic "ARM\x64"
 // at offset 0x38 of the file (i.e. of this header).  Without
 // the header the firmware leaves its rainbow boot pattern on
 // HDMI and our code never runs — symptom: "rainbow unchanged

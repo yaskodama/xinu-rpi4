@@ -553,8 +553,7 @@ xinu-pi4$ halt
 - AArch64 boot stub origin: https://github.com/radlyeel/leex
 - Shell centry pattern origin: https://github.com/davidxyz/xinuPi
 - Development roadmap (Round 1 plan):
-  `aice-pi-evolution/experiments/2026-05-22_xinu_rpi5/AIPL_XinuRPi5_Round1.aice`
-  (the original AIPL experiment directory name is kept for traceability)
+  under `aice-pi-evolution/experiments/` in the abclcp-project repo
 
 ----------------------------------------------------------------------
 

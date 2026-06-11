@@ -17,9 +17,7 @@
 #include "pm_reset.h"
 
 /* Pi 4 / BCM2711 PM block (also works on Pi 3 / BCM2837).  PM_BASE =
- * peripheral_base (0xFE000000 on Pi 4) + 0x100000.  Pi 5 / BCM2712 uses
- * a different SoC reset path via RP1; that variant is not implemented
- * here and will just spin in WFE. */
+ * peripheral_base (0xFE000000 on Pi 4) + 0x100000. */
 #define PM_BASE   0xFE100000UL
 #define PM_RSTC   (PM_BASE + 0x1c)
 #define PM_WDOG   (PM_BASE + 0x24)

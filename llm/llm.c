@@ -17,7 +17,7 @@
 /* Generation is slow with the D-cache off, and the GENET RX ring is pumped
  * from the wm/main loop (which we block while generating).  Drain the ring
  * between tokens so a busy link can't overflow it and wedge the NIC. */
-/* weak: targets without the GENET driver (QEMU/Pi5) resolve these to 0 */
+/* weak: targets without the GENET driver (QEMU) resolve these to 0 */
 extern int  genet_rx_poll(unsigned char **out_pkt) __attribute__((weak));
 extern void genet_rx_release(void) __attribute__((weak));
 static void net_drain(void)
@@ -30,7 +30,7 @@ static void net_drain(void)
 extern const unsigned char model_data[];
 extern const unsigned char tok_data[];
 /* weak: HDMI runtime-monitor heartbeat (tcp_server.c); no-op on targets
- * built without it so QEMU/Pi5 still link. */
+ * built without it so QEMU still links. */
 extern void app_beat(void) __attribute__((weak));
 extern void app_phase(const char *p) __attribute__((weak));   /* sub-phase for the HDMI monitor */
 static void llm_phase(const char *p) { if (app_phase) app_phase(p); }

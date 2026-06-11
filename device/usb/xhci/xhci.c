@@ -338,7 +338,7 @@ extern void delay_ms(unsigned int ms);
 
 /* Additional brcmstb RC offsets needed for a *usable* link (inbound/outbound
  * windows, interrupt mask, gen, endian) — see Circle bcmpciehostbridge.cpp /
- * xinu-rpi5 rp1pcie.c.  Without these the link can train but MMIO/DMA hang. */
+ * rp1pcie.c.  Without these the link can train but MMIO/DMA hang. */
 #define PCIE_MISC_CPU_2_PCIE_WIN0_LO     0x400c
 #define PCIE_MISC_CPU_2_PCIE_WIN0_HI     0x4010
 #define PCIE_MISC_RC_BAR1_LO             0x402c
@@ -397,7 +397,7 @@ static unsigned int pcie_encode_ibar(unsigned long size)
 }
 
 /* Outbound window 0: CPU `cpu` (40-bit) -> PCIe bus address `pci`, length
- * `size`.  Bit math from Circle / xinu-rpi5 rp1pcie.c set_outbound_win(). */
+ * `size`.  Bit math from Circle / rp1pcie.c set_outbound_win(). */
 static void pcie_set_outbound_win(unsigned long cpu, unsigned long pci, unsigned long size)
 {
     PCIE_REG(PCIE_MISC_CPU_2_PCIE_WIN0_LO) = (unsigned int)pci;
@@ -550,7 +550,7 @@ int xhci_pcie_enum_vl805(void)
     return 0;
 }
 
-/* ===== M4: VL805 xHCI controller init (ported from xinu-rpi5 rp1usb.c, minus
+/* ===== M4: VL805 xHCI controller init (ported from the rp1usb.c reference, minus
  * the DWC3-specific quirks — VL805 is a VIA xHCI, not a Synopsys DWC3).  Pi4
  * inbound RC_BAR2 maps PCIe addr 0 -> host RAM 0, so the device-DMA address of
  * a buffer == its physical (== identity-mapped virtual) address: XDA is the
@@ -679,7 +679,7 @@ int xhci_vl805_init(void)
 }
 
 /* ===== M5: port reset + Enable Slot + Address Device + GET_DESCRIPTOR =====
- * Ported from xinu-rpi5 rp1usb.c (single-controller, mouse-focused). ===== */
+ * Ported from the rp1usb.c reference (single-controller, mouse-focused). ===== */
 static int x_cmd_push(unsigned int p0, unsigned int p1, unsigned int status, unsigned int control)
 {
     struct xhci_trb *t = &x_cmd[x_cmd_idx];

@@ -176,9 +176,8 @@ void mmu_init(void)
  * ==================================================================== */
 
 /* A virtual window high above the identity region (32 GiB).  It is in an
- * otherwise-unused 1 GiB L1 slot for every target (Pi 5 peripherals sit
- * at ~68 GiB, Pi 4 / QEMU use only low memory), so repurposing it as a
- * page table is safe. */
+ * otherwise-unused 1 GiB L1 slot for every target (Pi 4 / QEMU use only
+ * low memory), so repurposing it as a page table is safe. */
 #define VMAP_VA   0x800000000UL          /* L1 index 32 */
 
 static unsigned long __attribute__((aligned(4096))) l2_win[NENT];

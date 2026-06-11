@@ -1,15 +1,14 @@
-// kernel/uart.c — bare-metal PL011 UART0 driver for Raspberry Pi 5.
+// kernel/uart.c — bare-metal PL011 UART0 driver for Raspberry Pi 4.
 //
-// This is the first I/O Xinu has available on Pi 5; everything else
-// (the framebuffer mailbox, the eMMC, network via RP1) comes later.
+// This is the first I/O Xinu has available on Pi 4; everything else
+// (the framebuffer mailbox, the eMMC, GENET network) comes later.
 // We rely on the firmware having already enabled UART0 via config.txt
 // (enable_uart=1 + dtparam=uart0=on) which locks the UART clock to a
 // stable 48 MHz reference, so we only need to:
 //
 //   1. Disable the UART so we can reprogram safely.
 //   2. Configure GPIO14 (TXD) and GPIO15 (RXD) as ALT0 (PL011).
-//      On Pi 5 the GPIO controller lives inside RP1 — but the
-//      firmware's enable_uart=1 has already done the muxing for us,
+//      The firmware's enable_uart=1 has already done the muxing for us,
 //      so we can skip GPIO programming on the first cut and add it
 //      in a later phase if the cable misbehaves.
 //   3. Program 115200/8N1: integer baud divisor 26, fractional 3
@@ -25,16 +24,14 @@
 #include "video.h"
 #include "shellwin.h"
 
-/* BCM2712 high-memory MMIO base + PL011 UART0 offset.
- * (Pi 4's base was 0xFE000000 + 0x201000 — both moved on Pi 5.)
+/* BCM2711 (Pi 4) peripheral base 0xFE000000 + PL011 UART0 offset 0x201000.
  *
  * Overridable at compile time via -DUART0_BASE=0xNN so the same
  * source builds for QEMU `virt` (PL011 at 0x09000000) without
- * touching the real-hardware default.  Don't use this for actual
- * Pi 4/Pi 3 — those need GPIO ALT muxing that the firmware does
- * for us on Pi 5 + QEMU virt. */
+ * touching the real-hardware default.  The firmware (enable_uart=1)
+ * does the GPIO ALT muxing for us on Pi 4 + QEMU virt. */
 #ifndef UART0_BASE
-#define UART0_BASE   0x107D001000UL
+#define UART0_BASE   0xFE201000UL
 #endif
 
 #define UART_DR      (*(volatile unsigned int *)(UART0_BASE + 0x00))
@@ -99,17 +96,6 @@ void uart_init(void)
     }
 #endif
 
-#ifdef UART_TRUST_FW_BAUD
-    /* Pi 5 dedicated DEBUG UART (0x107D001000): the firmware already
-     * configured it to 115200 8N1 — we read the firmware + BL31 boot log
-     * over it cleanly.  Its UARTCLK is NOT 48 MHz, so reprogramming the
-     * divisor below to the 48 MHz-derived 26/3 garbles the line (the
-     * banner's '=' (0x3D) arrives as '}' (0x7D) — a one-bit baud slip).
-     * So leave IBRD/FBRD/LCRH exactly as the firmware left them; just make
-     * sure TX/RX are enabled without ever disabling (UART_CR=0) and
-     * re-latching a stale divisor. */
-    UART_CR |= CR_UARTEN | CR_TXE | CR_RXE;
-#else
     /* 1. Disable while we reprogram. */
     UART_CR = 0;
 
@@ -128,7 +114,6 @@ void uart_init(void)
 
     /* 4. Re-enable TX + RX. */
     UART_CR = CR_UARTEN | CR_TXE | CR_RXE;
-#endif
 
     /* Drain any bytes the firmware / QEMU stdio pumped in before we
      * finished reprogramming — otherwise piped-stdin smoke tests
@@ -197,7 +182,7 @@ void uart_putc(char c)
      * (after that point screen_putc is safe; before, it's a no-op).
      * This is the whole point of the framebuffer driver — keeping
      * a parallel log channel in case the UART cable is silent on
-     * this particular Pi 5 board. */
+     * this particular Pi 4 board. */
     screen_putc(c);
 
     /* Also feed the wm shell window's scrollback ring.  Safe to

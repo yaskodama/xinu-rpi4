@@ -42,7 +42,7 @@ unsigned int gic_ack(void);
 /* Retire interrupt by writing the IAR value back to EOIR. */
 void gic_eoi(unsigned int iar);
 
-#else  /* GIC_BASE not defined — Pi 5 / QEMU */
+#else  /* GIC_BASE not defined — QEMU */
 
 static inline void gic_init(void) {}
 static inline void gic_enable_irq(unsigned irq) { (void)irq; }

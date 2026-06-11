@@ -21,7 +21,7 @@ kernel=kernel8.img
 kernel_address=0x80000
 
 # UART0 (PL011) on header pins 8/10 — Pi 4 has UART0 wired directly
-# from BCM2711 to the GPIO header (no RP1 in the way like Pi 5).
+# from BCM2711 to the GPIO header.
 enable_uart=1
 uart_2ndstage=1
 dtparam=uart0=on

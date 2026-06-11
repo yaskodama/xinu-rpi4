@@ -13,8 +13,6 @@
 #     make qemu-run   # build + launch QEMU (Ctrl-A X to quit)
 #     make qemu-smoke # canned-input smoke run
 #     make install_pi4 SDCARD=/Volumes
-#     make pi5        # build kernel_2712.img   (legacy Pi 5 image, opt-in)
-#     make pi5-min    # build kernel_xinu.img   (legacy Pi 5 first-light)
 #     make clean
 #
 # Every goal is simply forwarded into compile/ via `$(MAKE) -C compile`.
@@ -25,14 +23,14 @@ COMPILE_DIR := compile
 # compile/Makefile's default.
 .DEFAULT_GOAL := all
 
-.PHONY: all pi4 pi5 pi5-min qemu qemu-run qemu-smoke \
-        install install_pi4 install_pi5 clean help
+.PHONY: all pi4 qemu qemu-run qemu-smoke \
+        install install_pi4 clean help
 
-all pi4 pi5 pi5-min qemu qemu-run qemu-smoke \
-install install_pi4 install_pi5 clean help:
+all pi4 qemu qemu-run qemu-smoke \
+install install_pi4 clean help:
 	$(MAKE) -C $(COMPILE_DIR) $@
 
-# Forward any other goal (e.g. a specific image name like kernel_2712.img)
+# Forward any other goal (e.g. a specific image name like kernel8.img)
 # down to compile/ as well, so nothing the inner Makefile knows about breaks
 # when invoked from the root.
 %:

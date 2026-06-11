@@ -1,6 +1,6 @@
 // include/early_diag.h — visible "the kernel is alive" diagnostic.
 //
-// Pi 5 boot has a frustrating failure mode where the firmware shows
+// Pi 4 boot has a frustrating failure mode where the firmware shows
 // a full-screen rainbow test pattern, our kernel image is loaded by
 // the bootloader, but we see no evidence the kernel actually starts
 // running (UART silent, mailbox-allocated FB invisible).

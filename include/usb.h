@@ -7,9 +7,9 @@
 // don't touch).  To use a USB-A mouse it must be plugged into an
 // OTG cable (USB-C ↔ USB-A).
 //
-// Pi 5 routes USB through RP1 (PCIe), and QEMU virt has no DWC2
-// at our MMIO address.  Both make every function a no-op so a
-// single source tree can build for all three boards.
+// QEMU virt has no DWC2 at our MMIO address, so every function
+// becomes a no-op there and a single source tree builds for both
+// Pi 4 and QEMU.
 
 #ifndef XINU_RPI4_USB_H
 #define XINU_RPI4_USB_H

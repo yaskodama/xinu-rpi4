@@ -102,7 +102,7 @@ int sd_read_block(unsigned long lba, void *buf)
     return 0;
 }
 
-#else /* !SD_BASE — Pi 5 / QEMU: no controller we can talk to */
+#else /* !SD_BASE — QEMU: no controller we can talk to */
 
 int sd_init(void)                                 { return -1; }
 int sd_read_block(unsigned long lba, void *buf)   { (void)lba; (void)buf; return -1; }

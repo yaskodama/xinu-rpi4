@@ -34,8 +34,7 @@
 //                        through 1-slot inboxes for N rounds (default
 //                        5, capped at 50) then self-terminate when
 //                        both stop sending and the inboxes drain
-//   reboot               watchdog-driven reset via RP1 (stub — needs
-//                        more work; for now just spins)
+//   reboot               watchdog-driven reset via the BCM2711 PM block
 //
 // Designed so phase S0 (thread switch) and S1 (clock IRQ) can later
 // replace these stubs without touching the dispatch code.
