@@ -1,4 +1,4 @@
-# compile/Makefile — top-level build for xinu-rpi4 (and xinu-rpi4).
+# compile/Makefile — top-level build for xinu-rpi4 (Raspberry Pi 4).
 #
 # Mirrors the layout convention used by github.com/davidxyz/xinuPi
 # (and Embedded Xinu in general): sources live under per-subsystem
@@ -8,18 +8,19 @@
 # the root).
 #
 # Variants:
-#   pi4   Raspberry Pi 4 (BCM2711, Cortex-A72)  -> kernel8.img
-#   pi5   Raspberry Pi 5 (BCM2712, Cortex-A76)  -> kernel_2712.img
+#   pi4   Raspberry Pi 4 (BCM2711, Cortex-A72)  -> kernel8.img   (primary)
 #   qemu  QEMU `-M virt -cpu cortex-a76`         -> kernel_virt.img
+#   pi5   Raspberry Pi 5 (BCM2712, Cortex-A76)  -> kernel_2712.img
+#         (legacy / opt-in only; this is a Pi 4-dedicated project)
 #
 # Targets:
-#   make             pi4 + pi5 + qemu  (all variants)
+#   make             pi4 + qemu        (default; pi5 is opt-in)
 #   make pi4         kernel8.img       (default Pi 4 firmware kernel name)
-#   make pi5         kernel_2712.img
 #   make qemu        interactive QEMU virt (Ctrl-A X to quit)
 #   make qemu-smoke  canned-input smoke run; writes qemu-smoke.log
+#   make pi5         kernel_2712.img   (legacy Pi 5 image, opt-in)
 #   make install_pi4 SDCARD=/Volumes
-#   make install_pi5 SDCARD=/Volumes
+#   make install_pi5 SDCARD=/Volumes  (legacy)
 #   make clean
 #
 # Run from this directory:
@@ -165,7 +166,9 @@ obj/qemu/%.o: %.c | obj/qemu ; $(CC) $(QEMU_CFLAGS) -c $< -o $@
 obj/qemu/%.o: %.S | obj/qemu ; $(CC) $(QEMU_CFLAGS) -c $< -o $@
 
 # ----- images ---------------------------------------------------------
-all: pi4 pi5 qemu
+# Default build is Pi 4 + QEMU.  The legacy `pi5` image stays buildable
+# via an explicit `make pi5` but is not part of `all`.
+all: pi4 qemu
 
 pi5 kernel_2712.img: $(PI5_OBJS) link.ld
 	$(LD) -nostdlib $(PI5_OBJS) -T link.ld -o kernel_2712.elf
@@ -227,9 +230,9 @@ install_pi5: kernel_2712.img
 	sync
 	sudo umount $(DEST) || true
 
-# Backwards-compatible alias — `make install` still ships the Pi-5 image,
-# matching the previous Makefile's behaviour.
-install: install_pi5
+# `make install` ships the Pi 4 image (this is a Pi 4-dedicated project).
+# Use `make install_pi5` explicitly for the legacy Pi 5 image.
+install: install_pi4
 
 # ----- housekeeping --------------------------------------------------
 clean:

@@ -1,15 +1,15 @@
 # xinu-rpi4
 
-Embedded Xinu port for the Raspberry Pi 5 (BCM2712, Cortex-A76,
-AArch64-only).
+Embedded Xinu port for the Raspberry Pi 4 (BCM2711, Cortex-A72,
+AArch64).
 
 This is a brand-new repository, bootstrapped from
 [`yaskodama/xinu-rpi`](https://github.com/yaskodama/xinu-rpi)
 (arm-qemu / arm-rpi platforms, 32-bit) and the AArch64 boot pattern
 from [`radlyeel/leex`](https://github.com/radlyeel/leex).  The
-existing 32-bit Xinu tree stays where it is; Pi 5's mandatory
-AArch64 instruction set, new MMIO layout, and RP1 I/O hub make a
-clean split easier than ifdef-walling everything in place.
+existing 32-bit Xinu tree stays where it is; the Pi 4's AArch64
+(64-bit) instruction set and BCM2711 MMIO layout make a clean split
+easier than ifdef-walling everything in place.
 
 ## Status
 
@@ -17,14 +17,14 @@ clean split easier than ifdef-walling everything in place.
 |------------------------------------------|-------|
 | **B0** aarch64 toolchain ready           | ⏳ user-side (`brew install aarch64-none-elf-gcc`) |
 | **B1** AArch64 boot stub (`kernel/boot.S`)| ✅ |
-| **B2** `kernel_2712.img` build pipeline   | ✅ |
+| **B2** `kernel8.img` build pipeline       | ✅ |
 | **U0** PL011 UART0 driver                  | ✅ |
 | **U1** kprintf — banner only for now       | ✅ (basic puts; full kprintf later) |
 | M0 MMU flat identity map                  | ⏳ |
 | **M1** Kernel heap                         | ✅ first-fit (Xinu `getmem`/`freemem`), 16-byte align, coalescing |
 | **S0** AArch64 context switch              | ✅ cooperative `ctxsw.S` + `proctab[8]` + FIFO ready list |
 | S1 GIC-400 + generic timer                | ⏳ |
-| **X0** xsh on Pi 5 — interactive REPL      | ✅ minimal (help/echo/hello/mem/peek/uptime/reboot) |
+| **X0** xsh on Pi 4 — interactive REPL      | ✅ minimal (help/echo/hello/mem/peek/uptime/reboot) |
 | X1 AIPL hello                             | ⏳ |
 
 The boot path right now is **leex stub → BSS clear → `kernel_main` →
@@ -33,8 +33,8 @@ should show:
 
 ```
 ================================================
-  Xinu Pi5 hello (AArch64, BCM2712, kernel_2712.img)
-  PL011 UART0 @ 0x107D001000, 115200 8N1
+  Xinu Pi4 hello (AArch64, BCM2711, kernel8.img)
+  PL011 UART0 @ 0xFE201000, 115200 8N1
   bootstrap: leex-style stub + xinu-rpi4 main
 ================================================
 
@@ -54,24 +54,25 @@ The shell handles backspace/DEL, echoes input, and dispatches via a
 | `echo <words…>`   | echo args back (whitespace-collapsed)               |
 | `hello`           | friendly greeting (smoke marker)                    |
 | `mem`             | `__bss_start`, `__bss_end`, `_end` from `link.ld`   |
-| `peek <hex_addr>` | read 32-bit MMIO word; e.g. `peek 0x107d001018` (UART_FR) |
+| `peek <hex_addr>` | read 32-bit MMIO word; e.g. `peek 0xfe201018` (UART_FR) |
 | `uptime`          | raw `CNTPCT_EL0` (until phase S1 wires the timer)   |
 | `ps`              | core / EL status table (placeholder until phase S0) |
 | `halt`            | mask DAIF + PSCI `SYSTEM_OFF` via HVC — QEMU virt exits cleanly |
 | `pingpong [N]`    | 2-actor AIPL-style PingPong, cooperative dispatch, N rounds (1..50, default 5), auto-terminates |
 | `procdemo [N]`    | **real** 2-process ctxsw demo: creates pid 1 (ping) + pid 2 (pong), each prints its live `currpid` and `proc_yield()`s for N iters (1..30, default 5), then both `proc_exit()` and control returns to the shell |
-| `reboot`          | stub — spins until power-cycle (RP1 watchdog TBD)   |
+| `reboot`          | stub — spins until power-cycle (watchdog TBD)       |
 
-## Hardware vs Pi 4 (leex baseline)
+## Target hardware (Pi 4 / BCM2711)
 
-|              | Pi 4 (leex baseline) | **Pi 5 (this repo)** |
+|              | **Pi 4 (this repo)** | QEMU virt            |
 |--------------|----------------------|----------------------|
-| SoC          | BCM2711              | **BCM2712**          |
-| Cores        | Cortex-A72 ×4        | **Cortex-A76 ×4**    |
-| MMIO base    | 0xFE000000           | **0x107C000000**     |
-| I/O hub      | direct on SoC        | **RP1 (PCIe 別チップ)** |
-| Firmware img | `kernel8.img`        | **`kernel_2712.img`**|
-| UART base    | `0xFE201000`         | **`0x107D001000`**   |
+| SoC          | **BCM2711**          | QEMU `virt`          |
+| Cores        | **Cortex-A72 ×4**    | `-cpu cortex-a76`    |
+| MMIO base    | **0xFE000000**       | —                    |
+| I/O          | **on-SoC (GENET Ethernet) + VL805 PCIe xHCI for USB-A** | virtio / PL011 |
+| Firmware img | **`kernel8.img`**    | `kernel_virt.img`    |
+| UART base    | **`0xFE201000`**     | `0x09000000`         |
+| Load address | **`0x80000`**        | `0x40080000`         |
 
 ## Build
 
@@ -87,50 +88,52 @@ brew install aarch64-elf-gcc           # gnu cross compiler
 brew install --cask gcc-arm-embedded   # arm-supplied toolchain
 
 cd compile
-make                                    # → compile/kernel_2712.img
+make pi4                                # → compile/kernel8.img
 ```
 
 Override the toolchain location if you installed it elsewhere:
 
 ```sh
 cd compile
-make GCCPATH=$HOME/aarch64/arm-gnu-toolchain-14.3.rel1-x86_64-aarch64-none-elf
+make pi4 GCCPATH=$HOME/aarch64/arm-gnu-toolchain-14.3.rel1-x86_64-aarch64-none-elf
 ```
 
 ## Install
 
-Insert a Pi-5 SD card with the FAT32 bootfs partition mounted.  The
+Insert a Pi 4 SD card with the FAT32 bootfs partition mounted.  The
 canonical Mac path is `/Volumes/bootfs`:
 
 ```sh
 cd compile
-make install SDCARD=/Volumes        # copies kernel_2712.img + config.txt
+make install_pi4 SDCARD=/Volumes      # copies kernel8.img + config.txt
 ```
 
 The `sdcard/` directory at the repo root holds the canonical
-`config.txt`.  It sets `arm_64bit=1`, `kernel=kernel_2712.img`,
-`enable_uart=1`, and `dtparam=uart0=on` so the firmware locks
-UART0 to GPIO14/15 at the fixed 48 MHz reference clock.
+`config_pi4.txt` (copied to `config.txt` on the card).  It sets
+`arm_64bit=1`, `kernel=kernel8.img`, `enable_uart=1`,
+`dtparam=uart0=on`, and pins the PL011 reference clock to 48 MHz so
+the firmware locks UART0 to GPIO14/15 at a true 115200 baud.
 
-You also need the regular Pi-5 firmware blobs on the same partition
+You also need the regular Pi 4 firmware blobs on the same partition
 (`bootcode.bin`, `start4.elf` etc).  The easiest way is to format the
 card with a stock Raspberry Pi OS image and then overwrite
-`kernel_2712.img` + `config.txt`.
+`kernel8.img` + `config.txt`.
 
 ## Run
 
-### Real Pi 5 hardware
+### Real Pi 4 hardware
 
 1. Wire a 3.3 V USB-serial adapter to header pins 8 (TXD → GPIO14),
    10 (RXD → GPIO15) and a GND pin (e.g. 6).
 2. On the host: `screen /dev/tty.usbserial-XXXX 115200`
 3. Power-cycle the Pi.  The banner above appears within ~5 seconds.
 
-### QEMU `virt` (no Pi 5 machine in upstream QEMU yet)
+### QEMU `virt`
 
-QEMU 11 doesn't model BCM2712 / RP1, so we cross-build a tiny variant
-that swaps the PL011 base (`0x107D001000` → `0x09000000`) and the
-load address (`0x80000` → `0x40080000`).  Source is shared; only
+QEMU's generic `virt` machine doesn't faithfully model BCM2711, so we
+cross-build a tiny variant that swaps the PL011 base
+(`0xFE201000` → `0x09000000`) and the load address
+(`0x80000` → `0x40080000`).  Source is shared; only
 `-DUART0_BASE=...` and `link_virt.ld` differ.
 
 ```sh
@@ -144,7 +147,7 @@ Recorded `make qemu-smoke` output (`qemu-system-aarch64 11.0,
 
 ```
 xinu-pi4$ hello
-hello from Xinu on Raspberry Pi 5 (BCM2712, AArch64)
+hello from Xinu on virt (QEMU, AArch64)
 xinu-pi4$ mem
 __bss_start = 0x00000000400810d0
 __bss_end   = 0x00000000400811d0
@@ -177,8 +180,11 @@ halt: masking DAIF, requesting PSCI SYSTEM_OFF...
 # QEMU exits cleanly here (PSCI HVC at EL1 caught by virt emulator)
 ```
 
-MIDR `0x414fd0b1` is the published Cortex-A76 part number — proof the
-core actually emulates A76, not a generic ARMv8.
+The QEMU `virt` build is compiled `-cpu cortex-a76` (the closest model
+upstream QEMU exposes); on real hardware the same source runs on the
+Pi 4's Cortex-A72.  MIDR `0x414fd0b1` above is QEMU's published A76
+part number — proof the core actually emulates A76, not a generic
+ARMv8.
 
 **pingpong is the AIPL Ping/Pong actor pair, ported to the bare-metal
 shell** as a single-stack simulation.  Two static `pp_actor_t` structs
@@ -230,15 +236,15 @@ Xinu-style subsystem dirs (modelled on `github.com/davidxyz/xinuPi`):
 ```
 xinu-rpi4/
 ├── compile/                # build directory — run `make` from here
-│   ├── Makefile            # aarch64-elf → kernel_2712.img + kernel_virt.img
-│   ├── link.ld             # load address 0x80000 (Pi 5 firmware)
+│   ├── Makefile            # aarch64-elf → kernel8.img + kernel_virt.img
+│   ├── link.ld             # load address 0x80000 (Pi 4 firmware)
 │   ├── link_virt.ld        # load address 0x40080000 (QEMU virt)
 │   ├── obj/                # *.o per-source (gitignored)
 │   │   └── qemu/           # QEMU variant objects
 │   └── kernel_*.img        # final flat images (gitignored)
 ├── device/
 │   └── uart/
-│       └── uart.c          # PL011 UART0 @ 0x107D001000 + getc/getline
+│       └── uart.c          # PL011 UART0 @ 0xFE201000 + getc/getline
 ├── include/                # shared headers (-I../include)
 │   ├── memory.h
 │   ├── proc.h
@@ -255,7 +261,7 @@ xinu-rpi4/
 │   ├── ctxsw.S             # AArch64 callee-saved save/restore
 │   └── proc.c              # proctab + ready list + resched + create/exit
 ├── sdcard/
-│   └── config.txt          # firmware settings (arm_64bit=1, etc)
+│   └── config_pi4.txt      # firmware settings (arm_64bit=1, etc)
 └── README.md
 ```
 
@@ -266,17 +272,18 @@ new directory under `device/`; the `compile/Makefile` picks it up via
 ## Roadmap (`AIPL_XinuRPi5_Round1.aice`)
 
 The full Round 1 plan lives in the companion abclcp-project repo
-at `aice-pi-evolution/experiments/2026-05-22_xinu_rpi5/`.  Twelve
+at `aice-pi-evolution/experiments/2026-05-22_xinu_rpi5/` (the original
+AIPL experiment directory name is retained for traceability).  Twelve
 phases across six directions:
 
 | Direction | Phases | One-liner |
 |-----------|--------|-----------|
-| **B** Boot | B0–B2 | toolchain, AArch64 stub, kernel_2712.img |
+| **B** Boot | B0–B2 | toolchain, AArch64 stub, kernel8.img |
 | **U** UART | U0–U1 | PL011 UART0, kprintf |
 | **M** Memory | M0–M1 | MMU flat ID map, freelist heap |
 | **S** Scheduler | S0–S1 | AArch64 ctxsw, GIC + generic timer |
-| **X** Userland | X0–X1 | xsh on Pi 5, AIPL hello |
-| **N** Network (stretch) | N0–N1 | RP1 discover, VideoCore VII framebuffer |
+| **X** Userland | X0–X1 | xsh on Pi 4, AIPL hello |
+| **N** Network (stretch) | N0–N1 | GENET Ethernet, VideoCore framebuffer |
 
 The legacy 32-bit Xinu (`yaskodama/xinu-rpi`) is the regression
 anchor — none of its smokes are allowed to break while this repo

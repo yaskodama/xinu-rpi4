@@ -1,9 +1,9 @@
-// kernel/main.c — Xinu-on-Pi-5 first sign of life.
+// kernel/main.c — Xinu-on-Pi-4 first sign of life.
 //
 // boot.S has cleared BSS, set up the initial stack and dropped here.
 // All we do for the B0/B1/B2/U0/U1 milestone is bring up UART0 and
 // print a hello banner so the USB-serial cable shows something the
-// host can grep for ("Xinu Pi5 hello" is the smoke marker).
+// host can grep for ("Xinu Pi4 hello" is the smoke marker).
 //
 // Real Xinu init (interrupts, mmu, scheduler) lands in subsequent
 // phases — those will pull in their own files (system/initialize.c,
@@ -305,7 +305,7 @@ void xhci_mouse_event(unsigned nButtons, int dx, int dy)
 extern unsigned char _end[];   /* set by link.ld — top of static image */
 
 #ifndef HEAP_END
-/* Pi 5 firmware: assume at least 1 GiB of RAM mapped starting at 0
+/* Pi 4 firmware: assume at least 1 GiB of RAM mapped starting at 0
  * (config.txt's `arm_64bit=1` gives us the whole low region).  QEMU
  * `virt` builds override this from the Makefile to 0x50000000 (256 MB). */
 #define HEAP_END 0x40000000UL
@@ -723,7 +723,7 @@ static void sd_visit(const char *name, int is_dir, unsigned long size,
 
 /* Mount real SD-card FAT32 partition under /sd/.  No-op (graceful
  * fallback) if the controller fails to init or the partition isn't
- * FAT32; that lets the QEMU / Pi 5 builds compile and run identically
+ * FAT32; that lets the QEMU / Pi 4 builds compile and run identically
  * to before. */
 static void vfs_mount_sd(void)
 {

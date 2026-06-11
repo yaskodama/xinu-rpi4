@@ -2,7 +2,7 @@
 //
 // Follows the davidxyz/xinuPi shell.c shape: a `centry` table maps
 // command name → handler.  We don't have thread, tty, file
-// descriptors or printf yet on Pi 5 AArch64, so each handler talks
+// descriptors or printf yet on Pi 4 AArch64, so each handler talks
 // directly to the UART through the helpers in uart.h.
 //
 // The REPL loop:
@@ -18,7 +18,7 @@
 //   hello                friendly greeting (smoke marker)
 //   mem                  link-script symbols: __bss_start, __bss_end, _end
 //   peek  <hex_addr>     read 32-bit word at MMIO address (default base
-//                        BCM2712 — try `peek 0x107d001018` for UART_FR)
+//                        BCM2711 — try `peek 0xfe201018` for UART_FR)
 //   uptime               printed since this is bare metal: stub "?", later
 //                        bound to the generic timer in phase S1
 //   ps                   tiny core-status table (the scheduler isn't
@@ -27,7 +27,7 @@
 //                        per boot.S)
 //   halt                 mask interrupts, ask PSCI SYSTEM_OFF
 //                        (HVC at EL2, SMC at EL1 — QEMU virt
-//                        actually exits; real Pi 5 falls through to
+//                        actually exits; real Pi 4 falls through to
 //                        the WFE park)
 //   pingpong [N]         run a 2-actor AIPL-style PingPong: two
 //                        cooperative "processes" exchange messages
@@ -158,7 +158,7 @@ static int cmd_echo(int argc, char **argv)
 static int cmd_hello(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    uart_puts("hello from Xinu on Raspberry Pi 5 (BCM2712, AArch64)\n");
+    uart_puts("hello from Xinu on " BOARD_NAME " (" SOC_NAME ", AArch64)\n");
     return 0;
 }
 
@@ -595,7 +595,7 @@ static int cmd_usb(int argc, char **argv)
     (void)argc; (void)argv;
     if (!usb_present()) {
         uart_puts("usb: no DWC2 USB controller on this board\n");
-        uart_puts("     (Pi 5 routes USB through RP1; QEMU virt has no DWC2)\n");
+        uart_puts("     (QEMU virt has no DWC2; Pi 4 USB-A is via the VL805 PCIe xHCI)\n");
         return 0;
     }
     unsigned int id = usb_synopsys_id();
@@ -633,7 +633,7 @@ static int cmd_halt(int argc, char **argv)
      *
      * QEMU virt's PSCI conduit is HVC even when the guest is at EL1
      * (the emulator catches the call regardless of EL3 presence).
-     * Real Pi 5 firmware may or may not implement PSCI — we fall
+     * Real Pi 4 firmware may or may not implement PSCI — we fall
      * through to WFE if HVC returns at all.
      *
      * We can't try SMC as a fallback first: with no exception
