@@ -1,0 +1,508 @@
+% USERS_MANUAL_EN.tex — xinu-rpi4 User's Manual (English)
+% Build: lualatex USERS_MANUAL_EN.tex   (run twice for the ToC)
+\documentclass[a4paper,11pt]{article}
+
+\usepackage{fontspec}
+\setmonofont{Menlo}[Scale=0.88]   % box-drawing + arrows for code/trees
+\usepackage[a4paper,margin=2.2cm]{geometry}
+\usepackage{amssymb}
+\usepackage{xcolor}
+\usepackage{fancyvrb}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{newunicodechar}
+\usepackage[hidelinks]{hyperref}
+\usepackage{titlesec}
+
+% --- Unicode glyphs used in body text (code blocks use Menlo directly) ---
+\newunicodechar{→}{\textrightarrow}
+\newunicodechar{↔}{\ensuremath{\leftrightarrow}}
+\newunicodechar{×}{\ensuremath{\times}}
+\newunicodechar{…}{\dots}
+\newunicodechar{≥}{\ensuremath{\geq}}
+\newunicodechar{✅}{\textcolor{green!55!black}{\checkmark}}
+\newunicodechar{⏳}{\textcolor{orange!80!black}{\textbf{\small WIP}}}
+\newunicodechar{❌}{\textcolor{red!70!black}{\ensuremath{\times}}}
+\newunicodechar{—}{\textemdash}
+\newunicodechar{⚠}{\textcolor{orange!80!black}{\textbf{!}}}
+
+% --- code block style ---
+\definecolor{codebg}{gray}{0.96}
+\DefineVerbatimEnvironment{code}{Verbatim}%
+  {fontsize=\small,frame=single,framerule=0.3pt,rulecolor=\color{gray!60},%
+   framesep=5pt,xleftmargin=2pt,xrightmargin=2pt}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt}
+\titlespacing*{\section}{0pt}{14pt}{6pt}
+\renewcommand{\arraystretch}{1.25}
+
+\title{\textbf{Xinu \texttt{xinu-rpi4} User's Manual}\\[2pt]
+       \large Embedded Xinu for the Raspberry Pi 4 (BCM2711 / Cortex-A72, AArch64)}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-2.2em}
+\begin{center}\rule{0.9\textwidth}{0.4pt}\end{center}
+
+Embedded Xinu port for the Raspberry Pi 4 (BCM2711 / Cortex-A72, AArch64).
+The same source tree also cross-builds for the QEMU \texttt{virt} machine.
+This manual is written for \textbf{operators} --- for the development
+roadmap see \texttt{README.md}.
+
+{\small\tableofcontents}
+\bigskip
+
+%======================================================================
+\section{Targets and Build Artefacts}
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}l l l l@{}}
+\toprule
+\textbf{Target} & \textbf{Board / machine} & \textbf{Output image} & \textbf{UART0 base}\\
+\midrule
+\verb|pi4|  & Raspberry Pi 4 (BCM2711) & \verb|kernel8.img|     & \verb|0xFE201000|\\
+\verb|qemu| & QEMU \verb|-M virt -cpu cortex-a76| & \verb|kernel_virt.img| & \verb|0x09000000|\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The load address is \verb|0x80000| for Pi 4 and \verb|0x40080000| for QEMU.
+Both images come from one source tree, distinguished by \verb|-D<TARGET>|
+macros and a per-target linker script.
+
+\subsection{Feature Matrix (read this first!)}
+
+Not every feature works on every target. Several subsystems run only on
+real hardware (Pi 4):
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}l c c p{6.6cm}@{}}
+\toprule
+\textbf{Subsystem} & \textbf{Pi 4} & \textbf{QEMU} & \textbf{Notes}\\
+\midrule
+PL011 UART0 shell          & ✅ & ✅ & The common substrate\\
+Cooperative scheduler (S0) & ✅ & ✅ & \verb|procdemo| / \verb|pingpong|\\
+Preemptive scheduler (S1)  & ✅ & ⏳ & 100 Hz timer tick works on Pi 4 (\verb|ticks|)\\
+HDMI framebuffer           & ✅ & — & Usable on Pi 4\\
+Window manager             & ✅ & — & 1280×960 virtual desktop, Pi 4 only\\
+SD card + FAT32            & ✅ & — & EMMC driver is BCM2711-specific\\
+Ethernet (GENET)           & ✅ & — & NET-E done (BCM2711 GENET)\\
+USB (keyboard / HID)       & ✅ & — & Via VL805 PCIe xHCI (USB-2.0 ports)\\
+DHCP / TCP                 & ❌ & — & Code present but dispatch OFF (§7.4)\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+⚠~The source tree contains \texttt{device/genet/}, \texttt{device/sd/},
+\texttt{device/usb/xhci/} etc., initialised against \textbf{Pi 4 (BCM2711)
+register addresses}. The \verb|-D<BASE>| macros (\verb|GENET_BASE|, \dots) are
+defined only for the Pi 4 build; the QEMU build leaves them undefined so the
+corresponding code is linked out or no-ops.
+
+\subsection{Boot Sequence (the unusual bits)}
+
+\texttt{loader/boot.S} does more than a textbook bare-metal stub:
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+\item \textbf{Mandatory Linux ARM64 Image header.} The Pi 4 EEPROM bootloader
+  can refuse to jump into the kernel unless it sees the magic \verb|"ARM\x64"|
+  at file offset \verb|0x38|. \texttt{boot.S} places a 64-byte header right at
+  \verb|_start:|. Symptom of a missing header: the firmware rainbow pattern
+  stays on HDMI and your code never runs.
+\item \textbf{Pin secondary cores with MPIDR\_EL1.} The boot core continues;
+  cores 1/2/3 enter a \verb|wfe| park loop until S0/S1 wakes them.
+\item \textbf{Set up SP using the leex convention.} \verb|sp = _start| (=
+  \verb|0x80000|) --- the kernel base address doubles as the initial stack
+  pointer.
+\item \textbf{Preserve the DTB pointer.} Firmware passes the device tree
+  physical address in \verb|x0|; the stub stashes it across BSS clear and
+  writes it back to \verb|.data dtb_addr|.
+\item \textbf{Zero BSS, then jump to C} (\verb|bl kernel_main|). If
+  \verb|kernel_main| ever returns, drop into the same \verb|wfe| park loop.
+\end{enumerate}
+
+The stub does \textbf{not} implement an EL2\,\textrightarrow\,EL1 transition
+(same assumption holds for QEMU). Adding \verb|armstub=| or \verb|kernel_old=1|
+would change this.
+
+%======================================================================
+\section{What You Need}
+
+\subsection{Hardware (for a real board)}
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item Raspberry Pi 4 (BCM2711)
+\item microSD card with a FAT32 \verb|bootfs| partition (easiest: flash
+  Raspberry Pi OS first, then overwrite \verb|kernel8.img| and \verb|config.txt|)
+\item 3.3\,V USB-serial adapter, 115200 8N1 --- header pin 8 (TXD\,\textrightarrow\,GPIO14),
+  pin 10 (RXD\,\textrightarrow\,GPIO15), and a GND (e.g.\ pin 6)
+\item For networking: an Ethernet cable
+\end{itemize}
+
+\subsection{Host software}
+macOS or Linux, plus an AArch64 cross-toolchain (pick one):
+\begin{code}
+brew install aarch64-elf-gcc            # GNU
+brew install --cask gcc-arm-embedded    # ARM official
+\end{code}
+\verb|qemu-system-aarch64| for the QEMU target (\verb|brew install qemu|), and a
+serial terminal client (\verb|screen|, \verb|minicom|, \verb|picocom|, \dots).
+
+%======================================================================
+\section{Build}
+
+Always run \verb|make| from \verb|compile/| --- the Makefile uses \verb|VPATH|
+to gather sources from \verb|../loader/|, \verb|../device/...|, etc.
+
+\subsection{Basic commands}
+\begin{code}
+cd /Users/kodamay/projects/xinu-rpi4/compile
+
+make pi4            # -> compile/kernel8.img       (real Pi 4)
+make qemu           # -> compile/kernel_virt.img   (QEMU virt)
+make                # = make all = pi4 + qemu
+make clean          # remove all objects and images
+\end{code}
+Objects live in per-variant trees (\verb|obj/pi4/|, \verb|obj/qemu/|), so
+building different targets in sequence only recompiles what differs.
+
+\subsection{Toolchain auto-detection}
+The Makefile looks for AArch64 GCC as \verb|$(GCCPATH)/bin/aarch64-elf-gcc|
+then \verb|aarch64-none-elf-gcc|. Default \verb|GCCPATH| is \verb|/opt/homebrew|:
+\begin{code}
+make pi4 GCCPATH=$HOME/aarch64/arm-gnu-toolchain-...-aarch64-none-elf
+make pi4 CROSS=aarch64-linux-gnu-
+\end{code}
+
+\subsection{Key Make variables}
+\begin{center}\footnotesize
+\begin{tabular}{@{}l l p{7.2cm}@{}}
+\toprule
+\textbf{Variable} & \textbf{Default} & \textbf{Purpose}\\
+\midrule
+\verb|GCCPATH| & \verb|/opt/homebrew| & Cross-toolchain install prefix\\
+\verb|CROSS|   & (auto-detected)     & Tool prefix (\verb|aarch64-elf-|, \dots)\\
+\verb|SDCARD|  & \verb|/Volumes|     & Parent mount point for \verb|make install_*|\\
+\verb|DEST|    & \verb|$(SDCARD)/bootfs| & Target FAT32 partition\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Per-target macros (passed via CFLAGS)}
+\begin{center}\footnotesize
+\begin{tabular}{@{}l l l@{}}
+\toprule
+\textbf{Macro} & \textbf{Pi 4} & \textbf{QEMU virt}\\
+\midrule
+\verb|-mcpu|       & \verb|cortex-a72| & \verb|cortex-a76|\\
+\verb|UART0_BASE|  & \verb|0xFE201000| & \verb|0x09000000|\\
+\verb|MBOX_BASE|   & \verb|0xFE00B880| & (undef)\\
+\verb|SD_BASE|     & \verb|0xFE340000| & ---\\
+\verb|USB_BASE|    & \verb|0xFE980000| & ---\\
+\verb|GIC_BASE|    & \verb|0xFF840000| & ---\\
+\verb|PCIE_BASE|   & \verb|0xFD500000| & ---\\
+\verb|GENET_BASE|  & \verb|0xFD580000| & ---\\
+\verb|HEAP_END|    & \verb|0x40000000| (1G) & \verb|0x50000000|\\
+\verb|SKIP_MBOX|   & ---               & defined (simplify)\\
+\verb|KERNEL_NAME| & \verb|"kernel8.img"| & \verb|"kernel_virt.img"|\\
+\verb|BOARD_NAME|  & \verb|"Pi4"|      & \verb|"virt"|\\
+\verb|SOC_NAME|    & \verb|"BCM2711"|  & \verb|"QEMU"|\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Common CFLAGS:
+\verb|-Wall -O2 -ffreestanding -nostdinc -nostdlib -nostartfiles -mgeneral-regs-only|.
+The flag keeps most code FPU/NEON-free; only \verb|cc.c| and \verb|llm.c| are
+built with FP enabled (CPACR releases the FPU at EL1).
+
+\subsection{Linker scripts}
+\begin{center}\footnotesize
+\begin{tabular}{@{}l l l@{}}
+\toprule
+\textbf{Script} & \textbf{Target} & \textbf{Entry / load address}\\
+\midrule
+\verb|compile/link.ld|      & Pi 4      & \verb|0x80000|\\
+\verb|compile/link_virt.ld| & QEMU virt & \verb|0x40080000|\\
+\bottomrule
+\end{tabular}
+\end{center}
+Both place \verb|.text.boot| at the start and export \verb|__bss_start| /
+\verb|__bss_size| (8-byte units), following the leex convention.
+
+%======================================================================
+\section{Writing the SD Card}
+
+\subsection{Pi 4}
+\begin{code}
+cd compile
+make install_pi4 SDCARD=/Volumes
+# -> copies kernel8.img and sdcard/config_pi4.txt to /Volumes/bootfs
+\end{code}
+\verb|make install| is an alias for \verb|install_pi4|.
+
+\subsection{Manual copy (e.g.\ external SD reader)}
+\begin{code}
+diskutil mount /dev/disk4s1                # -> /Volumes/bootfs
+cp compile/kernel8.img /Volumes/bootfs/
+cp sdcard/config_pi4.txt /Volumes/bootfs/config.txt
+sync
+diskutil eject /Volumes/bootfs
+\end{code}
+⚠~Verify the md5 of \verb|kernel8.img| on the card matches \verb|compile/| ---
+booting an old image is the most common time sink.
+
+\subsection{What else must be on the card}
+\verb|kernel8.img| + \verb|config.txt| alone won't boot. The same FAT32
+partition also needs the Raspberry Pi OS firmware blobs (\verb|bootcode.bin|,
+\verb|start4.elf|, \verb|fixup4.dat|, \dots). Fastest path: flash Pi OS first,
+then overwrite only \verb|kernel8.img| and \verb|config.txt|.
+
+%======================================================================
+\section{Serial Console}
+\begin{code}
+screen /dev/tty.usbserial-XXXX 115200                       # macOS
+minicom -b 115200 -o -D /dev/tty.usbserial-XXXX             # macOS
+sudo screen /dev/ttyUSB0 115200                             # Linux
+\end{code}
+Exit \verb|screen| with \verb|Ctrl-a k| then \verb|y|. Within ~5 seconds of
+power-on you should see:
+\begin{code}
+================================================
+  Xinu Pi4 hello (AArch64, BCM2711, kernel8.img)
+  PL011 UART0 @ 0xFE201000, 115200 8N1
+  bootstrap: leex-style stub + xinu-rpi4 main
+================================================
+
+Round 1 phase B/U done -- entering interactive shell.
+type `help` for the command list.
+xinu-pi4$ _
+\end{code}
+
+%======================================================================
+\section{Shell Command Reference}
+\begin{center}\footnotesize
+\begin{tabular}{@{}l p{9.4cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose}\\
+\midrule
+\verb|help| / \verb|?|    & List registered commands\\
+\verb|echo <words>|       & Echo args back (whitespace-collapsed)\\
+\verb|hello|              & Smoke marker --- greeting\\
+\verb|mem|                & Show \verb|__bss_start| / \verb|__bss_end| / \verb|_end|\\
+\verb|peek <hex_addr>|    & Read a 32-bit MMIO word (e.g.\ \verb|peek 0xfe201018|)\\
+\verb|uptime|            & Raw \verb|CNTPCT_EL0| (generic timer counter)\\
+\verb|ticks|             & 100 Hz timer tick counter (S1)\\
+\verb|ps|                & Core / EL status\\
+\verb|halt|              & Mask DAIF + PSCI \verb|SYSTEM_OFF| (QEMU exits cleanly)\\
+\verb|reboot|            & Watchdog-driven reset via the BCM2711 PM block\\
+\verb|pingpong [N]|       & AIPL-style 2-actor cooperative PingPong, N=1..50\\
+\verb|procdemo [N]|       & Real 2-process ctxsw demo, N=1..30\\
+\verb|usb|               & DWC2 USB HCD diagnostics (Pi 4 only)\\
+\verb|rxstat|            & Drain RX ring + show packet / byte counters\\
+\verb|pan <dx> <dy>|      & Scroll the virtual 1280×960 desktop viewport\\
+\verb|view|              & Show viewport / desktop sizes\\
+\verb!autopan [on|off]!   & Toggle demo auto-scroll\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{procdemo --- real context switch}
+\begin{code}
+xinu-pi4$ procdemo 3
+procdemo: created pid=1 (ping) and pid=2 (pong), iters=3
+  [Ping pid=1] tick 1
+  [Pong pid=2] tock 1
+  [Ping pid=1] tick 2
+  [Pong pid=2] tock 2
+  [Ping pid=1] tick 3
+  [Pong pid=2] tock 3
+  [Ping pid=1] exit at iter 3
+  [Pong pid=2] exit at iter 3
+procdemo: both processes exited; back in shell.
+\end{code}
+Each \verb|pid=N| is read live from global \verb|currpid|, so the alternation
+is direct evidence the scheduler flipped contexts. Stacks are not reclaimed on
+\verb|proc_exit| yet --- S1 (clock IRQ) will let the dispatcher reap them.
+
+\subsection{pingpong vs procdemo}
+\begin{center}\footnotesize
+\begin{tabular}{@{}l p{4.4cm} p{5.0cm}@{}}
+\toprule
+\textbf{Aspect} & \verb|pingpong| & \verb|procdemo|\\
+\midrule
+Actors     & Two static (\verb|Ping|, \verb|Pong|) & Real procs via \verb|proc_create|\\
+Switch     & Single-stack dispatcher loop & Real ctxsw via \verb|ctxsw.S|\\
+Terminate  & Both inboxes empty & Both call \verb|proc_exit()|\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%======================================================================
+\section{Networking (Pi 4)}
+The network stack runs on the Pi 4 GENET (BCM2711).
+
+\textbf{What works:} ARP request/reply; ICMP echo (ping); static IP/MAC
+\verb|192.168.3.100| / \verb|d8:3a:dd:a7:fd:bf| (set in \verb|loader/main.c:707|
+area); raw broadcast/unicast TX; 16-slot RX ring.
+
+\subsection{Ping from a Mac}
+\begin{code}
+sudo arp -s 192.168.3.100 d8:3a:dd:a7:fd:bf
+ping 192.168.3.100
+\end{code}
+RTT is ~900\,ms (rate-limited by the window-manager tick). Quick shell checks:
+\verb|rxstat| and \verb|ticks|.
+
+\subsection{DHCP / TCP status}
+\verb|system/dhcp_client.c| and \verb|system/tcp_server.c| ship in the tree but
+their \verb|rx_tick| dispatch is \textbf{OFF}: repeated DHCP broadcast TX
+degrades the GENET TX ring and stalls ICMP, and routing \verb|tcp_handle_packet()|
+from \verb|rx_tick| stops subsequent ICMP echo replies. Re-enabling is planned in
+a future sprint (NET-G bisect).
+
+%======================================================================
+\section{Running under QEMU}
+\begin{code}
+cd compile
+make qemu          # interactive -- Ctrl-A X to quit
+make qemu-smoke    # canned input, writes qemu-smoke.log
+\end{code}
+Under QEMU: \verb|MIDR_EL1 = 0x414fd0b1| (QEMU's published Cortex-A76 part
+number; real Pi 4 hardware runs Cortex-A72); \verb|halt| cleanly exits because
+\verb|virt| handles PSCI \verb|SYSTEM_OFF|; no networking, USB, SD, or HDMI.
+
+%======================================================================
+\section{Important config.txt Lines}
+\verb|sdcard/config_pi4.txt| (copied to the card's \verb|config.txt| by
+\verb|make install_pi4|):
+\begin{center}\footnotesize
+\begin{tabular}{@{}l p{7.6cm}@{}}
+\toprule
+\textbf{Line} & \textbf{Meaning}\\
+\midrule
+\verb|arm_64bit=1|              & Boot in AArch64\\
+\verb|kernel=kernel8.img|       & Pi 4 kernel name\\
+\verb|kernel_address=0x80000|   & Load address\\
+\verb|enable_uart=1|            & Enable UART\\
+\verb|uart_2ndstage=1|          & Print second-stage bootloader log on UART\\
+\verb|dtparam=uart0=on|         & Route UART0 to GPIO14/15\\
+\verb|init_uart_clock=48000000| & Pin the PL011 reference clock to 48 MHz\\
+\verb|hdmi_force_hotplug=1|     & Force HDMI hotplug\\
+\verb|framebuffer_width=640|    & Width of firmware-allocated framebuffer\\
+\verb|framebuffer_height=480|   & Height\\
+\verb|framebuffer_depth=32|     & bpp\\
+\bottomrule
+\end{tabular}
+\end{center}
+The KMS overlay (\verb|dtoverlay=vc4-kms-v3d|) is left in --- Xinu still
+consumes the firmware's simple-framebuffer via the VC mailbox.
+
+%======================================================================
+\section{USB / Input Device Support}
+The Pi 4's USB-A ports go through \textbf{VL805 (PCIe xHCI)}; a hand-rolled
+xHCI driver brings up USB keyboards and mice.
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item \textbf{Use the USB-2.0 (black) ports.} They route through the USB-2.0 hub
+  (Genesys, working TT), so low-speed interrupt-IN split transactions are
+  delivered. The USB-3.0 (blue) ports sit behind the VIA USB3 hub whose path
+  does not deliver the periodic transfer (the cursor won't move).
+\item The shell's \verb|usb| command is a diagnostic dump for the DWC2 (USB-C
+  OTG) HCD, not a general device-control interface.
+\item VL805 firmware leaves the PCIe RC in reset on an SD boot, so boot issues a
+  \verb|NOTIFY_XHCI_RESET| mailbox tag (\verb|0x00030058|, devid \verb|0x100000|)
+  to bring xHCI up (details in \verb|NEXT_SESSION_PI4.md|).
+\end{itemize}
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}l l l@{}}
+\toprule
+\textbf{Board} & \textbf{Input} & \textbf{Output}\\
+\midrule
+Pi 4  & USB-A keyboard / UART0 serial & UART0 serial + HDMI framebuffer\\
+QEMU  & qemu stdio (serial)          & qemu stdio (serial)\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%======================================================================
+\section{Troubleshooting}
+\begin{center}\footnotesize
+\begin{tabular}{@{}p{5.2cm} p{8.2cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{What to check}\\
+\midrule
+No output on serial            & device name + speed in \verb|screen|; TX/RX swapped; GND\\
+Banner appears, then stops     & Old \verb|kernel8.img| on SD --- rebuild and recopy\\
+No echo at the prompt          & Local echo on the host terminal --- keep it OFF\\
+\verb|peek| returns 0xFFFFFFFF  & Address not mapped; MMU is flat ID\\
+USB keyboard/mouse dead        & Make sure it's on a USB-2.0 (black) port (§11)\\
+Ping fails on Pi 4             & \verb|sudo arp -s ...| done?; cable; \verb|rxstat| increments?\\
+\verb|make qemu| fails          & Check \verb|qemu-system-aarch64| version ($\geq$11)\\
+\verb|make install| permission  & It uses \verb|sudo cp| --- provide the sudo password\\
+Reboot loop on power-on        & Does \verb|kernel=| match the file on the card?\\
+Rainbow pattern stays on HDMI  & Likely missing ARM64 Image header --- rebuild\\
+\bottomrule
+\end{tabular}
+\end{center}
+Generic recovery flow:
+\begin{code}
+cd compile && make clean && make pi4
+make install_pi4 SDCARD=/Volumes
+diskutil eject /Volumes/bootfs
+# Reseat the SD card and power-cycle the board.
+\end{code}
+
+%======================================================================
+\section{Directory Layout (operator view)}
+\begin{code}
+xinu-rpi4/
+├── compile/                # run `make` here
+│   ├── Makefile
+│   ├── kernel8.img         # Pi 4 (built by `make pi4`)
+│   └── kernel_virt.img     # QEMU (built by `make qemu`)
+├── sdcard/
+│   └── config_pi4.txt      # Pi 4 (copied by install_pi4)
+├── README.md               # Developer-facing roadmap + internals
+├── USERS_MANUAL_EN.md      # Markdown source of this manual
+├── USERS_MANUAL_JA.md      # Japanese version
+└── NEXT_SESSION_PI4.md     # Handoff notes for ongoing work
+\end{code}
+
+%======================================================================
+\section{Recipe Book}
+\textbf{From a fresh checkout to a running Pi 4:}
+\begin{code}
+cd /Users/kodamay/projects/xinu-rpi4/compile
+make clean && make pi4
+make install_pi4 SDCARD=/Volumes
+diskutil eject /Volumes/bootfs
+screen /dev/tty.usbserial-XXXX 115200
+\end{code}
+\textbf{Quick command sanity check (QEMU):}
+\begin{code}
+cd compile && make qemu
+xinu-pi4$ procdemo 5
+xinu-pi4$ pingpong 3
+xinu-pi4$ halt          # Ctrl-A X to exit QEMU
+\end{code}
+
+%======================================================================
+\section{References}
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item Upstream Xinu (32-bit): \url{https://github.com/yaskodama/xinu-rpi}
+\item AArch64 boot stub origin: \url{https://github.com/radlyeel/leex}
+\item Shell centry pattern origin: \url{https://github.com/davidxyz/xinuPi}
+\item Development roadmap (Round 1 plan): under
+  \verb|aice-pi-evolution/experiments/| in the abclcp-project repo
+\end{itemize}
+
+\section{License}
+Inherits the BSD-style licenses of upstream Xinu and leex. See \verb|LICENSE|
+once the source-of-truth file is added.
+
+\end{document}

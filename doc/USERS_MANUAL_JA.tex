@@ -1,0 +1,493 @@
+% USERS_MANUAL_JA.tex — xinu-rpi4 ユーザーズマニュアル (日本語版)
+% Build: lualatex USERS_MANUAL_JA.tex   (目次のため 2 回実行)
+\documentclass[a4paper,11pt]{ltjsarticle}
+
+\usepackage{luatexja-fontspec}
+\setmonofont{Menlo}[Scale=0.85]    % コード/ツリーの box-drawing と矢印用
+\usepackage[a4paper,margin=2.0cm]{geometry}
+\usepackage{amssymb}
+\usepackage{xcolor}
+\usepackage{fancyvrb}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{newunicodechar}
+\usepackage[hidelinks]{hyperref}
+
+% --- 本文中で使う Unicode 記号 (コードブロックは Menlo が直接描画) ---
+\newunicodechar{→}{\textrightarrow}
+\newunicodechar{↔}{\ensuremath{\leftrightarrow}}
+\newunicodechar{×}{\ensuremath{\times}}
+\newunicodechar{…}{\dots}
+\newunicodechar{≥}{\ensuremath{\geq}}
+\newunicodechar{✅}{\textcolor{green!55!black}{\checkmark}}
+\newunicodechar{⏳}{\textcolor{orange!80!black}{\textbf{\small WIP}}}
+\newunicodechar{❌}{\textcolor{red!70!black}{\ensuremath{\times}}}
+\newunicodechar{⚠}{\textcolor{orange!80!black}{\textbf{!}}}
+
+% --- コードブロック ---
+\DefineVerbatimEnvironment{code}{Verbatim}%
+  {fontsize=\small,frame=single,framerule=0.3pt,rulecolor=\color{gray!60},%
+   framesep=5pt,xleftmargin=2pt,xrightmargin=2pt}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt}
+\renewcommand{\arraystretch}{1.25}
+
+\title{\textbf{Xinu \texttt{xinu-rpi4} ユーザーズマニュアル}\\[2pt]
+       \large Raspberry Pi 4 (BCM2711 / Cortex-A72, AArch64) 向け Embedded Xinu}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-2.2em}
+\begin{center}\rule{0.9\textwidth}{0.4pt}\end{center}
+
+Raspberry Pi 4 (BCM2711 / Cortex-A72, AArch64) 向けの Embedded Xinu 移植版。
+同じソースツリーから QEMU \texttt{virt} 機にもクロスビルドできる。本マニュアルは
+「動かす側」向け --- リポジトリの開発ロードマップは \texttt{README.md} を参照のこと。
+
+{\small\tableofcontents}
+\bigskip
+
+%======================================================================
+\section{対象ターゲットとビルド成果物}
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}l l l l@{}}
+\toprule
+\textbf{ターゲット} & \textbf{ボード / 機種} & \textbf{出力イメージ} & \textbf{UART0 base}\\
+\midrule
+\verb|pi4|  & Raspberry Pi 4 (BCM2711) & \verb|kernel8.img|     & \verb|0xFE201000|\\
+\verb|qemu| & QEMU \verb|-M virt -cpu cortex-a76| & \verb|kernel_virt.img| & \verb|0x09000000|\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+load address は \verb|0x80000| (Pi 4) / \verb|0x40080000| (QEMU)。2 つのイメージは
+同一ソースから \verb|-D<TARGET>| と異なるリンカスクリプトで作り分けている。
+
+\subsection{機能対応マトリクス (重要)}
+
+「全ターゲットで動く」訳ではない。\textbf{実機 (Pi 4) でしか動かない機能} が
+複数あるので要注意:
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}l c c p{6.4cm}@{}}
+\toprule
+\textbf{サブシステム} & \textbf{Pi 4} & \textbf{QEMU} & \textbf{備考}\\
+\midrule
+PL011 UART0 シェル        & ✅ & ✅ & 全機種で動く土台\\
+協調的スケジューラ (S0)   & ✅ & ✅ & \verb|procdemo| / \verb|pingpong|\\
+プリエンプティブ (S1)     & ✅ & ⏳ & Pi 4 のみ 100 Hz tick 稼働 (\verb|ticks|)\\
+HDMI フレームバッファ     & ✅ & — & Pi 4 で実用\\
+ウィンドウマネージャ      & ✅ & — & 1280×960 仮想デスクトップは Pi 4 のみ\\
+SD カード + FAT32        & ✅ & — & EMMC ドライバが BCM2711 向け\\
+Ethernet (GENET)         & ✅ & — & NET-E 完了 (BCM2711 GENET)\\
+USB (キーボード/HID)      & ✅ & — & VL805 PCIe xHCI 経由 (USB-2.0 ポート)\\
+DHCP / TCP               & ❌ & — & コードは在るが dispatch OFF (§7.4)\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+⚠~ソースツリーには \texttt{device/genet/}, \texttt{device/sd/},
+\texttt{device/usb/xhci/} 等が同居しており、これらは \textbf{Pi 4 (BCM2711) の
+レジスタアドレスで初期化} される。\verb|-DGENET_BASE| 等は Pi 4 ビルドでのみ定義
+され、QEMU ビルドでは undef になって対応コードがリンクから外れる作り。
+
+\subsection{起動シーケンス (特殊な部分)}
+
+\texttt{loader/boot.S} は通常の bare-metal stub よりひと工夫が要る:
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+\item \textbf{Linux ARM64 Image ヘッダが必須。} Pi 4 の EEPROM bootloader は
+  ファイル先頭から \verb|0x38| オフセットに \verb|"ARM\x64"| マジックが無いと
+  カーネルへジャンプしないケースがある。\texttt{boot.S} の \verb|_start:| 直下に
+  64 バイトのヘッダを配置。無いと \textbf{HDMI に虹色が出たまま固まる}。
+\item \textbf{MPIDR\_EL1 によるコア固定。} boot core 以外 (core1/2/3) を
+  \verb|wfe| ループに park。
+\item \textbf{スタック設定。} \verb|sp = _start| (= \verb|0x80000|)。
+\item \textbf{DTB アドレス退避。} ファームウェアから \verb|x0| に渡される DTB の
+  物理アドレスを BSS clear の間退避し \verb|.data dtb_addr| に格納。
+\item \textbf{BSS クリア → \texttt{kernel\_main}。} \verb|kernel_main| から戻れば
+  secondary と同じ \verb|wfe| パークへ落ちる。
+\end{enumerate}
+
+EL のドロップ (EL2\,\textrightarrow\,EL1) は自分で実装していない (QEMU も同じ
+前提)。\verb|armstub| や \verb|kernel_old=1| を入れると状況が変わる。
+
+%======================================================================
+\section{用意するもの}
+
+\subsection{ハードウェア (実機の場合)}
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item Raspberry Pi 4 (BCM2711)
+\item microSD カード (FAT32 で \verb|bootfs| パーティション)。一番簡単なのは
+  Raspberry Pi OS を焼き、後で \verb|kernel8.img| と \verb|config.txt| を上書き
+\item USB-シリアル変換ケーブル (3.3V、115200 8N1) --- ヘッダピン 8
+  (TXD\,\textrightarrow\,GPIO14) / 10 (RXD\,\textrightarrow\,GPIO15) / 6 (GND)
+\item ネットワーク機能を使う場合: イーサネットケーブル
+\end{itemize}
+
+\subsection{ホスト側ソフトウェア}
+macOS / Linux と AArch64 クロスツールチェイン (どちらか):
+\begin{code}
+brew install aarch64-elf-gcc           # Homebrew (推奨)
+brew install --cask gcc-arm-embedded   # ARM 公式
+\end{code}
+QEMU で動かすなら \verb|qemu-system-aarch64| (\verb|brew install qemu|)、および
+ターミナルシリアルクライアント (\verb|screen|、\verb|minicom|、\verb|picocom|)。
+
+%======================================================================
+\section{ビルド手順}
+
+ビルドは必ず \verb|compile/| ディレクトリで行うこと (\verb|Makefile| が
+\verb|VPATH| で \verb|../loader/|、\verb|../device/...| を集める作り)。
+
+\subsection{基本コマンド}
+\begin{code}
+cd /Users/kodamay/projects/xinu-rpi4/compile
+
+make pi4            # -> compile/kernel8.img      (Raspberry Pi 4 実機)
+make qemu           # -> compile/kernel_virt.img  (QEMU virt)
+make                # = make all = pi4 + qemu
+make clean          # オブジェクト・全 .img を削除
+\end{code}
+各ターゲットのオブジェクトは別ツリー (\verb|obj/pi4/|, \verb|obj/qemu/|) に
+分離され、続けて別ターゲットをビルドしても再コンパイルは差分のみ。
+
+\subsection{ツールチェインの自動検出}
+\verb|$(GCCPATH)/bin/aarch64-elf-gcc| → \verb|aarch64-none-elf-gcc| の順に探す。
+既定 \verb|GCCPATH| は \verb|/opt/homebrew|。別の場所なら:
+\begin{code}
+make pi4 GCCPATH=$HOME/aarch64/arm-gnu-toolchain-...-aarch64-none-elf
+make pi4 CROSS=aarch64-linux-gnu-
+\end{code}
+
+\subsection{主な Make 変数}
+\begin{center}\footnotesize
+\begin{tabular}{@{}l l p{7.0cm}@{}}
+\toprule
+\textbf{変数} & \textbf{既定値} & \textbf{用途}\\
+\midrule
+\verb|GCCPATH| & \verb|/opt/homebrew| & クロスコンパイラのインストール先\\
+\verb|CROSS|   & (自動検出)          & プレフィックス (\verb|aarch64-elf-| 等)\\
+\verb|SDCARD|  & \verb|/Volumes|     & \verb|make install_*| のマウント親\\
+\verb|DEST|    & \verb|$(SDCARD)/bootfs| & コピー先パーティション\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{ビルド時の主な定義 (CFLAGS で渡る)}
+\begin{center}\footnotesize
+\begin{tabular}{@{}l l l@{}}
+\toprule
+\textbf{マクロ} & \textbf{Pi 4} & \textbf{QEMU virt}\\
+\midrule
+\verb|-mcpu|       & \verb|cortex-a72| & \verb|cortex-a76|\\
+\verb|UART0_BASE|  & \verb|0xFE201000| & \verb|0x09000000|\\
+\verb|MBOX_BASE|   & \verb|0xFE00B880| & (未定義)\\
+\verb|SD_BASE|     & \verb|0xFE340000| & ---\\
+\verb|USB_BASE|    & \verb|0xFE980000| & ---\\
+\verb|GIC_BASE|    & \verb|0xFF840000| & ---\\
+\verb|PCIE_BASE|   & \verb|0xFD500000| & ---\\
+\verb|GENET_BASE|  & \verb|0xFD580000| & ---\\
+\verb|HEAP_END|    & \verb|0x40000000| (1G) & \verb|0x50000000|\\
+\verb|SKIP_MBOX|   & ---               & 定義 (簡略化)\\
+\verb|KERNEL_NAME| & \verb|"kernel8.img"| & \verb|"kernel_virt.img"|\\
+\verb|BOARD_NAME|  & \verb|"Pi4"|      & \verb|"virt"|\\
+\verb|SOC_NAME|    & \verb|"BCM2711"|  & \verb|"QEMU"|\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+共通 CFLAGS:
+\verb|-Wall -O2 -ffreestanding -nostdinc -nostdlib -nostartfiles -mgeneral-regs-only|。
+大半のコードで FPU/NEON は使わず、\verb|cc.c| / \verb|llm.c| のみ FP 有効でビルドする。
+
+\subsection{リンカスクリプト}
+\begin{center}\footnotesize
+\begin{tabular}{@{}l l l@{}}
+\toprule
+\textbf{スクリプト} & \textbf{対象} & \textbf{エントリ・ロードアドレス}\\
+\midrule
+\verb|compile/link.ld|      & Pi 4      & \verb|0x80000|\\
+\verb|compile/link_virt.ld| & QEMU virt & \verb|0x40080000|\\
+\bottomrule
+\end{tabular}
+\end{center}
+どちらも \verb|.text.boot| を先頭に置き、\verb|__bss_start| / \verb|__bss_size|
+(8-byte 単位) をエクスポートする leex 風の構成。
+
+%======================================================================
+\section{SD カードへの書き込み}
+
+\subsection{Pi 4}
+\begin{code}
+cd compile
+make install_pi4 SDCARD=/Volumes
+# -> /Volumes/bootfs に kernel8.img と sdcard/config_pi4.txt をコピー
+\end{code}
+\verb|make install| は \verb|install_pi4| のエイリアス。
+
+\subsection{手動で焼く場合}
+\begin{code}
+diskutil mount /dev/disk4s1                # -> /Volumes/bootfs
+cp compile/kernel8.img /Volumes/bootfs/
+cp sdcard/config_pi4.txt /Volumes/bootfs/config.txt
+sync
+diskutil eject /Volumes/bootfs
+\end{code}
+⚠~\verb|kernel8.img| の md5 が SD カード上のものと一致するか必ず確認すること。
+古いイメージで起動して混乱するのは「あるある」。
+
+\subsection{SD カードに必要なもの}
+\verb|kernel8.img| と \verb|config.txt| だけでは起動しない。同じ FAT32 パーティ
+ションに Raspberry Pi OS の \verb|bootcode.bin|, \verb|start4.elf|,
+\verb|fixup4.dat| ほかファームウェア blob 一式も必要。Pi OS を焼いてから
+\verb|kernel8.img| と \verb|config.txt| だけ上書きするのが最速。
+
+%======================================================================
+\section{シリアルコンソールへの接続}
+\begin{code}
+screen /dev/tty.usbserial-XXXX 115200                       # Mac
+minicom -b 115200 -o -D /dev/tty.usbserial-XXXX             # Mac
+sudo screen /dev/ttyUSB0 115200                             # Linux
+\end{code}
+\verb|screen| を終了するときは \verb|Ctrl-a k| → \verb|y|。電源投入後、約 5 秒
+以内に次のバナーが出る:
+\begin{code}
+================================================
+  Xinu Pi4 hello (AArch64, BCM2711, kernel8.img)
+  PL011 UART0 @ 0xFE201000, 115200 8N1
+  bootstrap: leex-style stub + xinu-rpi4 main
+================================================
+
+Round 1 phase B/U done -- entering interactive shell.
+type `help` for the command list.
+xinu-pi4$ _
+\end{code}
+
+%======================================================================
+\section{シェルコマンドリファレンス}
+\verb|help| または \verb|?| で常に最新の一覧が見られる。以下は標準コマンド:
+\begin{center}\footnotesize
+\begin{tabular}{@{}l p{8.8cm}@{}}
+\toprule
+\textbf{コマンド} & \textbf{用途}\\
+\midrule
+\verb|help| / \verb|?|    & 登録コマンド一覧を表示\\
+\verb|echo <words>|       & 引数をそのままエコーバック\\
+\verb|hello|             & 動作確認用の挨拶\\
+\verb|mem|               & \verb|__bss_start| / \verb|__bss_end| / \verb|_end| を表示\\
+\verb|peek <hex_addr>|    & 32-bit MMIO ワードを読む (例: \verb|peek 0xfe201018|)\\
+\verb|uptime|           & 生の \verb|CNTPCT_EL0| (汎用タイマカウンタ)\\
+\verb|ticks|            & 100 Hz タイマ tick の累積数 (S1)\\
+\verb|ps|               & コア / EL ステータス簡易表示\\
+\verb|halt|             & DAIF マスク + PSCI \verb|SYSTEM_OFF| (QEMU はクリーン終了)\\
+\verb|reboot|           & BCM2711 PM ブロックによる watchdog リセット\\
+\verb|pingpong [N]|      & AIPL 風 2 アクター協調 PingPong (N=1..50)\\
+\verb|procdemo [N]|      & 実 ctxsw による 2 プロセスデモ (N=1..30)\\
+\verb|usb|              & DWC2 USB HCD 診断 (Pi 4 のみ)\\
+\verb|rxstat|           & RX リングを drain してパケット/バイトカウンタを表示\\
+\verb|pan <dx> <dy>|     & 仮想 1280×960 デスクトップのビューポートをスクロール\\
+\verb|view|             & ビューポート / デスクトップサイズを表示\\
+\verb!autopan [on|off]!  & デモ用オートパンの切替\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{procdemo の見どころ}
+\begin{code}
+xinu-pi4$ procdemo 3
+procdemo: created pid=1 (ping) and pid=2 (pong), iters=3
+  [Ping pid=1] tick 1
+  [Pong pid=2] tock 1
+  [Ping pid=1] tick 2
+  [Pong pid=2] tock 2
+  [Ping pid=1] tick 3
+  [Pong pid=2] tock 3
+  [Ping pid=1] exit at iter 3
+  [Pong pid=2] exit at iter 3
+procdemo: both processes exited; back in shell.
+\end{code}
+\verb|pid=N| はグローバル \verb|currpid| から実行時に読み出した値なので、列方向の
+交互パターン自体がスケジューラが本当に切替えている証拠になる。スタックは
+\verb|proc_exit| では回収していない (S1 で IRQ tick 経由で回収予定)。
+
+\subsection{pingpong との違い}
+\begin{center}\footnotesize
+\begin{tabular}{@{}l p{4.2cm} p{5.2cm}@{}}
+\toprule
+\textbf{観点} & \verb|pingpong| & \verb|procdemo|\\
+\midrule
+アクター   & 静的 2 つ (\verb|Ping|, \verb|Pong|) & \verb|proc_create| した実プロセス\\
+スイッチ   & 単一スタック上のディスパッチ & \verb|ctxsw.S| による実 callee-saved 保存\\
+停止条件   & 両者の inbox が空 & 両者が \verb|proc_exit()|\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%======================================================================
+\section{ネットワーク機能 (Pi 4)}
+ネットワークドライバは Pi 4 GENET (BCM2711) で動作する。
+
+\textbf{動作する機能:} ARP request/reply、ICMP echo (ping)、静的 IP/MAC
+\verb|192.168.3.100| / \verb|d8:3a:dd:a7:fd:bf| (\verb|loader/main.c:707| 付近で
+設定)、生 broadcast/unicast 送信、RX リング 16-slot。
+
+\subsection{Mac から ping する手順}
+\begin{code}
+sudo arp -s 192.168.3.100 d8:3a:dd:a7:fd:bf
+ping 192.168.3.100
+\end{code}
+RTT は約 900\,ms (ウィンドウマネージャの tick 律速)。シェルからは \verb|rxstat| /
+\verb|ticks| で状況確認。
+
+\subsection{DHCP / TCP の現状}
+\verb|system/dhcp_client.c| と \verb|system/tcp_server.c| はツリーに含まれるが、
+\verb|rx_tick| からの dispatch を \textbf{OFF} にしている: 連続 broadcast TX で
+GENET TX ring が劣化し ICMP が止まる、また \verb|tcp_handle_packet()| を
+\verb|rx_tick| から呼ぶと以降の ICMP echo reply が止まるため。再有効化は今後の
+スプリント (NET-G bisect) で対応予定。
+
+%======================================================================
+\section{QEMU で試す}
+\begin{code}
+cd compile
+make qemu          # インタラクティブ起動。Ctrl-A X で抜ける
+make qemu-smoke    # 既定のスクリプトを流し込み qemu-smoke.log に保存
+\end{code}
+QEMU 上では: \verb|MIDR_EL1| が \verb|0x414fd0b1| (QEMU が公開する Cortex-A76 の
+part 番号。実機 Pi 4 では Cortex-A72)、\verb|halt| は PSCI SYSTEM\_OFF が
+\verb|virt| でハンドルされクリーン終了、ネットワーク・USB・SD・HDMI 出力は無し。
+
+%======================================================================
+\section{config.txt の主な設定}
+\verb|sdcard/config_pi4.txt| (\verb|make install_pi4| がカード上の
+\verb|config.txt| へコピー) の重要項目:
+\begin{center}\footnotesize
+\begin{tabular}{@{}l p{7.2cm}@{}}
+\toprule
+\textbf{行} & \textbf{意味}\\
+\midrule
+\verb|arm_64bit=1|              & AArch64 で起動\\
+\verb|kernel=kernel8.img|       & Pi 4 用カーネル名\\
+\verb|kernel_address=0x80000|   & カーネルロードアドレス\\
+\verb|enable_uart=1|            & UART を有効化\\
+\verb|uart_2ndstage=1|          & bootloader 第 2 段の UART ログを出す\\
+\verb|dtparam=uart0=on|         & UART0 を GPIO14/15 にルーティング\\
+\verb|init_uart_clock=48000000| & PL011 基準クロックを 48 MHz に固定 (115200 用)\\
+\verb|hdmi_force_hotplug=1|     & HDMI ホットプラグを強制 ON\\
+\verb|framebuffer_width=640|    & ファームウェア確保 FB の幅\\
+\verb|framebuffer_height=480|   & FB の高さ\\
+\verb|framebuffer_depth=32|     & FB の bpp\\
+\bottomrule
+\end{tabular}
+\end{center}
+KMS overlay (\verb|dtoverlay=vc4-kms-v3d|) を残してあるが、Xinu 側はファームウェアが
+用意した simple-framebuffer を mailbox 経由で借りる構成。
+
+%======================================================================
+\section{USB / 入力デバイスのサポート状況}
+Pi 4 のフルサイズ USB-A ポートは \textbf{VL805 (PCIe xHCI)} 経由でぶら下がって
+おり、xHCI ドライバを自作して USB キーボード・マウスを動かしている。
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item \textbf{USB-2.0 (黒) ポートに挿すこと。} USB-2.0 ハブ (Genesys、TT 動作)
+  経由なので LS の割り込み IN split transaction が届く。USB-3.0 (青) は VIA USB3
+  ハブ側に入り、周期転送が届かず動かない。
+\item \verb|usb| コマンドは DWC2 (USB-C OTG) HCD の診断ダンプ専用。
+\item VL805 のファームウェアは SD ブート時 PCIe RC がリセットのままになるため、
+  \verb|NOTIFY_XHCI_RESET| mailbox tag (\verb|0x00030058|, devid \verb|0x100000|)
+  を boot 時に発行して xHCI を起こしている (詳細は \verb|NEXT_SESSION_PI4.md|)。
+\end{itemize}
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}l l l@{}}
+\toprule
+\textbf{機種} & \textbf{入力経路} & \textbf{出力経路}\\
+\midrule
+Pi 4  & USB-A キーボード / UART0 シリアル & UART0 シリアル + HDMI FB\\
+QEMU  & qemu のシリアル stdio          & qemu のシリアル stdio\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%======================================================================
+\section{トラブルシューティング}
+\begin{center}\footnotesize
+\begin{tabular}{@{}p{5.0cm} p{8.4cm}@{}}
+\toprule
+\textbf{症状} & \textbf{確認ポイント}\\
+\midrule
+シリアルに何も出ない            & \verb|screen| のデバイス名と速度、TX/RX 入れ違い、GND\\
+バナーは出るがすぐ止まる        & \verb|kernel8.img| の md5 が古い。再ビルド + 再コピー\\
+キー入力が echo されない        & ターミナルの local echo は OFF が正しい\\
+\verb|peek| で 0xFFFFFFFF        & そのアドレス帯が未マップ。MMU は flat ID\\
+USB キーボード/マウスが効かない  & USB-2.0 (黒) ポートに挿しているか (§10)\\
+ping が通らない (Pi 4)          & \verb|sudo arp -s ...| 済か、ケーブル、\verb|rxstat| 増分\\
+\verb|make qemu| が失敗          & \verb|qemu-system-aarch64| のバージョン ($\geq$11)\\
+\verb|make install| permission   & 内部で \verb|sudo cp| するためパスワード入力\\
+起動後すぐ reboot ループ        & \verb|config.txt| の \verb|kernel=| 行と実ファイル名\\
+HDMI に虹色が残る               & ARM64 Image ヘッダ欠落の可能性。再ビルド\\
+\bottomrule
+\end{tabular}
+\end{center}
+ハマったときの定番動作:
+\begin{code}
+cd compile && make clean && make pi4
+make install_pi4 SDCARD=/Volumes
+diskutil eject /Volumes/bootfs
+# SD カード抜き挿し → Pi の電源再投入
+\end{code}
+
+%======================================================================
+\section{ディレクトリ構成 (利用者目線)}
+\begin{code}
+xinu-rpi4/
+├── compile/                # ビルドはここで `make`
+│   ├── Makefile
+│   ├── kernel8.img         # Pi 4 用 (make pi4 で生成)
+│   └── kernel_virt.img     # QEMU 用 (make qemu で生成)
+├── sdcard/
+│   └── config_pi4.txt      # Pi 4 用 (install_pi4 がコピー)
+├── README.md               # 開発者向けロードマップ + 内部実装
+├── USERS_MANUAL_JA.md      # 本マニュアルの Markdown 版
+├── USERS_MANUAL_EN.md      # 英語版
+└── NEXT_SESSION_PI4.md     # 進行中作業のハンドオフメモ
+\end{code}
+
+%======================================================================
+\section{よくある操作レシピ集}
+\textbf{ビルドから Pi 4 で起動するまで一気通貫:}
+\begin{code}
+cd /Users/kodamay/projects/xinu-rpi4/compile
+make clean && make pi4
+make install_pi4 SDCARD=/Volumes
+diskutil eject /Volumes/bootfs
+screen /dev/tty.usbserial-XXXX 115200
+\end{code}
+\textbf{コマンドを手早く確かめる (QEMU):}
+\begin{code}
+cd compile && make qemu
+xinu-pi4$ procdemo 5
+xinu-pi4$ pingpong 3
+xinu-pi4$ halt          # Ctrl-A X で QEMU から脱出
+\end{code}
+
+%======================================================================
+\section{参考リンク}
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item 上流 Xinu (32-bit): \url{https://github.com/yaskodama/xinu-rpi}
+\item AArch64 boot stub の元: \url{https://github.com/radlyeel/leex}
+\item シェル centry パターンの元: \url{https://github.com/davidxyz/xinuPi}
+\item 開発ロードマップ (Round 1 計画書): abclcp-project リポジトリの
+  \verb|aice-pi-evolution/experiments/| 配下
+\end{itemize}
+
+\section{ライセンス}
+上流 Xinu と leex の BSD 系ライセンスを継承。詳細は \verb|LICENSE| を参照 (整備中)。
+
+\end{document}
