@@ -141,7 +141,7 @@ disassemble + pcie_init function 特定で数日〜数週間の作業。
 | `thubble/videocore-elf-dis` | .NET / monodevelop 要 (Windows 系向け) | ELF 専用、Pi 1/2 era ベース |
 | `dshadowwolf/vciv-disassembler` | C++17 + Boost + CMake (modern, アクティブ) | スカラ VPU SCALAR16/32/48 decode 済み |
 | `hermanhermitage/videocore-disjs` | ブラウザ JS、自動化困難 | 元祖 |
-| `Terminus-IMRC/vc6qpudisas` | VideoCore VI QPU 用 | Pi 5 用、無関係 |
+| `Terminus-IMRC/vc6qpudisas` | VideoCore VI QPU 用 | 別世代向け、無関係 |
 | `anszom/videocore-iv` | Hopper disassembler プラグイン | 商用 Hopper 必要 |
 
 **実用パス**: Docker / Linux VM で `itszor/vc4-toolchain` をビルド → `vc4-elf-objdump start4.elf` で disasm
@@ -520,7 +520,7 @@ GPU）だが、極小 Llama-2 をカーネルに埋め込んで推論。
   `llm`→" Anna and Ben are friends. They like to play..."、`llm Lily went to the`→coherent 継続。
   float/double 丸め差で Python とは別の話になるが両方正しい(forward 正常の証左)。greedy は繰り返す癖。
 - **wedge 対策**: D-cache OFF で推論が遅く、生成中は wm ループ(=genet_rx_tick 駆動)がブロックされる。
-  各層末で RX リングをドレイン(`genet_rx_poll`/`release`、weak シンボルで QEMU/Pi5 は no-op)。HTTP /llm は
+  各層末で RX リングをドレイン(`genet_rx_poll`/`release`、weak シンボルで QEMU は no-op)。HTTP /llm は
   当面追加せず(アクティブ接続での wedge 回避)。シェル(シリアル)経由のみ。
 - commit xinu **a3a6aeb**(モデル .bin 含む)。**未 flash**。実機初回は**速度未知**(D-cache OFF) — 焼いて
   トークン速度と wedge 有無を実測する。遅すぎ/wedge なら層内ドレイン頻度↑ or float 最適化 or D-cache 検討。
@@ -728,8 +728,8 @@ Multi(2アクター・クロス now・new)→123、並行 ping 0% loss。
 ## ✅ 2026-05-28 — 階層ファイルシステム + オンデバイス C コンパイラ (JIT)
 
 AIPL→C→実行環境の土台として、Xinu 上に **(1) 使える階層 FS** と **(2) C を機械語に
-コンパイルして即実行する JIT コンパイラ**を実装。**QEMU virt で全機能 PASS**、pi4/pi5/
-qemu の 3 ターゲットともクリーンビルド (kernel8.img 96008 / 2712 85432 / virt 85176)。
+コンパイルして即実行する JIT コンパイラ**を実装。**QEMU virt で全機能 PASS**、pi4/
+qemu の 2 ターゲットともクリーンビルド (kernel8.img 96008 / virt 85176)。
 
 ### (1) 階層ファイルシステム
 - `fs/vfs.c` + `include/vfs.h` に **cwd / 相対パス・`.`・`..` 解決 (`vfs_resolve`)、
@@ -960,7 +960,7 @@ responder が止まる」という未解決バグで TCP dispatch を OFF にし
 
 `make clean` したら **コミット済みツリーが元々クリーンビルドできない**ことが
 発覚 (Makefile にヘッダ依存追跡が無く、ヘッダ drift しても .c が再コンパイル
-されず stale .o で動いていた)。以下を修正し、**pi4 / pi5 / qemu 全 3 変種が
+されず stale .o で動いていた)。以下を修正し、**pi4 / qemu 両変種が
 0 error でクリーンビルド**するようにした:
 
 - `include/memory.h`: `ROUNDMB`/`TRUNCMB` マクロを追加 (memory.c が使うが未定義
@@ -968,13 +968,13 @@ responder が止まる」という未解決バグで TCP dispatch を OFF にし
   `<memory.h>` 経由で要求する `struct memblock` を定義 (include 順で native
   memory.h が優先され incomplete type になっていた、13 ファイルが失敗)。
 - `include/genet.h`: 非 pi4 (`#else`) 分岐に全 genet 関数の inert stub を追加
-  (pi5/qemu の main.c/shell.c が無条件参照していた)。
+  (qemu の main.c/shell.c が無条件参照していた)。
 - `shell/shell.c`: `_end` のローカル再宣言を削除 (memory.h と型衝突)。
 
 ## 検証状況
 
-- ✅ **pi4 / pi5 / qemu フルクリーンビルド 0 error** (`make clean && make all`)。
-  kernel8.img 67088 / kernel_2712.img 56400 / kernel_virt.img 56144 bytes。
+- ✅ **pi4 / qemu フルクリーンビルド 0 error** (`make clean && make all`)。
+  kernel8.img 67088 / kernel_virt.img 56144 bytes。
 - ✅ **QEMU virt smoke**: boot / shell / pingpong / procdemo / ps / halt 全 OK。
   `mem` で heap allocator (ROUNDMB/freemem 修正) が正常動作 (`_end` も正値)。
 - ⏳ **GENET ネットワークは QEMU では検証不可** (virt に GENET 無し)。**実機
@@ -1041,4 +1041,3 @@ nc 192.168.3.100 23
 - **S1 preemptive timer** (GIC + Generic Timer IRQ → preemptive scheduler)
 - **X1 AIPL hello** (Py-I or JS-O runtime を xinu-rpi4 上で hello-world)
 - **XHCI-B〜H** (Pi 4 USB-A キーボード/マウス: VL805 enumeration)
-- **N0 RP1 discover** (Pi 5 に切り替えるなら)

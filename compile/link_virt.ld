@@ -3,7 +3,7 @@
  * QEMU's aarch64 virt machine starts RAM at 0x40000000 and the
  * generic AArch64 -kernel loader places flat binaries at
  * RAM_base + 0x80000 = 0x40080000.  Everything else (BSS NOLOAD,
- * __bss_size in 8-byte units) matches the Pi 5 link script —
+ * __bss_size in 8-byte units) matches the Pi 4 link script —
  * only the load address differs.
  */
 SECTIONS
