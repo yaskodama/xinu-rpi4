@@ -21,6 +21,7 @@
 \newunicodechar{×}{\ensuremath{\times}}
 \newunicodechar{…}{\dots}
 \newunicodechar{≥}{\ensuremath{\geq}}
+\newunicodechar{≠}{\ensuremath{\neq}}
 \newunicodechar{✅}{\textcolor{green!55!black}{\checkmark}}
 \newunicodechar{⏳}{\textcolor{orange!80!black}{\textbf{\small WIP}}}
 \newunicodechar{❌}{\textcolor{red!70!black}{\ensuremath{\times}}}
@@ -272,12 +273,12 @@ xinu-pi4$ _
 
 %======================================================================
 \section{シェルコマンドリファレンス}
-\verb|help| または \verb|?| で常に最新の一覧が見られる。以下は標準コマンド:
+\verb|help| または \verb|?| で常に最新の一覧が見られる。現在のコマンド一覧:
 \begin{center}\footnotesize
-\begin{tabular}{@{}l p{8.8cm}@{}}
+\begin{longtable}{@{}l p{8.6cm}@{}}
 \toprule
 \textbf{コマンド} & \textbf{用途}\\
-\midrule
+\midrule \endhead
 \verb|help| / \verb|?|    & 登録コマンド一覧を表示\\
 \verb|echo <words>|       & 引数をそのままエコーバック\\
 \verb|hello|             & 動作確認用の挨拶\\
@@ -287,16 +288,22 @@ xinu-pi4$ _
 \verb|ticks|            & 100 Hz タイマ tick の累積数 (S1)\\
 \verb|ps|               & コア / EL ステータス簡易表示\\
 \verb|halt|             & DAIF マスク + PSCI \verb|SYSTEM_OFF| (QEMU はクリーン終了)\\
-\verb|reboot|           & BCM2711 PM ブロックによる watchdog リセット\\
+\verb|reboot|           & スタブ — 電源再投入待ちでスピン\\
+\verb|pwd ls cd mkdir rmdir touch cat write edit rm cp mv tree| & RAM 上のファイルシステム (揮発性。§6.3)\\
+\verb|cc <file.c>|       & C をオンデバイスでコンパイル\&実行 (JIT \textrightarrow{} AArch64。§6.3)\\
+\verb|aload| / \verb|amsg| & 常駐 AIPL アクタのロード / メッセージ送信 (§6.3)\\
+\verb|actordemo| / \verb|selectdemo| & アクタ ping-pong / 名前付き選択受信 (§6.3)\\
+\verb|vmtest| / \verb|vmdemand| & VA≠PA リマップ / デマンドページング仮想メモリ (§6.4)\\
+\verb|llm [prompt]|      & 組込み LLM でテキスト生成 (§6.3)\\
+\verb|preempt|          & タイマ駆動プリエンプティブ RR のデモ\\
 \verb|pingpong [N]|      & AIPL 風 2 アクター協調 PingPong (N=1..50)\\
 \verb|procdemo [N]|      & 実 ctxsw による 2 プロセスデモ (N=1..30)\\
-\verb|usb|              & DWC2 USB HCD 診断 (Pi 4 のみ)\\
-\verb|rxstat|           & RX リングを drain してパケット/バイトカウンタを表示\\
-\verb|pan <dx> <dy>|     & 仮想 1280×960 デスクトップのビューポートをスクロール\\
-\verb|view|             & ビューポート / デスクトップサイズを表示\\
-\verb!autopan [on|off]!  & デモ用オートパンの切替\\
+\verb|usb|              & xHCI / DWC2 USB 診断 (Pi 4 のみ)\\
+\verb|wifi ...|          & WiFi + メッシュ: \verb|probe|/\verb|scan|/\verb|up|/\verb|adhoc|/\verb|aodv|/\dots\ (§7.5--§7.6)\\
+\verb|rxstat| / \verb|tcpstat| & RX リング / TCP listener カウンタ\\
+\verb|pan <dx> <dy>| \verb|view| \verb!autopan [on|off]! & ウィンドウマネージャのビューポート操作\\
 \bottomrule
-\end{tabular}
+\end{longtable}
 \end{center}
 
 \subsection{procdemo の見どころ}
@@ -329,6 +336,39 @@ procdemo: both processes exited; back in shell.
 \bottomrule
 \end{tabular}
 \end{center}
+
+\subsection{オンデバイス・ツール (ファイルシステム / C JIT / アクタ / LLM)}
+上記のデモに加え、シェルには自己完結したツールチェインが載っており、ボード上で
+コードを書いて・コンパイルして・実行できます。
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item \textbf{RAM 上のファイルシステム} --- \verb|pwd| \verb|ls| \verb|cd|
+  \verb|mkdir| \verb|rmdir| \verb|touch| \verb|cat| \verb|write| \verb|edit|
+  \verb|rm| \verb|cp| \verb|mv| \verb|tree| がメモリ上の小さなツリーを操作
+  (揮発性。再起動で消える)。
+\item \textbf{C JIT (\texttt{cc})} --- \verb|cc <file.c>| が C のサブセットを
+  ネイティブ AArch64 にコンパイルしてその場で実行。同じコンパイラは HTTP の
+  \verb|POST /compile| (本文 = C ソース) からも使えます。
+\item \textbf{AIPL アクタ} --- \verb|aload <file.c>| で常駐アクタをロード、
+  \verb|amsg <actor> <method> [arg]| で送信。\verb|actordemo| は 2 アクターの
+  ping-pong を実 Xinu プロセスとして実行、\verb|selectdemo| はガード付き受信を
+  示します。HTTP の \verb|/actor|・\verb|/send|・\verb|/gc| がアクタ一覧・送信・
+  アクタプール GC を公開。
+\item \textbf{組込み LLM (\texttt{llm})} --- 小さな transformer がイメージに焼き
+  込まれており、\verb|llm [prompt]| でオンデバイス生成 (HTTP の \verb|/chat| でも)。
+\end{itemize}
+
+\subsection{仮想メモリ (\texttt{vmtest} / \texttt{vmdemand})}
+カーネルは MMU 有効 (identity map) + VA \verb|0x80000000|..\verb|0x80400000|
+(4 MiB, 512 フレームプール) の\textbf{デマンドページング窓}で動作します:
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item \verb|vmtest| --- 同じ物理ページを別の仮想アドレスにマップして変換を実証
+  (VA ≠ PA)。
+\item \verb|vmdemand| --- デマンド窓の 64 ページに触れる。初回は \verb|0x40| 回の
+  ページフォルト (1 ページ 1 回) でリードバック OK、2 回目は \verb|0x0| フォルト
+  (既にマップ済み)。フォルトカウンタは \verb|/fault| で確認。
+\end{itemize}
+ローカルでもリモートでも実行可: 例
+\verb|curl "http://192.168.3.100/shell?cmd=vmdemand"|。
 
 %======================================================================
 \section{ネットワーク機能 (Pi 4)}
@@ -423,6 +463,34 @@ xinu-pi4$ wifi aodv 10.0.0.3
 (経路表は最大 16 エントリ)。IBSS/ad-hoc はインフラ (\verb|wifi up|) モードとは独立
 です (AP に繋がっている場合は先に \verb|wifi off|)。再起動後は復元しないので、各
 ノードで \verb|wifi probe| + \verb|wifi adhoc| を再実行してください。
+
+\subsection{HTTP 制御面とリモートシェル}
+\verb|system/tcp_server.c| は有線インタフェース上で HTTP サーバ (既定ポート 80、
+\verb|192.168.3.100|) を動かし、ボードをネットワーク越しに丸ごと操作できます:
+\begin{center}\footnotesize
+\begin{tabular}{@{}l p{8.0cm}@{}}
+\toprule \textbf{ルート} & \textbf{内容}\\ \midrule
+\verb|GET /shell?cmd=<cmd>| & 任意のシェルコマンドを実行し出力を返す (stdin なし)\\
+\verb|POST /compile| & C を JIT コンパイル\&実行 (本文 = ソース)\\
+\verb|GET /chat| & オンデバイス LLM チャット\\
+\verb|GET /actor| \verb|/send| \verb|/gc| \verb|/jitstats| & アクタ一覧 / 送信 / GC / JIT カウンタ\\
+\verb|GET /usbdiag| \verb|/pcie-init| \verb|/pcie-enum| \verb|/xhci-reset| & USB / PCIe bring-up 診断\\
+\verb|GET /fault| \verb|/mmio-read| \verb|/mmio-write| \verb|/mmio-sweep| & フォルトカウンタ + 生 MMIO peek/poke\\
+\verb|POST /reboot| & BCM2711 watchdog リセット\\
+\verb|POST /chainload| & 新カーネルをアップロードして起動 (SD 交換なし)\\
+\bottomrule
+\end{tabular}
+\end{center}
+実行時診断にこれら HTTP カウンタを使うのは、\verb|uart_puts| が HTTP ワーカ
+コンテキストでデッドロックするためです (bring-up ログはブート時にシリアルへ)。
+
+\textbf{SD 交換なしのカーネル更新 (chainload)。} \verb|POST /chainload| は新カーネル
+をアップロードして RAM 上でジャンプします。アップロードはヘルパスクリプトが包みます:
+\begin{code}
+python3 tools/remote_chainload.py 192.168.3.100 compile/kernel8.img
+\end{code}
+不良イメージでも電源を入れ直すだけで戻ります (SD は無傷) ので開発ループが速く
+なります。アップロードには HTTP サーバが応答可能であることが必要です。
 
 %======================================================================
 \section{QEMU で試す}

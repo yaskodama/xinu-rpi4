@@ -276,27 +276,33 @@ xinu-pi4$ _
 
 ## 6. シェルコマンドリファレンス
 
-`help` または `?` で常に最新の一覧が見られる。以下は標準コマンド:
+`help` または `?` で常に最新の一覧が見られる。現在のコマンド一覧:
 
-| コマンド           | 用途                                                       |
-|--------------------|------------------------------------------------------------|
-| `help` / `?`       | 登録コマンド一覧を表示                                     |
-| `echo <words…>`    | 引数をそのままエコーバック                                 |
-| `hello`            | 動作確認用の挨拶                                           |
-| `mem`              | `__bss_start` / `__bss_end` / `_end` を表示 (link.ld 由来) |
-| `peek <hex_addr>`  | 32-bit MMIO ワードを読む (例: `peek 0xfe201018`)           |
-| `uptime`           | 生の `CNTPCT_EL0` (汎用タイマカウンタ) を表示              |
-| `ticks`            | 100 Hz タイマ tick の累積数 (S1 GIC+Timer 後)              |
-| `ps`               | コア / EL ステータス簡易表示 (スケジューラ前のスナップ)    |
-| `halt`             | DAIF マスク + PSCI `SYSTEM_OFF` (QEMU `virt` ならクリーン終了) |
-| `reboot`           | スタブ — 電源再投入待ちでスピン                            |
-| `pingpong [N]`     | AIPL 風 2 アクター協調 PingPong (N=1..50, 既定 5)          |
-| `procdemo [N]`     | 実 ctxsw による 2 プロセスデモ (N=1..30, 既定 5)           |
-| `usb`              | DWC2 USB HCD 診断 (Pi 4 のみ)                              |
-| `rxstat`           | RX リングを drain してパケット/バイトカウンタを表示        |
-| `pan <dx> <dy>`    | 仮想 1280×960 デスクトップのビューポートをスクロール       |
-| `view`             | ビューポート / デスクトップサイズを表示                    |
-| `autopan [on|off]` | デモ用オートパンの切替                                     |
+| コマンド | 用途 |
+|---------|------|
+| `help` / `?` | 登録コマンド一覧を表示 |
+| `echo <words…>` | 引数をそのままエコーバック |
+| `hello` | 動作確認用の挨拶 |
+| `mem` | `__bss_start` / `__bss_end` / `_end` を表示 (link.ld 由来) |
+| `peek <hex_addr>` | 32-bit MMIO ワードを読む (例: `peek 0xfe201018`) |
+| `uptime` | 生の `CNTPCT_EL0` (汎用タイマカウンタ) を表示 |
+| `ticks` | 100 Hz タイマ tick の累積数 (S1) |
+| `ps` | コア / EL ステータス簡易表示 |
+| `halt` | DAIF マスク + PSCI `SYSTEM_OFF` (QEMU `virt` はクリーン終了) |
+| `reboot` | スタブ — 電源再投入待ちでスピン |
+| `pwd` `ls` `cd` `mkdir` `rmdir` `touch` `cat` `write` `edit` `rm` `cp` `mv` `tree` | RAM 上のファイルシステム (揮発性。§6.3) |
+| `cc <file.c>` | C プログラムをオンデバイスでコンパイル&実行 (JIT → AArch64。§6.3) |
+| `aload` / `amsg` | 常駐 AIPL アクタのロード / メッセージ送信 (§6.3) |
+| `actordemo` / `selectdemo` | アクタ ping-pong / 名前付きメッセージの選択受信 (§6.3) |
+| `vmtest` / `vmdemand` | VA≠PA リマップ / デマンドページング仮想メモリ (§6.4) |
+| `llm [prompt]` | 組込み LLM でテキスト生成 (§6.3) |
+| `preempt` | タイマ駆動プリエンプティブ RR スケジューラのデモ |
+| `pingpong [N]` | AIPL 風 2 アクター協調 PingPong (N=1..50, 既定 5) |
+| `procdemo [N]` | 実 ctxsw による 2 プロセスデモ (N=1..30, 既定 5) |
+| `usb` | xHCI / DWC2 USB 診断 (Pi 4 のみ) |
+| `wifi …` | WiFi + メッシュ — `probe`/`scan`/`up`/`adhoc`/`aodv`/… (§7.5–§7.6) |
+| `rxstat` / `tcpstat` | RX リング / TCP listener カウンタ |
+| `pan <dx> <dy>` `view` `autopan [on|off]` | ウィンドウマネージャのビューポート操作 |
 
 ### 6.1 procdemo の見どころ
 
@@ -329,6 +335,24 @@ procdemo: both processes exited; back in shell.
 | アクター      | 静的 2 つ (`Ping`, `Pong`)       | `proc_create` した実プロセス pid=1, 2   |
 | スイッチ      | 単一スタック上のディスパッチ     | `ctxsw.S` による実 callee-saved 保存復元 |
 | 停止条件      | 両者の inbox が空                | 両者が `proc_exit()`                    |
+
+### 6.3 オンデバイス・ツール (ファイルシステム / C JIT / アクタ / LLM)
+
+上記のデモに加え、シェルには自己完結したツールチェインが載っており、ボード上でコードを書いて・コンパイルして・実行できます。
+
+- **RAM 上のファイルシステム** — `pwd` `ls` `cd` `mkdir` `rmdir` `touch` `cat` `write` `edit` `rm` `cp` `mv` `tree` がメモリ上の小さなツリーを操作 (揮発性。再起動で消える)。
+- **C JIT (`cc`)** — `cc <file.c>` が C のサブセットをネイティブ AArch64 にコンパイルしてその場で実行。同じコンパイラは HTTP の `POST /compile` (本文 = C ソース) からも使えます。
+- **AIPL アクタ** — `aload <file.c>` で常駐アクタをロード、`amsg <actor> <method> [arg]` でメッセージ送信。`actordemo` は 2 アクターの ping-pong を実 Xinu プロセスとして実行、`selectdemo` はガード付き受信 (名前付きメッセージを優先) を示します。HTTP の `/actor`・`/send`・`/gc` がアクタ一覧・送信・アクタプール GC を公開。
+- **組込み LLM (`llm`)** — 小さな transformer がイメージに焼き込まれており、`llm [prompt]` でオンデバイス生成 (HTTP の `/chat` でも)。
+
+### 6.4 仮想メモリ (`vmtest` / `vmdemand`)
+
+カーネルは MMU 有効 (identity map) + VA `0x80000000`..`0x80400000` (4 MiB, 512 フレームプール) の**デマンドページング窓**で動作します:
+
+- `vmtest` — 同じ物理ページを別の仮想アドレスにマップして変換を実証 (VA ≠ PA)。
+- `vmdemand` — デマンド窓の 64 ページに触れる。初回は `0x40` 回のページフォルト (1 ページ 1 回) でリードバック OK、2 回目は `0x0` フォルト (既にマップ済み)。フォルトカウンタは `/fault` (HTTP) で確認。
+
+ローカルでもリモートでも実行可: 例 `curl "http://192.168.3.100/shell?cmd=vmdemand"`。
 
 ----------------------------------------------------------------------
 
@@ -449,6 +473,31 @@ xinu-pi4$ wifi aodv 10.0.0.3
 最小 AODV モジュール (M13, RFC 3561 コア) が RREQ をブロードキャスト (UDP port 654) し、範囲内の各ノードが中継して逆経路を記録、宛先が RREP を返して順経路を確立します。各ノードはピアのために自動で中継するので、直接届かない宛先も中間ノードが転送します (経路表は最大 16 エントリ)。
 
 > IBSS/ad-hoc はインフラ (`wifi up`) モードとは独立です。AP に繋がっている場合は先に `wifi off`。ad-hoc も再起動後は復元しないので、各ノードで `wifi probe` + `wifi adhoc` を再実行してください。
+
+### 7.7 HTTP 制御面とリモートシェル
+
+`system/tcp_server.c` は有線インタフェース上で HTTP サーバ (既定ポート 80、`192.168.3.100`) を動かし、ボードをネットワーク越しに丸ごと操作できます:
+
+| ルート | 内容 |
+| --- | --- |
+| `GET /shell?cmd=<cmd>` | 任意のシェルコマンドを実行し出力を返す (stdin なし) |
+| `POST /compile` | C プログラムを JIT コンパイル&実行 (本文 = ソース) |
+| `GET /chat` | オンデバイス LLM チャット |
+| `GET /actor` `/send` `/gc` `/jitstats` | アクタ一覧 / 送信 / アクタプール GC / JIT カウンタ |
+| `GET /usbdiag` `/pcie-init` `/pcie-enum` `/xhci-reset` | USB / PCIe bring-up 診断 |
+| `GET /fault` `/mmio-read` `/mmio-write` `/mmio-sweep` | フォルトカウンタ + 生 MMIO peek/poke |
+| `POST /reboot` | BCM2711 watchdog リセット |
+| `POST /chainload` | 新カーネルをアップロードして起動 (SD 交換なし) |
+
+実行時診断にこれら HTTP カウンタを使うのは、`uart_puts` が HTTP ワーカコンテキストでデッドロックするためです (PCIe/xHCI の bring-up ログはすべてブート時にシリアルへ出力)。
+
+**SD 交換なしのカーネル更新 (chainload)。** `POST /chainload` は新カーネルをアップロードして RAM 上でそれにジャンプします。アップロードはヘルパスクリプトが包みます:
+
+```sh
+python3 tools/remote_chainload.py 192.168.3.100 compile/kernel8.img
+```
+
+不良イメージでも電源を入れ直すだけで戻ります (SD は無傷) ので開発ループが速くなります。アップロードには HTTP サーバが応答可能であることが必要です。
 
 ----------------------------------------------------------------------
 
