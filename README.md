@@ -1,293 +1,203 @@
 # xinu-rpi4
 
-Embedded Xinu port for the Raspberry Pi 4 (BCM2711, Cortex-A72,
-AArch64).
+Embedded Xinu port for the **Raspberry Pi 4 (BCM2711, Cortex-A72, AArch64)**,
+running on real hardware. The same source tree also cross-builds for the
+QEMU `virt` machine.
 
-This is a brand-new repository, bootstrapped from
-[`yaskodama/xinu-rpi`](https://github.com/yaskodama/xinu-rpi)
-(arm-qemu / arm-rpi platforms, 32-bit) and the AArch64 boot pattern
-from [`radlyeel/leex`](https://github.com/radlyeel/leex).  The
-existing 32-bit Xinu tree stays where it is; the Pi 4's AArch64
-(64-bit) instruction set and BCM2711 MMIO layout make a clean split
-easier than ifdef-walling everything in place.
+Bootstrapped from [`yaskodama/xinu-rpi`](https://github.com/yaskodama/xinu-rpi)
+(32-bit arm-qemu / arm-rpi) and the AArch64 boot pattern from
+[`radlyeel/leex`](https://github.com/radlyeel/leex). It has since grown from a
+serial hello-world into a small interactive system with an HDMI window manager,
+USB-A input, virtual memory, networking (wired + WiFi mesh), an on-device C JIT,
+an actor runtime, and an HTTP control plane.
 
-## Status
+## What works
 
-| Phase (Round 1 plan) | State |
-|------------------------------------------|-------|
-| **B0** aarch64 toolchain ready           | ⏳ user-side (`brew install aarch64-none-elf-gcc`) |
-| **B1** AArch64 boot stub (`kernel/boot.S`)| ✅ |
-| **B2** `kernel8.img` build pipeline       | ✅ |
-| **U0** PL011 UART0 driver                  | ✅ |
-| **U1** kprintf — banner only for now       | ✅ (basic puts; full kprintf later) |
-| M0 MMU flat identity map                  | ⏳ |
-| **M1** Kernel heap                         | ✅ first-fit (Xinu `getmem`/`freemem`), 16-byte align, coalescing |
-| **S0** AArch64 context switch              | ✅ cooperative `ctxsw.S` + `proctab[8]` + FIFO ready list |
-| S1 GIC-400 + generic timer                | ⏳ |
-| **X0** xsh on Pi 4 — interactive REPL      | ✅ minimal (help/echo/hello/mem/peek/uptime/reboot) |
-| X1 AIPL hello                             | ⏳ |
+**Boot & core kernel**
+- AArch64 leex-style stub → BSS clear → `kernel_main` → window manager + shell.
+- **MMU**: identity map + a **demand-paged virtual-memory window** (page-fault
+  driven, VA `0x80000000`..`0x80400000`, 512-frame pool). D-cache off for DMA
+  coherency; I-cache + MMU on.
+- **Scheduler**: cooperative AArch64 `ctxsw` (S0) **and** preemptive 100 Hz
+  round-robin off the GIC-400 + generic timer (S1).
+- First-fit kernel heap (`getmem`/`freemem`), 16-byte aligned, coalescing.
 
-The boot path right now is **leex stub → BSS clear → `kernel_main` →
-banner → `shell_main()` REPL**.  USB-serial cable on header pins 8 / 10
-should show:
+**Devices (BCM2711, on real hardware)**
+- **HDMI framebuffer + window manager** — a 1280×960 virtual desktop with a
+  movable/resizable shell window, smooth mouse cursor, and live monitors.
+- **USB-A input** — BCM2711 PCIe RC bring-up + VL805 xHCI + hub enumeration
+  (route string + TT) → **working USB mouse + keyboard** (on the USB-2.0 black
+  ports; see *Known limits*).
+- **Ethernet (GENET)** — static `192.168.3.100`, ARP + ICMP (pingable),
+  16-slot RX ring.
+- **WiFi (BCM43455)** — scan / WPA2 join / DHCP / ping / NTP / DNS / HTTP /
+  TFTP / netboot, plus **MANET ad-hoc (IBSS) + on-demand AODV multi-hop mesh**
+  (the same stack the Pi 4 + Pi 3 nodes use in the drone-HIL demo).
 
-```
-================================================
-  Xinu Pi4 hello (AArch64, BCM2711, kernel8.img)
-  PL011 UART0 @ 0xFE201000, 115200 8N1
-  bootstrap: leex-style stub + xinu-rpi4 main
-================================================
+**Runtime & tooling**
+- **On-device C JIT** (`cc`) — compiles a C subset to native AArch64 and runs it.
+- **AIPL actor runtime** — resident actors, message send, a select/receive demo,
+  and an actor-pool GC.
+- **Embedded tiny LLM** (`llm`) — a baked-in transformer for on-device text gen.
+- **HTTP control plane** (`system/tcp_server.c`) — run shell commands, upload &
+  chainload a new kernel, drive diagnostics, all over the wire.
+- **Network kernel update** — `tools/remote_chainload.py` swaps the running
+  kernel in RAM with no SD card swap.
 
-Round 1 phase B/U done — entering interactive shell.
-Next milestones: M0 MMU, S0 ctxsw, S1 GIC+timer
-
-type `help` for the command list.
-xinu-pi4$ _
-```
-
-The shell handles backspace/DEL, echoes input, and dispatches via a
-`davidxyz/xinuPi`-style `centry` table.  Built-ins:
-
-| command           | what it does                                        |
-|-------------------|-----------------------------------------------------|
-| `help` / `?`      | list registered commands                            |
-| `echo <words…>`   | echo args back (whitespace-collapsed)               |
-| `hello`           | friendly greeting (smoke marker)                    |
-| `mem`             | `__bss_start`, `__bss_end`, `_end` from `link.ld`   |
-| `peek <hex_addr>` | read 32-bit MMIO word; e.g. `peek 0xfe201018` (UART_FR) |
-| `uptime`          | raw `CNTPCT_EL0` (until phase S1 wires the timer)   |
-| `ps`              | core / EL status table (placeholder until phase S0) |
-| `halt`            | mask DAIF + PSCI `SYSTEM_OFF` via HVC — QEMU virt exits cleanly |
-| `pingpong [N]`    | 2-actor AIPL-style PingPong, cooperative dispatch, N rounds (1..50, default 5), auto-terminates |
-| `procdemo [N]`    | **real** 2-process ctxsw demo: creates pid 1 (ping) + pid 2 (pong), each prints its live `currpid` and `proc_yield()`s for N iters (1..30, default 5), then both `proc_exit()` and control returns to the shell |
-| `reboot`          | stub — spins until power-cycle (watchdog TBD)       |
-
-## Target hardware (Pi 4 / BCM2711)
+## Target hardware
 
 |              | **Pi 4 (this repo)** | QEMU virt            |
 |--------------|----------------------|----------------------|
 | SoC          | **BCM2711**          | QEMU `virt`          |
 | Cores        | **Cortex-A72 ×4**    | `-cpu cortex-a76`    |
 | MMIO base    | **0xFE000000**       | —                    |
-| I/O          | **on-SoC (GENET Ethernet) + VL805 PCIe xHCI for USB-A** | virtio / PL011 |
+| I/O          | **GENET Ethernet + VL805 PCIe xHCI (USB-A) + BCM43455 WiFi** | virtio / PL011 |
 | Firmware img | **`kernel8.img`**    | `kernel_virt.img`    |
 | UART base    | **`0xFE201000`**     | `0x09000000`         |
 | Load address | **`0x80000`**        | `0x40080000`         |
 
 ## Build
 
-The repository follows the classic Embedded Xinu / davidxyz/xinuPi
-subsystem layout — sources live in per-area top-level directories
-(`loader/`, `mem/`, `system/`, `shell/`, `device/uart/`) and every
-build artefact lands under `compile/`.
-
 ```sh
-# Mac (Homebrew toolchain — pick either):
-brew install aarch64-elf-gcc           # gnu cross compiler
-# OR:
-brew install --cask gcc-arm-embedded   # arm-supplied toolchain
+# Mac (Homebrew AArch64 cross toolchain — pick either):
+brew install aarch64-elf-gcc           # GNU
+brew install --cask gcc-arm-embedded   # ARM-supplied
 
 cd compile
-make pi4                                # → compile/kernel8.img
+make pi4            # → compile/kernel8.img   (real Pi 4)
+make qemu           # → compile/kernel_virt.img (QEMU virt)
+make                # = pi4 + qemu
 ```
 
-Override the toolchain location if you installed it elsewhere:
+Override the toolchain location with `make pi4 GCCPATH=...`.
 
-```sh
-cd compile
-make pi4 GCCPATH=$HOME/aarch64/arm-gnu-toolchain-14.3.rel1-x86_64-aarch64-none-elf
-```
+## Deploy
 
-## Install
-
-Insert a Pi 4 SD card with the FAT32 bootfs partition mounted.  The
-canonical Mac path is `/Volumes/bootfs`:
+**SD card (persistent):**
 
 ```sh
 cd compile
-make install_pi4 SDCARD=/Volumes      # copies kernel8.img + config.txt
+make install_pi4 SDCARD=/Volumes      # copies kernel8.img + config_pi4.txt
+# or by hand: cp compile/kernel8.img /Volumes/bootfs/kernel8.img  (preserve config.txt)
 ```
 
-The `sdcard/` directory at the repo root holds the canonical
-`config_pi4.txt` (copied to `config.txt` on the card).  It sets
-`arm_64bit=1`, `kernel=kernel8.img`, `enable_uart=1`,
-`dtparam=uart0=on`, and pins the PL011 reference clock to 48 MHz so
-the firmware locks UART0 to GPIO14/15 at a true 115200 baud.
+The card needs the stock Raspberry Pi OS firmware blobs (`bootcode.bin`,
+`start4.elf`, …) plus `kernel8.img` and `config_pi4.txt` (→ `config.txt`).
 
-You also need the regular Pi 4 firmware blobs on the same partition
-(`bootcode.bin`, `start4.elf` etc).  The easiest way is to format the
-card with a stock Raspberry Pi OS image and then overwrite
-`kernel8.img` + `config.txt`.
+**Network chainload (fast iterate, RAM-only, no SD swap):**
 
-## Run
+```sh
+python3 tools/remote_chainload.py 192.168.3.100 compile/kernel8.img
+# ~50 s upload; a bad image just needs a power cycle (the SD is untouched).
+# Requires the device's HTTP server to be responsive.
+```
 
-### Real Pi 4 hardware
+## Console
 
-1. Wire a 3.3 V USB-serial adapter to header pins 8 (TXD → GPIO14),
-   10 (RXD → GPIO15) and a GND pin (e.g. 6).
-2. On the host: `screen /dev/tty.usbserial-XXXX 115200`
-3. Power-cycle the Pi.  The banner above appears within ~5 seconds.
+- **Serial**: 3.3 V USB-serial on header pins 8 (TXD→GPIO14) / 10 (RXD→GPIO15)
+  / 6 (GND), **115200 8N1**. `screen /dev/tty.usbserial-XXXX 115200`.
+- **HDMI**: the window-manager desktop with the interactive shell window.
+- **Remote**: `curl "http://192.168.3.100/shell?cmd=help"` runs a shell command
+  over HTTP and returns its output.
 
-### QEMU `virt`
+The boot banner (over serial) looks like:
 
-QEMU's generic `virt` machine doesn't faithfully model BCM2711, so we
-cross-build a tiny variant that swaps the PL011 base
-(`0xFE201000` → `0x09000000`) and the load address
-(`0x80000` → `0x40080000`).  Source is shared; only
-`-DUART0_BASE=...` and `link_virt.ld` differ.
+```
+================================================
+  Xinu Pi4 hello (AArch64, BCM2711, kernel8.img)
+  PL011 UART0 @ 0xFE201000, 115200 8N1
+================================================
+xinu-pi4$ _
+```
+
+## Shell commands
+
+| Area | Commands |
+|------|----------|
+| Files | `pwd` `ls` `cd` `mkdir` `rmdir` `touch` `cat` `write` `edit` `rm` `cp` `mv` `tree` |
+| Compile / run | `cc <file.c>` (JIT C → AArch64) |
+| Actors / AIPL | `aload` `amsg` `actordemo` `selectdemo` |
+| Memory / VM | `mem` `vmtest` (VA≠PA remap) `vmdemand` (demand paging) |
+| Scheduler | `procdemo` `pingpong` `preempt` `ticks` `ps` |
+| Networking | `wifi probe\|scan\|up\|adhoc\|aodv\|ping\|…` `rxstat` `tcpstat` |
+| Devices | `usb` (xHCI/DWC2 diag) `peek` `pan` `view` `autopan` |
+| LLM | `llm [prompt]` |
+| Misc | `help` `?` `echo` `hello` `uptime` `halt` `reboot` |
+
+WiFi connection and **multi-node mesh** (`wifi adhoc` / `wifi aodv`) are
+documented in the user manuals — see *Documentation* below.
+
+## HTTP control plane
+
+`system/tcp_server.c` serves (default port 80) a set of introspection/control
+routes:
+
+```
+GET  /shell?cmd=<cmd>     run a shell command, return its output
+POST /compile            body = C source; JIT-compile & run
+GET  /chat?...           on-device LLM chat
+GET  /actor , /send      AIPL actor inventory / message send
+GET  /gc , /jitstats     actor-pool GC + JIT counters
+GET  /usbdiag            xHCI/HID counters (pump/mfindex/ep_state/reports/…)
+GET  /pcie-init,/pcie-enum  PCIe RC bring-up + device enumeration
+GET  /fault              page-fault / exception counters
+GET  /mmio-read,/mmio-write,/mmio-sweep   raw MMIO peek/poke
+POST /chainload          upload + jump to a new kernel (no SD swap)
+POST /reboot             BCM2711 watchdog reset
+```
+
+## QEMU
 
 ```sh
 cd compile
-make qemu          # interactive  — Ctrl-A X to quit
-make qemu-smoke    # pipes a canned command list, writes qemu-smoke.log
+make qemu          # interactive — Ctrl-A X to quit
+make qemu-smoke    # canned commands → qemu-smoke.log
 ```
 
-Recorded `make qemu-smoke` output (`qemu-system-aarch64 11.0,
--cpu cortex-a76`):
-
-```
-xinu-pi4$ hello
-hello from Xinu on virt (QEMU, AArch64)
-xinu-pi4$ mem
-__bss_start = 0x00000000400810d0
-__bss_end   = 0x00000000400811d0
-_end        = 0x00000000400811d0
-xinu-pi4$ peek 0x09000018           # PL011 FR
-[0x0000000009000018] = 0x00000000000000c0   # TXFE | RI
-xinu-pi4$ uptime
-cntpct_el0 = 0x0000000003bf71ad
-xinu-pi4$ ps
-PID  STATE      CORE  EL  MIDR_EL1            DESCRIPTION
-  0  RUN        0     1   0x00000000414fd0b1  shell_main (kernel)
-  -  PARK(WFE)  1     -   -                   (parked by boot.S)
-  -  PARK(WFE)  2     -   -                   (parked by boot.S)
-  -  PARK(WFE)  3     -   -                   (parked by boot.S)
-xinu-pi4$ pingpong 3
-pingpong: spawning Ping + Pong, rounds=3
----------------------------------------------
-  [Ping] send 'ping' -> Pong   (bootstrap)
-  [Pong] recv 'ping' (msg #1)
-  [Pong] send 'pong' -> Ping
-  [Ping] recv 'pong' (msg #1)
-  [Ping] send 'ping' -> Pong
-  ...
-  [Ping] budget exhausted (sent 3) — no reply
----------------------------------------------
-pingpong: done.  Ping  sent=3 recv=3
-                 Pong  sent=3 recv=3
-xinu-pi4$ halt
-halt: masking DAIF, requesting PSCI SYSTEM_OFF...
-# QEMU exits cleanly here (PSCI HVC at EL1 caught by virt emulator)
-```
-
-The QEMU `virt` build is compiled `-cpu cortex-a76` (the closest model
-upstream QEMU exposes); on real hardware the same source runs on the
-Pi 4's Cortex-A72.  MIDR `0x414fd0b1` above is QEMU's published A76
-part number — proof the core actually emulates A76, not a generic
-ARMv8.
-
-**pingpong is the AIPL Ping/Pong actor pair, ported to the bare-metal
-shell** as a single-stack simulation.  Two static `pp_actor_t` structs
-(`Ping`, `Pong`) each own a 1-slot inbox; the outer dispatcher in
-`cmd_pingpong` just drains whichever inbox is non-empty.  Each actor
-stops sending once its `sent` budget hits the round count, so the
-run self-terminates the moment both inboxes go empty.  Trace matches
-what AIPL emits on the Python and OCaml runtimes.  Clamped to `[1,50]`.
-
-**procdemo is the actual S0 scheduler in action.**  `proc_create()`
-allocates a 4 KiB stack via `getmem()` and hand-builds a fake ctxsw
-save-frame on it (12 quadwords: x19-x28 + FP + LR) so the first
-`ctxsw` into the new SP pops the frame and `ret`s directly into the
-entry function.  `cmd_procdemo` creates pid 1 (ping) + pid 2 (pong)
-and calls `proc_resched()`; the dispatcher picks the ready list head,
-ctxsw'es into it, and the two children take turns through `proc_yield`
-until both call `proc_exit()` — at which point the ready list empties,
-the dispatcher ctxsw'es back to NULLPROC (pid 0 = shell), and
-cmd_procdemo returns from `proc_resched()`.
-
-```
-xinu-pi4$ procdemo 3
-procdemo: created pid=1 (ping) and pid=2 (pong), iters=3
----------------------------------------------
-  [Ping pid=1] tick 1
-  [Pong pid=2] tock 1        # ← real ctxsw between iterations
-  [Ping pid=1] tick 2
-  [Pong pid=2] tock 2
-  [Ping pid=1] tick 3
-  [Pong pid=2] tock 3
-  [Ping pid=1] exit at iter 3
-  [Pong pid=2] exit at iter 3
----------------------------------------------
-procdemo: both processes exited; back in shell.
-```
-
-Each iteration's `pid=N` is read live from the global `currpid`, so
-the alternation in that column is direct evidence that the scheduler
-flipped contexts (not just the dispatcher re-ordering printlns).
-Stacks are not currently reclaimed on `proc_exit` — `mem` after a
-run shows ~8 KiB consumed, which is correct (2 × 4 KiB stacks).
-Phase S1 (clock IRQ) will let us reap exited stacks from the dispatcher
-tick.
+The QEMU `virt` build uses `-cpu cortex-a76` (MIDR `0x414fd0b1`); the same source
+runs on the Pi 4's Cortex-A72 on hardware. No networking / USB / SD / HDMI under
+QEMU (hardware not modelled).
 
 ## Layout
 
-Xinu-style subsystem dirs (modelled on `github.com/davidxyz/xinuPi`):
-
 ```
 xinu-rpi4/
-├── compile/                # build directory — run `make` from here
-│   ├── Makefile            # aarch64-elf → kernel8.img + kernel_virt.img
-│   ├── link.ld             # load address 0x80000 (Pi 4 firmware)
-│   ├── link_virt.ld        # load address 0x40080000 (QEMU virt)
-│   ├── obj/                # *.o per-source (gitignored)
-│   │   └── qemu/           # QEMU variant objects
-│   └── kernel_*.img        # final flat images (gitignored)
-├── device/
-│   └── uart/
-│       └── uart.c          # PL011 UART0 @ 0xFE201000 + getc/getline
-├── include/                # shared headers (-I../include)
-│   ├── memory.h
-│   ├── proc.h
-│   ├── shell.h
-│   └── uart.h
-├── loader/                 # boot path + kernel_main
-│   ├── boot.S              # AArch64 entry stub (leex pattern)
-│   └── main.c              # banner + heap/proc init + shell handoff
-├── mem/                    # memory manager
-│   └── memory.c            # first-fit getmem / freemem (Xinu-style)
-├── shell/                  # bare-metal REPL
-│   └── shell.c             # davidxyz/xinuPi-style centry dispatch
-├── system/                 # core kernel
-│   ├── ctxsw.S             # AArch64 callee-saved save/restore
-│   └── proc.c              # proctab + ready list + resched + create/exit
-├── sdcard/
-│   └── config_pi4.txt      # firmware settings (arm_64bit=1, etc)
-└── README.md
+├── compile/        # build dir — `make pi4` / `make qemu`; link*.ld; obj/<variant>/
+├── loader/         # boot.S (AArch64 stub) + main.c (init + WM + shell handoff)
+├── system/         # proc/ctxsw, mmu (+ demand paging), tcp_server, exceptions
+├── mem/            # first-fit heap
+├── shell/          # bare-metal REPL + command handlers
+├── device/         # uart, video (HDMI + window manager), usb/xhci, gic, timer,
+│                   #   genet (ethernet), wifi (BCM43455), sd, mbox
+├── cc/  llm/  fs/  # C JIT, embedded LLM, in-RAM filesystem
+├── network/        # arp / ipv4 / icmp / net (xinu-raz stack)
+├── sdcard/         # config_pi4.txt
+├── tools/          # remote_chainload.py
+└── doc/            # LaTeX user manuals (EN + JA) → PDF
 ```
 
-Subsystem dirs are individually grep-able and a new device just means a
-new directory under `device/`; the `compile/Makefile` picks it up via
-`$(wildcard ../device/*/*.c)`.
+## Documentation
 
-## Roadmap (Round 1 plan)
+- **User manuals** (operator-facing, EN + JA): `USERS_MANUAL_EN.md` /
+  `USERS_MANUAL_JA.md`, plus typeset PDFs under `doc/` (`doc/Makefile`,
+  lualatex). They cover build, deploy, the shell, **WiFi connection**, and
+  **multi-node mesh networking**.
+- Session handoff / hard-won hardware facts: `NEXT_SESSION_PI4.md`.
 
-The full Round 1 plan lives in the companion abclcp-project repo under
-`aice-pi-evolution/experiments/`.  Twelve phases across six directions:
+## Known limits
 
-| Direction | Phases | One-liner |
-|-----------|--------|-----------|
-| **B** Boot | B0–B2 | toolchain, AArch64 stub, kernel8.img |
-| **U** UART | U0–U1 | PL011 UART0, kprintf |
-| **M** Memory | M0–M1 | MMU flat ID map, freelist heap |
-| **S** Scheduler | S0–S1 | AArch64 ctxsw, GIC + generic timer |
-| **X** Userland | X0–X1 | xsh on Pi 4, AIPL hello |
-| **N** Network (stretch) | N0–N1 | GENET Ethernet, VideoCore framebuffer |
-
-The legacy 32-bit Xinu (`yaskodama/xinu-rpi`) is the regression
-anchor — none of its smokes are allowed to break while this repo
-catches up.
+- USB mouse/keyboard must be on the **USB-2.0 (black) ports** — the USB-3.0
+  (blue) hub's TT does not deliver the periodic (interrupt-IN) transfer.
+- The full-scene HDMI repaint runs ~20 fps (D-cache off), which caps cursor /
+  keyboard echo smoothness.
+- Demand-paging has no swap/eviction (OOM after 512 frames), a single window,
+  and is not per-process.
+- An HTTP worker can wedge on a faulting request (ICMP/ping keep working); a
+  power cycle clears it.
+- WiFi / ad-hoc are not restored after a reboot — re-run `wifi probe` + `wifi up`
+  (or `wifi adhoc`) each boot.
 
 ## License
 
-Inherits from upstream Xinu / leex (BSD-style).  See LICENSE once
-the source-of-truth license file is added.
+Inherits from upstream Xinu / leex (BSD-style). See `LICENSE` once the
+source-of-truth license file is added.
