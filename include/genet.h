@@ -14,8 +14,8 @@
 //   NET-F  DHCP client -> IP address
 //   NET-G  TCP + telnetd -> remote shell
 
-#ifndef XINU_RPI5_GENET_H
-#define XINU_RPI5_GENET_H
+#ifndef XINU_RPI4_GENET_H
+#define XINU_RPI4_GENET_H
 
 #ifdef GENET_BASE   /* Pi 4 only — PI4_CFLAGS supplies the value */
 
@@ -60,12 +60,21 @@ int genet_tx_frame(const unsigned char *frame, int length);
 int  genet_link_up(void);
 unsigned int genet_phy_bmsr(void);
 
-#else  /* GENET_BASE not defined (Pi 5 / QEMU) — no built-in GENET MAC */
+/* RX interrupt (INTRL2_0 bit 13, GIC INTID 189).  genet_irq_handler is the
+ * connect_interrupt() target; genet_irq_enable() arms it after init;
+ * genet_irq_rearm() re-unmasks after the poll path drains a packet;
+ * genet_irq_count() reports fires for the /genetirq diagnostic. */
+void          genet_irq_handler(void *arg);
+void          genet_irq_enable(void);
+void          genet_irq_rearm(void);
+unsigned long genet_irq_count(void);
+
+#else  /* GENET_BASE not defined (QEMU) — no built-in GENET MAC */
 
 /* main.c, shell.c and the RX dispatcher reference these unconditionally
  * (the calls are not wrapped in #ifdef GENET_BASE), so provide inert
- * stubs for every non-pi4 variant.  Keeping them here is what lets the
- * pi5 and qemu targets compile cleanly. */
+ * stubs for the non-pi4 variant.  Keeping them here is what lets the
+ * qemu target compile cleanly. */
 static inline void          genet_init(void)                 {}
 static inline unsigned int  genet_sys_rev(void)              { return 0; }
 static inline unsigned int  genet_sys_port_ctrl(void)        { return 0; }
@@ -82,7 +91,11 @@ static inline int           genet_tx_frame(const unsigned char *f, int n)
                                                              { (void)f; (void)n; return -1; }
 static inline int           genet_link_up(void)              { return 0; }
 static inline unsigned int  genet_phy_bmsr(void)             { return 0xFFFFFFFFu; }
+static inline void          genet_irq_handler(void *a)       { (void)a; }
+static inline void          genet_irq_enable(void)           {}
+static inline void          genet_irq_rearm(void)            {}
+static inline unsigned long genet_irq_count(void)            { return 0; }
 
 #endif
 
-#endif /* XINU_RPI5_GENET_H */
+#endif /* XINU_RPI4_GENET_H */

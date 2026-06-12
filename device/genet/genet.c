@@ -75,6 +75,15 @@
  */
 #define GENET_TX_OFF                0x4000
 #define GENET_RX_OFF                0x2000
+
+/* INTRL2_0 (interrupt level-2, set 0) — RX-ring-16 done lives here.
+ * Layout: STAT +0x00, SET +0x04, CLEAR +0x08, MASK_STATUS +0x0C,
+ * MASK_SET +0x10, MASK_CLEAR +0x14, relative to 0x0200. */
+#define INTRL2_0_STAT               0x0200
+#define INTRL2_0_CLEAR              0x0208
+#define INTRL2_0_MASK_SET           0x0210
+#define INTRL2_0_MASK_CLEAR         0x0214
+#define UMAC_IRQ_RXDMA_DONE         (1u << 13)   /* default RX ring (16) complete */
 #define TX_DESCS                    256
 #define RX_DESCS                    256
 #define DMA_DESC_SIZE               12       /* 3 × 32-bit words */
@@ -778,6 +787,39 @@ void genet_rx_recover(void)
 
     g_rx_recoveries++;
 }
+
+/* ---------- RX interrupt (diagnostic) ----------
+ * Step toward IRQ-driven networking: enable the RX-ring-16 done interrupt
+ * (INTRL2_0 bit 13, GIC SPI 157 = INTID 189) and count fires.  The handler
+ * masks itself + acks so it can't storm; genet_rx_irq_rearm() (called from
+ * the poll/tick path after draining) re-enables it for the next packet.
+ * This proves the GENET IRQ is delivered before we move RX into an
+ * interrupt-woken network process. */
+static volatile unsigned long g_genet_irq_count;
+
+void genet_irq_handler(void *arg)
+{
+    (void)arg;
+    g_genet_irq_count++;
+    GENET_REG(INTRL2_0_MASK_SET) = 0xFFFFFFFFu;        /* mask: don't re-fire before rearm */
+    GENET_REG(INTRL2_0_CLEAR)    = GENET_REG(INTRL2_0_STAT);  /* ack pending status */
+    __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+void genet_irq_enable(void)
+{
+    GENET_REG(INTRL2_0_CLEAR)     = 0xFFFFFFFFu;        /* clear stale status */
+    GENET_REG(INTRL2_0_MASK_SET)  = 0xFFFFFFFFu;        /* mask everything... */
+    GENET_REG(INTRL2_0_MASK_CLEAR)= UMAC_IRQ_RXDMA_DONE;/* ...then unmask just RX-done */
+    __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+void genet_irq_rearm(void)
+{
+    GENET_REG(INTRL2_0_MASK_CLEAR) = UMAC_IRQ_RXDMA_DONE;
+}
+
+unsigned long genet_irq_count(void) { return g_genet_irq_count; }
 
 int genet_rx_poll(unsigned char **out_pkt)
 {

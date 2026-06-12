@@ -6,8 +6,8 @@
 // (CNTFRQ_EL0 / HZ) so an interrupt fires every (1/HZ) seconds,
 // and the IRQ handler reloads the same value to make it periodic.
 
-#ifndef XINU_RPI5_TIMER_H
-#define XINU_RPI5_TIMER_H
+#ifndef XINU_RPI4_TIMER_H
+#define XINU_RPI4_TIMER_H
 
 #define TIMER_HZ 100
 
@@ -20,4 +20,4 @@ void timer_init(void);
 /* Monotonically increasing tick counter (one tick per 1/HZ). */
 unsigned long timer_ticks(void);
 
-#endif /* XINU_RPI5_TIMER_H */
+#endif /* XINU_RPI4_TIMER_H */

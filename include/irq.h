@@ -10,8 +10,8 @@
 // USPi's uspios.h expects, so the future USPi adapter can forward
 // to this API one-for-one.
 
-#ifndef XINU_RPI5_IRQ_H
-#define XINU_RPI5_IRQ_H
+#ifndef XINU_RPI4_IRQ_H
+#define XINU_RPI4_IRQ_H
 
 typedef void (*irq_handler_t)(void *arg);
 
@@ -41,4 +41,4 @@ static inline void irq_disable_all(void)
     __asm__ volatile ("msr daifset, #2" ::: "memory");
 }
 
-#endif /* XINU_RPI5_IRQ_H */
+#endif /* XINU_RPI4_IRQ_H */

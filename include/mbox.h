@@ -3,15 +3,14 @@
 // Standard "property tags" channel (channel 8) for talking to the
 // firmware about HDMI / framebuffer / clocks / etc.  Works on every
 // Pi generation that exposes the legacy VC mailbox; we use it here
-// to ask Pi 5's firmware for a framebuffer it has already set up.
+// to ask the Pi 4 firmware for a framebuffer it has already set up.
 //
-// The MMIO base address is best-effort for Pi 5 (BCM2712):
-// peripheral base 0x107C000000 + the conventional 0xB880 offset.
-// If a future Pi or a Pi 5 revision moves it, override MBOX_BASE
-// via the Makefile (-DMBOX_BASE=0x...UL).
+// The MMIO base address on the Pi 4 (BCM2711) is peripheral base
+// 0xFE000000 + the conventional 0xB880 offset = 0xFE00B880.  Override
+// MBOX_BASE via the Makefile (-DMBOX_BASE=0x...UL) if needed.
 
-#ifndef XINU_RPI5_MBOX_H
-#define XINU_RPI5_MBOX_H
+#ifndef XINU_RPI4_MBOX_H
+#define XINU_RPI4_MBOX_H
 
 #ifndef MBOX_BASE
 #define MBOX_BASE  0x107C00B880UL
@@ -23,4 +22,4 @@
  * is implicit. */
 int mbox_call(volatile unsigned int *buf);
 
-#endif /* XINU_RPI5_MBOX_H */
+#endif /* XINU_RPI4_MBOX_H */

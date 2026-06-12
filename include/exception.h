@@ -7,11 +7,11 @@
 // also the shell window) so a stray data abort can no longer
 // stall the kernel silently behind early_paint_diagnostic().
 
-#ifndef XINU_RPI5_EXCEPTION_H
-#define XINU_RPI5_EXCEPTION_H
+#ifndef XINU_RPI4_EXCEPTION_H
+#define XINU_RPI4_EXCEPTION_H
 
 /* Program VBAR_EL1 with the address of `exception_vector_table`.
  * Idempotent; safe to call from the boot path or after a remap. */
 void exception_init(void);
 
-#endif /* XINU_RPI5_EXCEPTION_H */
+#endif /* XINU_RPI4_EXCEPTION_H */

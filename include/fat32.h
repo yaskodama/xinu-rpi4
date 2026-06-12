@@ -13,8 +13,8 @@
 // for keeping this reader small.  Most Pi boot files have 8.3 names
 // natively.
 
-#ifndef XINU_RPI5_FAT32_H
-#define XINU_RPI5_FAT32_H
+#ifndef XINU_RPI4_FAT32_H
+#define XINU_RPI4_FAT32_H
 
 /* Returned by fat32_mount() — opaque to callers but the struct is
  * exposed so they can keep a stack-allocated instance. */
@@ -55,4 +55,4 @@ typedef void (*fat32_visit_fn)(const char  *name,
 int fat32_walk_dir(fat32_t *fs, unsigned int cluster, int depth,
                    fat32_visit_fn visit, void *ctx);
 
-#endif /* XINU_RPI5_FAT32_H */
+#endif /* XINU_RPI4_FAT32_H */

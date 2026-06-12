@@ -4,7 +4,7 @@
 // Embedded-Xinu kernel API for synchronisation (semaphore,
 // mailbox), packet buffer allocation (bufpool), interrupt
 // control, and (limited) threading.  This file stubs those
-// APIs on top of xinu-rpi5's cooperative scheduler so the
+// APIs on top of xinu-rpi4's cooperative scheduler so the
 // network code can build and run in a single-threaded mode.
 //
 // Semantics deliberately simplified:
@@ -13,7 +13,7 @@
 //   - create() returns a fake TID but doesn't actually spawn a
 //     thread.  Network code that relies on daemon threads will
 //     need to be driven from a polling loop (e.g. the wm tick)
-//     in xinu-rpi5.
+//     in xinu-rpi4.
 //   - kprintf is implemented with uart_puts and a tiny %d/%x/%s
 //     formatter.
 
@@ -278,7 +278,7 @@ tid_typ create(void *procaddr, uint ssize, int priority,
 {
     /* Stub: don't actually spawn a thread.  Network code's
      * daemon threads (e.g. arpDaemon) will need to be invoked
-     * by the host (wm tick or shell command) in xinu-rpi5. */
+     * by the host (wm tick or shell command) in xinu-rpi4. */
     (void)procaddr; (void)ssize; (void)priority;
     (void)name;     (void)nargs;
     return (tid_typ)2;

@@ -15,7 +15,7 @@
 //   - rsta2/uspi (the canonical bare-metal RPi USB stack)
 //
 // Layout convention: only USB_BASE-dependent code lives inside
-// #ifdef USB_BASE.  When the macro isn't defined (Pi 5, QEMU),
+// #ifdef USB_BASE.  When the macro isn't defined (QEMU),
 // every public function compiles down to a no-op so the link
 // step still succeeds and the shell prints a clean message.
 
@@ -114,7 +114,7 @@ int usb_present(void) { return 1; }
 unsigned int usb_synopsys_id(void) { return DWC2_GSNPSID; }
 int usb_last_init_ok(void) { return g_init_ok; }
 
-#else  /* USB_BASE not defined — Pi 5 / QEMU virt */
+#else  /* USB_BASE not defined — QEMU virt */
 
 void usb_init(void) { /* no DWC2 on this board */ }
 int usb_present(void) { return 0; }

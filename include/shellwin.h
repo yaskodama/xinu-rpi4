@@ -11,8 +11,8 @@
 // a CR/LF arrives — so the wm_run() frame loop can drive the
 // shell without giving up the CPU to a blocking uart_getline().
 
-#ifndef XINU_RPI5_SHELLWIN_H
-#define XINU_RPI5_SHELLWIN_H
+#ifndef XINU_RPI4_SHELLWIN_H
+#define XINU_RPI4_SHELLWIN_H
 
 #include "wm.h"
 
@@ -52,4 +52,4 @@ void shellwin_handle_key(char c);
  * loader/main.c.  draw_content already points at shellwin_draw. */
 extern window_t shell_win;
 
-#endif /* XINU_RPI5_SHELLWIN_H */
+#endif /* XINU_RPI4_SHELLWIN_H */

@@ -1,6 +1,6 @@
 // include/early_diag.h — visible "the kernel is alive" diagnostic.
 //
-// Pi 5 boot has a frustrating failure mode where the firmware shows
+// Pi 4 boot has a frustrating failure mode where the firmware shows
 // a full-screen rainbow test pattern, our kernel image is loaded by
 // the bootloader, but we see no evidence the kernel actually starts
 // running (UART silent, mailbox-allocated FB invisible).
@@ -14,8 +14,8 @@
 // over the rainbow — telling us both "kernel runs" and "FB lives
 // somewhere around HERE".
 
-#ifndef XINU_RPI5_EARLY_DIAG_H
-#define XINU_RPI5_EARLY_DIAG_H
+#ifndef XINU_RPI4_EARLY_DIAG_H
+#define XINU_RPI4_EARLY_DIAG_H
 
 /* Phys addr the firmware passed in x0 (saved by boot.S after BSS
  * clear).  Reading it before main() is safe because boot.S writes
@@ -24,4 +24,4 @@ extern unsigned long dtb_addr;
 
 void early_paint_diagnostic(void);
 
-#endif /* XINU_RPI5_EARLY_DIAG_H */
+#endif /* XINU_RPI4_EARLY_DIAG_H */

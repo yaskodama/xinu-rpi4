@@ -16,6 +16,7 @@
 #include "timer.h"
 #include "irq.h"
 #include "gic.h"
+#include "proc.h"
 
 #define TIMER_IRQ_PPI 30
 
@@ -46,6 +47,7 @@ static void timer_irq_handler(void *arg)
      * of the handler takes a few μs. */
     cntp_set_tval(timer_interval);
     tick_count++;
+    proc_resched_request();         /* ask for a preemptive switch (acted on after EOI) */
 }
 
 void timer_init(void)

@@ -1,6 +1,6 @@
-/* kernel/link.ld — AArch64 kernel image layout for Raspberry Pi 5.
+/* kernel/link.ld — AArch64 kernel image layout for Raspberry Pi 4.
  *
- * The Pi 5 firmware (after reading kernel_2712.img per config.txt) loads
+ * The Pi 4 firmware (after reading kernel8.img per config.txt) loads
  * the flat image at physical address 0x80000 and jumps to the first
  * instruction.  We must therefore put .text.boot's first instruction
  * exactly there.
@@ -19,9 +19,12 @@ SECTIONS
         KEEP(*(.text.boot))
         *(.text .text.* .gnu.linkonce.t*)
     }
+    . = ALIGN(4096);
+    _etext = .;                 /* end of code — page-aligned for W^X */
 
     .rodata : { *(.rodata .rodata.* .gnu.linkonce.r*) }
 
+    . = ALIGN(4096);
     PROVIDE(_data = .);
     .data : { *(.data .data.* .gnu.linkonce.d*) }
 

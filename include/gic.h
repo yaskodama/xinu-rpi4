@@ -19,8 +19,8 @@
 // gic_ack() returns the IAR value (low 10 bits = active IRQ ID);
 // pass the same value to gic_eoi() to retire.
 
-#ifndef XINU_RPI5_GIC_H
-#define XINU_RPI5_GIC_H
+#ifndef XINU_RPI4_GIC_H
+#define XINU_RPI4_GIC_H
 
 #ifdef GIC_BASE   /* Pi 4 only — PI4_CFLAGS supplies the value */
 
@@ -42,7 +42,7 @@ unsigned int gic_ack(void);
 /* Retire interrupt by writing the IAR value back to EOIR. */
 void gic_eoi(unsigned int iar);
 
-#else  /* GIC_BASE not defined — Pi 5 / QEMU */
+#else  /* GIC_BASE not defined — QEMU */
 
 static inline void gic_init(void) {}
 static inline void gic_enable_irq(unsigned irq) { (void)irq; }
@@ -52,4 +52,4 @@ static inline void gic_eoi(unsigned int iar) { (void)iar; }
 
 #endif
 
-#endif /* XINU_RPI5_GIC_H */
+#endif /* XINU_RPI4_GIC_H */

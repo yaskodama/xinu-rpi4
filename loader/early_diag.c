@@ -4,7 +4,7 @@
 // on the SD card and our kernel started actually running (rainbow gone
 // → screen black instead), the original 6-candidate list wasn't dense
 // enough to catch wherever the firmware allocates the HDMI FB on a
-// 8 GiB Pi 5.  This version writes a 256 KiB CONTIGUOUS block of solid
+// 8 GiB Pi 4.  This version writes a 256 KiB CONTIGUOUS block of solid
 // colour (no row-pitch assumption!) at 16 different candidate addresses
 // covering the low 4 GiB at roughly 0.25 GiB spacing.  Pitch-independent
 // means even if the FB is wider/narrower than we'd guess, the start of
@@ -47,7 +47,7 @@ void early_paint_diagnostic(void)
 
     /* 16 candidates across the low 4 GiB.  Stops at 0xF8000000 to
      * keep clear of any peripheral / firmware-reserved areas the
-     * Pi 5 might map between 0xFC000000 and 0xFFFFFFFF.
+     * Pi 4 might map between 0xFC000000 and 0xFFFFFFFF.
      *
      * Colours are chosen distinct enough to identify by name on a
      * normal monitor: tell us which colour fills the screen and we

@@ -1,7 +1,7 @@
-// include/memory.h — xinu-rpi5 first-fit allocator interface.
+// include/memory.h — xinu-rpi4 first-fit allocator interface.
 
-#ifndef XINU_RPI5_MEMORY_H
-#define XINU_RPI5_MEMORY_H
+#ifndef XINU_RPI4_MEMORY_H
+#define XINU_RPI4_MEMORY_H
 
 struct memblk {
     struct memblk *mnext;
@@ -37,4 +37,4 @@ int           mem_free_block_count(void);
 
 extern unsigned char _end[];
 
-#endif /* XINU_RPI5_MEMORY_H */
+#endif /* XINU_RPI4_MEMORY_H */

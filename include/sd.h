@@ -14,13 +14,13 @@
 // initialisation sequence ourselves — just issue CMD17 (read single
 // block) and pull 128 little-endian words from the data port.
 //
-// On Pi 5 the SD controller has moved behind RP1 (PCIe) and on QEMU
-// virt there's no SDHCI at all.  Builds that don't define SD_BASE
-// turn sd_init() into "return -1" and sd_read_block() into a no-op,
-// so the higher-level mount code drops cleanly to "no /sd available".
+// On QEMU virt there's no SDHCI at all.  Builds that don't define
+// SD_BASE turn sd_init() into "return -1" and sd_read_block() into a
+// no-op, so the higher-level mount code drops cleanly to
+// "no /sd available".
 
-#ifndef XINU_RPI5_SD_H
-#define XINU_RPI5_SD_H
+#ifndef XINU_RPI4_SD_H
+#define XINU_RPI4_SD_H
 
 #define SD_BLOCK_SIZE  512
 
@@ -34,4 +34,4 @@ int sd_init(void);
  * timeout / hardware error. */
 int sd_read_block(unsigned long lba, void *buf);
 
-#endif /* XINU_RPI5_SD_H */
+#endif /* XINU_RPI4_SD_H */

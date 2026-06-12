@@ -1,0 +1,78 @@
+// gc_with_zombies.abcl — load a GC actor and N idle Zombies together in one
+// /actor/load.  After load, external poller (e.g. gc_aipl_demo.py) waits
+// past threshold then sends `tick` to the GC actor; verify via `get(k)`.
+//
+// Slot layout after load (after /actor/load resets the pool):
+//   slot 0: implicit "main" entry (set by the /actor/load infrastructure)
+//   slot 1: GC actor (first `new` in main)
+//   slot 2: Spawner
+//   slots 3..2+N: Zombie actors
+//
+// The GC actor self-protects via actor_protect(self_id, 1) in init,
+// so it won't sweep itself.
+
+class Zombie {
+  var id = 0;
+  method init(i) { id = i; }
+}
+
+class Spawner {
+  var n_spawned = 0;
+  method bootstrap(n) {
+    var i = 0;
+    while (i < n) do {
+      var z = new Zombie();
+      send z.init(i);
+      i = i + 1;
+    }
+    n_spawned = n;
+  }
+}
+
+class GC {
+  var threshold_ms = 500;
+  var killed_total = 0;
+  var scans_total  = 0;
+  var last_killed  = 0;
+  var last_scanned = 0;
+  var self_id      = 0;
+
+  method init(my_id) {
+    self_id = my_id;
+    // Don't let the sweep kill the GC actor itself.
+    actor_protect(my_id, 1);
+  }
+
+  method set_threshold(ms) {
+    threshold_ms = ms;
+  }
+
+  method tick() {
+    last_scanned = actor_count();
+    last_killed  = gc_sweep(threshold_ms, 0);
+    killed_total = killed_total + last_killed;
+    scans_total  = scans_total + 1;
+  }
+
+  method tick_dry() {
+    last_scanned = actor_count();
+    last_killed  = gc_sweep(threshold_ms, 1);
+    scans_total  = scans_total + 1;
+  }
+
+  method get(k) {
+    if (k == 0) { return killed_total; }
+    if (k == 1) { return scans_total; }
+    if (k == 2) { return last_killed; }
+    if (k == 3) { return last_scanned; }
+    if (k == 4) { return threshold_ms; }
+    if (k == 5) { return self_id; }
+    return 0;
+  }
+}
+
+var gc = new GC();
+send gc.init(gc);
+
+var sp = new Spawner();
+send sp.bootstrap(__N__);

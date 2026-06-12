@@ -20,3 +20,5 @@ qemu-smoke.log
 
 # Build tree (everything under compile/ that's regenerable)
 compile/obj/
+references/
+wifi-fw/

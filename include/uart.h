@@ -1,9 +1,8 @@
-// kernel/uart.h — minimal PL011 UART0 interface for Raspberry Pi 5.
+// kernel/uart.h — minimal PL011 UART0 interface for Raspberry Pi 4.
 //
-// Mapped into the BCM2712 high-memory MMIO window — Pi 5 moves all
-// peripherals to 0x107C000000 (Pi 4 was 0xFE000000).  The PL011 UART0
-// CR/DR/FR register block sits 0x1001000 above the base, so the absolute
-// register base is 0x107D001000.
+// BCM2711 maps peripherals at 0xFE000000.  The PL011 UART0 CR/DR/FR
+// register block sits 0x201000 above the base, so the absolute
+// register base is 0xFE201000.
 //
 // The header is just three functions:
 //   uart_init() — claim GPIO14/15, deassert UART, set 115200/8N1, enable
@@ -11,8 +10,8 @@
 //   uart_puts(s) — convenience wrapper that walks a NUL-terminated string
 //                  and converts each '\n' into "\r\n" for terminal sanity.
 
-#ifndef XINU_RPI5_UART_H
-#define XINU_RPI5_UART_H
+#ifndef XINU_RPI4_UART_H
+#define XINU_RPI4_UART_H
 
 void uart_init(void);
 void uart_putc(char c);
@@ -33,4 +32,9 @@ int  uart_poll_char(void);
  * (0x0A) both terminate input. */
 int uart_getline(char *buf, int max);
 
-#endif /* XINU_RPI5_UART_H */
+/* Format a one-line RX hardware/drain snapshot (count of bytes pulled from
+ * the FIFO, FR/CR/GPFSEL register state, last 16 raw bytes) into `buf`.
+ * Returns bytes written.  Backs the /uartrx HTTP bisect route. */
+int uart_rx_debug(char *buf, int max);
+
+#endif /* XINU_RPI4_UART_H */

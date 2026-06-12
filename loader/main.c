@@ -1,9 +1,9 @@
-// kernel/main.c — Xinu-on-Pi-5 first sign of life.
+// kernel/main.c — Xinu-on-Pi-4 first sign of life.
 //
 // boot.S has cleared BSS, set up the initial stack and dropped here.
 // All we do for the B0/B1/B2/U0/U1 milestone is bring up UART0 and
 // print a hello banner so the USB-serial cable shows something the
-// host can grep for ("Xinu Pi5 hello" is the smoke marker).
+// host can grep for ("Xinu Pi4 hello" is the smoke marker).
 //
 // Real Xinu init (interrupts, mmu, scheduler) lands in subsequent
 // phases — those will pull in their own files (system/initialize.c,
@@ -15,6 +15,8 @@
 #include "shell.h"
 #include "memory.h"
 #include "proc.h"
+#include "critical.h"
+#include "actorproc.h"
 #include "video.h"
 #include "early_diag.h"
 #include "wm.h"
@@ -26,6 +28,7 @@
 #include "shellwin.h"
 #include "softkbd.h"
 #include "exception.h"
+#include "mmu.h"
 #include "gic.h"
 #include "timer.h"
 #include "irq.h"
@@ -137,6 +140,140 @@ static void genet_rx_tick(void)
         }
         genet_rx_release();
     }
+    /* Re-arm the RX-done interrupt: the handler self-masked when it fired,
+     * so unmask it now that we've drained what was pending. */
+    genet_irq_rearm();
+}
+
+/* ---------- IRQ-woken network process + app worker (preemptive net) ----------
+ * Two cooperating processes decouple networking from both the wm-loop and
+ * the non-reentrant AIPL runtime:
+ *   - net process  : drains RX, runs the TCP/ARP/ICMP state machine, and
+ *                     flushes finished HTTP responses.  Sole owner of
+ *                     GENET/TCP state; never touches vheap/cc/llm.  Woken by
+ *                     the GENET RX IRQ (INTID 189) and by the app worker.
+ *   - app worker   : runs http_build (cc/llm) for a queued request on its
+ *                     own stack, then kicks the net process to send the
+ *                     reply.  Touches vheap/cc/llm; never touches GENET/TCP.
+ * They share only the single-slot mailbox in tcp_server.c (g_app_state).
+ *
+ * Why this is preemption-safe (with /netpreempt on): NULLPROC (shell, which
+ * also uses vheap) is never preempted (proc_preempt skips it) and never sits
+ * on the ready list, so a preemption from the app worker can only land on
+ * the net process — which doesn't touch vheap.  Thus the timer can preempt a
+ * long cc/llm to service RX/ICMP/TCP within a tick, with no shared-state race.
+ *
+ * waiter_t: a process parks waiting for work; another context kicks it.
+ * Race-free — park sets `parked` under IRQ mask before blocking, so a kick
+ * (which only readies a parked == PR_WAIT process) is never lost and never
+ * pushes a PR_CURR process onto the ready list. */
+typedef struct { int pid; volatile int pending; volatile int parked; } waiter_t;
+static waiter_t g_net_w      = { -1, 0, 0 };
+static waiter_t g_app_w      = { -1, 0, 0 };
+/* AIPL runtime process (NEXT_SESSION option ②): a third process that owns the
+ * cc/llm runtime, so the app worker (HTTP) is decoupled from the vheap users.
+ * g_aipl_w wakes the aipl process when work is submitted; g_aipl_done_w wakes
+ * the app worker (parked synchronously in http_build) when aipl finishes. */
+static waiter_t g_aipl_w     = { -1, 0, 0 };
+static waiter_t g_aipl_done_w = { -1, 0, 0 };
+
+/* App-layer handoff (tcp_server.c). */
+extern int  tcp_app_req_pending(void);
+extern int  tcp_app_work(void);     /* run cc/llm for the queued request   */
+extern void tcp_app_flush(void);    /* send the finished response          */
+/* AIPL-runtime handoff (tcp_server.c). */
+extern int  tcp_aipl_pending(void); /* aipl work submitted, awaiting execution */
+extern void tcp_aipl_work_run(void);/* run the submitted work on the aipl stack */
+
+/* Live runtime state for the HDMI monitor in win_banner (tcp_server.c). */
+extern int           rt_app_state(void);   /* 0=IDLE 1=QUEUED 2=WORKING 3=DONE */
+extern unsigned long rt_served(void);      /* responses flushed               */
+extern unsigned long rt_heartbeat(void);   /* app-worker forward-progress beat */
+extern const char   *rt_phase(void);       /* what the worker is doing (llm/ld-main/disp/...) */
+/* AIPL vheap-lock state (proc.c / exception watchdog) — the key signal for the
+ * actor-preemption wedge: which pid holds the heap + how often the watchdog
+ * had to force-steal it from a wedged holder. */
+extern volatile unsigned long g_lock_timeouts;
+
+static void waiter_kick(waiter_t *w)          /* from any context (IRQ-safe) */
+{
+    unsigned long d = irq_save();
+    w->pending = 1;
+    if (w->parked) { w->parked = 0; proc_ready(w->pid); }
+    irq_restore(d);
+}
+
+static void waiter_park(waiter_t *w)          /* from the waiter's own process */
+{
+    irq_disable_all();                        /* atomic check-and-block */
+    if (w->pending) { w->pending = 0; irq_enable_all(); return; }
+    w->parked = 1;
+    proc_block();                             /* masked; resumes masked on kick */
+    irq_enable_all();
+}
+
+static void net_proc_main(void)
+{
+    for (;;) {
+        irq_enable_all();
+        genet_rx_tick();                       /* drain + dispatch (may queue a request) */
+        if (tcp_app_req_pending()) waiter_kick(&g_app_w);  /* hand off to worker */
+        tcp_app_flush();                       /* send a response the worker finished */
+        waiter_park(&g_net_w);                 /* sleep until RX IRQ or worker kick */
+    }
+}
+
+/* AIPL runtime process: owns the cc/llm work queue.  When app submits a job
+ * (state SUBMIT) and kicks g_aipl_w, this process wakes, runs the job on its
+ * own stack (so the app worker stays free to serve other HTTP traffic), then
+ * kicks g_aipl_done_w to wake the synchronously-waiting app worker. */
+static void aipl_proc_main(void)
+{
+    irq_enable_all();
+    for (;;) {
+        if (tcp_aipl_pending()) {
+            tcp_aipl_work_run();              /* runs llm_run etc.; kicks app when done */
+        }
+        waiter_park(&g_aipl_w);
+    }
+}
+
+/* Called from tcp_server.c (the app worker, mid-http_build) to wake the aipl
+ * runtime after submitting a work item, and to park while waiting for it. */
+void aipl_kick(void)        { waiter_kick(&g_aipl_w); }
+void aipl_done_kick(void)   { waiter_kick(&g_aipl_done_w); }
+void aipl_done_wait(void)   { waiter_park(&g_aipl_done_w); }
+/* Clear any stale pending bit before a fresh submit, so the subsequent park
+ * actually blocks until the aipl process kicks again. */
+void aipl_done_reset(void)  { g_aipl_done_w.pending = 0; g_aipl_done_w.parked = 0; }
+
+static void app_proc_main(void)
+{
+    for (;;) {
+        irq_enable_all();
+        if (tcp_app_work())                    /* run cc/llm off the net stack */
+            waiter_kick(&g_net_w);             /* wake net to flush the reply */
+        waiter_park(&g_app_w);                 /* sleep until net queues a request */
+    }
+}
+
+static void net_irq_handler(void *arg)
+{
+    genet_irq_handler(arg);                    /* driver: count + self-mask + ack */
+    waiter_kick(&g_net_w);                     /* upper half: wake the net process */
+}
+
+/* wm tick: yield so the IRQ-woken net process / app worker get the CPU.
+ * No-op (returns immediately) when nothing is ready. */
+static void net_yield_tick(void)
+{
+    extern void shellwin_step(void);   /* drain UART RX -> interactive shell */
+    extern void wifi_net_poll(void);   /* persistent WiFi ARP/ICMP responder */
+    extern void xhci_mouse_pump(void); /* drain USB HID reports -> cursor */
+    shellwin_step();
+    wifi_net_poll();
+    xhci_mouse_pump();
+    proc_yield();
 }
 
 /* USPi is gone (DWC2 only — Pi 4 USB-A keyboards/mice need xHCI).
@@ -161,13 +298,14 @@ void xhci_mouse_event(unsigned nButtons, int dx, int dy)
     if (g_cursor_x >= sw)      { wm_pan(g_cursor_x - sw + 1, 0); g_cursor_x = sw - 1; }
     if (g_cursor_y >= sh)      { wm_pan(0, g_cursor_y - sh + 1); g_cursor_y = sh - 1; }
     wm_cursor_set(g_cursor_x, g_cursor_y, 1);
-    (void)nButtons;
+    { extern void wm_pointer(int, int, int);          /* left-drag a title bar -> move window */
+      wm_pointer(g_cursor_x, g_cursor_y, (int)(nButtons & 1)); }
 }
 
 extern unsigned char _end[];   /* set by link.ld — top of static image */
 
 #ifndef HEAP_END
-/* Pi 5 firmware: assume at least 1 GiB of RAM mapped starting at 0
+/* Pi 4 firmware: assume at least 1 GiB of RAM mapped starting at 0
  * (config.txt's `arm_64bit=1` gives us the whole low region).  QEMU
  * `virt` builds override this from the Makefile to 0x50000000 (256 MB). */
 #define HEAP_END 0x40000000UL
@@ -219,17 +357,20 @@ static char *u_to_hex16(unsigned long v, char *buf)
 static void win_banner(window_t *self, unsigned int frame)
 {
     (void)frame;
-    /* Static text inside the content area.  draw_string_at is at
-     * pixel coordinates so we offset from the window origin. */
-    draw_string_at(self->x + 8,  self->y + WM_TITLEBAR_H + 6,
-        "Xinu " BOARD_NAME " Window System",
-        0xFF00FF80U, self->content_bg);
-    draw_string_at(self->x + 8,  self->y + WM_TITLEBAR_H + 18,
-        "B U M1 S0 X0 -- cooperative scheduler",
-        0xFFCCCCCCU, self->content_bg);
-    draw_string_at(self->x + 8,  self->y + WM_TITLEBAR_H + 30,
-        "no input -- HDMI-only demo (no USB stack)",
-        0xFF888888U, self->content_bg);
+    /* Static text inside the content area.  Glyphs auto-scale to the window's
+     * font size (the wm sets the text scale before draw_content); scale the
+     * line spacing to match so the rows don't overlap. */
+    int fs = self->font_scale > 0 ? self->font_scale : 1;
+    int xb = self->x + 8;
+    int yb = self->y + WM_TITLEBAR_H + 6;
+    int LH = 12 * fs;
+    unsigned int bg = self->content_bg;
+    draw_string_at(xb, yb,          "Xinu " BOARD_NAME " Window System",
+        0xFF00FF80U, bg);
+    draw_string_at(xb, yb + LH,     "B U M1 S0 X0 -- net process + app worker (/netpreempt)",
+        0xFFCCCCCCU, bg);
+    draw_string_at(xb, yb + 2 * LH, "live runtime monitor -> the Runtime window",
+        0xFF888888U, bg);
 }
 
 /* Link state sampled once at boot (see the rationale where it is set):
@@ -254,6 +395,8 @@ static void win_status(window_t *self, unsigned int frame)
     char *p;
     unsigned long midr, mpidr, current_el, cnt, freq;
     int line = 0;
+    int fs = self->font_scale > 0 ? self->font_scale : 1;
+    int LH = 12 * fs;
     int xb = self->x + 8;
     int yb = self->y + WM_TITLEBAR_H + 6;
 
@@ -266,14 +409,14 @@ static void win_status(window_t *self, unsigned int frame)
     unsigned int fg = 0xFFFFFFFFU;
     unsigned int bg = self->content_bg;
 
-    draw_string_at(xb, yb + line*12, "System status", 0xFF80FF80U, bg); line++;
+    draw_string_at(xb, yb + line*LH, "System status", 0xFF80FF80U, bg); line++;
 
     /* MIDR */
     {
         char tmp[24];
         u_to_hex16(midr, tmp);
-        draw_string_at(xb, yb + line*12, "MIDR_EL1:", fg, bg);
-        draw_string_at(xb + 80, yb + line*12, tmp, fg, bg);
+        draw_string_at(xb, yb + line*LH, "MIDR_EL1:", fg, bg);
+        draw_string_at(xb + 80*fs, yb + line*LH, tmp, fg, bg);
         line++;
     }
 
@@ -282,8 +425,8 @@ static void win_status(window_t *self, unsigned int frame)
         char tmp[8] = {'E','L',' ',0};
         tmp[3] = (char)('0' + ((current_el >> 2) & 3));
         tmp[4] = 0;
-        draw_string_at(xb, yb + line*12, "CurrentEL:", fg, bg);
-        draw_string_at(xb + 80, yb + line*12, tmp, fg, bg);
+        draw_string_at(xb, yb + line*LH, "CurrentEL:", fg, bg);
+        draw_string_at(xb + 80*fs, yb + line*LH, tmp, fg, bg);
         line++;
     }
 
@@ -291,8 +434,8 @@ static void win_status(window_t *self, unsigned int frame)
     {
         char tmp[12];
         p = u_to_dec(mpidr & 0xFFUL, tmp, sizeof tmp);
-        draw_string_at(xb, yb + line*12, "Core:", fg, bg);
-        draw_string_at(xb + 80, yb + line*12, p, fg, bg);
+        draw_string_at(xb, yb + line*LH, "Core:", fg, bg);
+        draw_string_at(xb + 80*fs, yb + line*LH, p, fg, bg);
         line++;
     }
 
@@ -301,10 +444,10 @@ static void win_status(window_t *self, unsigned int frame)
         char tmp[24];
         unsigned long secs = freq ? (cnt / freq) : 0UL;
         p = u_to_dec(secs, tmp, sizeof tmp);
-        draw_string_at(xb, yb + line*12, "Uptime:", fg, bg);
-        draw_string_at(xb + 80, yb + line*12, p, fg, bg);
-        draw_string_at(xb + 80 + 8 * (int)(tmp + sizeof tmp - 1 - p),
-                       yb + line*12, " s", fg, bg);
+        draw_string_at(xb, yb + line*LH, "Uptime:", fg, bg);
+        draw_string_at(xb + 80*fs, yb + line*LH, p, fg, bg);
+        draw_string_at(xb + 80*fs + 8*fs * (int)(tmp + sizeof tmp - 1 - p),
+                       yb + line*LH, " s", fg, bg);
         line++;
     }
 
@@ -312,10 +455,10 @@ static void win_status(window_t *self, unsigned int frame)
     {
         char tmp[24];
         p = u_to_dec(mem_free_bytes() >> 10, tmp, sizeof tmp);
-        draw_string_at(xb, yb + line*12, "Heap free:", fg, bg);
-        draw_string_at(xb + 80, yb + line*12, p, fg, bg);
-        draw_string_at(xb + 80 + 8 * (int)(tmp + sizeof tmp - 1 - p),
-                       yb + line*12, " KiB", fg, bg);
+        draw_string_at(xb, yb + line*LH, "Heap free:", fg, bg);
+        draw_string_at(xb + 80*fs, yb + line*LH, p, fg, bg);
+        draw_string_at(xb + 80*fs + 8*fs * (int)(tmp + sizeof tmp - 1 - p),
+                       yb + line*LH, " KiB", fg, bg);
         line++;
     }
 
@@ -323,8 +466,8 @@ static void win_status(window_t *self, unsigned int frame)
     {
         char tmp[24];
         p = u_to_dec((unsigned long)frame, tmp, sizeof tmp);
-        draw_string_at(xb, yb + line*12, "Frame:", fg, bg);
-        draw_string_at(xb + 80, yb + line*12, p, fg, bg);
+        draw_string_at(xb, yb + line*LH, "Frame:", fg, bg);
+        draw_string_at(xb + 80*fs, yb + line*LH, p, fg, bg);
         line++;
     }
 
@@ -341,10 +484,10 @@ static void win_status(window_t *self, unsigned int frame)
         unsigned int nfg = 0xFF80E0FFU;   /* light blue */
 
         line++;   /* blank separator */
-        draw_string_at(xb, yb + line*12, "Network", 0xFF80FF80U, bg); line++;
+        draw_string_at(xb, yb + line*LH, "Network", 0xFF80FF80U, bg); line++;
 
-        draw_string_at(xb, yb + line*12, "link:", nfg, bg);
-        draw_string_at(xb + 48, yb + line*12, g_net_link ? "UP" : "DOWN", nfg, bg);
+        draw_string_at(xb, yb + line*LH, "link:", nfg, bg);
+        draw_string_at(xb + 48*fs, yb + line*LH, g_net_link ? "UP" : "DOWN", nfg, bg);
         line++;
 
         n = 0;
@@ -352,22 +495,149 @@ static void win_status(window_t *self, unsigned int frame)
         kv_append(l, &n, "ov",  genet_rx_overrun_count());
         kv_append(l, &n, "rc",  genet_rx_recover_count());
         kv_append(l, &n, "txt", genet_tx_timeout_count());
-        draw_string_at(xb, yb + line*12, l, nfg, bg); line++;
+        draw_string_at(xb, yb + line*LH, l, nfg, bg); line++;
 
         n = 0;
         kv_append(l, &n, "any", tcp_any_count());
         kv_append(l, &n, "seg", tcp_seg_rx_count());
         kv_append(l, &n, "syn", tcp_syn_count());
-        draw_string_at(xb, yb + line*12, l, nfg, bg); line++;
+        draw_string_at(xb, yb + line*LH, l, nfg, bg); line++;
 
         n = 0;
         kv_append(l, &n, "sak", tcp_synack_count());
         kv_append(l, &n, "est", tcp_estab_count());
         kv_append(l, &n, "txf", tcp_txfail_count());
-        draw_string_at(xb, yb + line*12, l, nfg, bg);
-        draw_string_at(xb + 184, yb + line*12, tcp_state_str(), nfg, bg);
+        draw_string_at(xb, yb + line*LH, l, nfg, bg);
+        draw_string_at(xb + 184*fs, yb + line*LH, tcp_state_str(), nfg, bg);
         line++;
     }
+}
+
+/* Runtime monitor — a LIVE, on-device-survivable view of the app worker.
+ * Drawn by the wm, which runs in NULLPROC and is never preempted, so it stays
+ * visible even when the app worker / HTTP path wedges (the diagnostic channel
+ * lives OUTSIDE the path that can wedge — the NEXT_SESSION lesson).  Read it as:
+ *   app=WORKING + heartbeat frozen (STALL) -> the worker is stuck mid-compute
+ *   app=IDLE/idle                          -> nothing queued (normal)
+ * A small dedicated panel; the layout designer can grow its font / resize it. */
+static void win_runtime(window_t *self, unsigned int frame)
+{
+    (void)frame;
+    int fs = self->font_scale > 0 ? self->font_scale : 1;
+    int xb = self->x + 8;
+    int yb = self->y + WM_TITLEBAR_H + 6;
+    int LH = 12 * fs;
+    int line = 0;
+    unsigned int bg = self->content_bg;
+    static unsigned long last_hb = 0;
+    static const char *st[] = { "IDLE", "QUEUED", "WORKING", "DONE" };
+
+    int as = rt_app_state(); if (as < 0 || as > 3) as = 0;
+    unsigned long hb = rt_heartbeat();
+    int working = (as == 2);
+    int alive   = (hb != last_hb);
+    last_hb = hb;
+
+    char l[64]; int n;
+
+    draw_string_at(xb, yb + line*LH, "Runtime", 0xFF80FF80U, bg);
+    {   /* phase: what the app worker is doing — localizes a stuck holder */
+        char pl[40]; int pn = 0; const char *a = "ph="; while (*a) pl[pn++] = *a++;
+        const char *ph = rt_phase(); if (!ph) ph = "?";
+        for (int k = 0; ph[k] && pn < (int)sizeof(pl) - 1; k++) pl[pn++] = ph[k];
+        pl[pn] = 0;
+        draw_string_at(xb + 8*fs*8, yb + line*LH, pl, 0xFF80FF80U, bg);
+    }
+    line++;
+
+    /* app=<state>  + ALIVE/STALL/idle */
+    n = 0; { const char *a = "app="; while (*a) l[n++] = *a++;
+             const char *s = st[as]; while (*s) l[n++] = *s++; l[n] = 0; }
+    draw_string_at(xb, yb + line*LH, l, 0xFFFFFFFFU, bg);
+    {
+        const char *status; unsigned int scol;
+        if (working && !alive) { status = "STALL"; scol = 0xFFFF6060U; }   /* wedge! */
+        else if (alive)        { status = "ALIVE"; scol = 0xFF80FF80U; }
+        else                   { status = "idle";  scol = 0xFFAAAAAAU; }
+        draw_string_at(xb + 8*fs*(n + 1), yb + line*LH, status, scol, bg);
+    }
+    line++;
+
+    n = 0; kv_append(l, &n, "hb=", hb);
+    draw_string_at(xb, yb + line*LH, l, 0xFFCCCCCCU, bg); line++;
+
+    n = 0; { const char *a = "pre="; while (*a) l[n++] = *a++;
+             const char *s = proc_preempt_on() ? "ON" : "off"; while (*s) l[n++] = *s++;
+             l[n++] = ' '; }
+    kv_append(l, &n, "sw=", proc_ctxsw_count());
+    draw_string_at(xb, yb + line*LH, l, 0xFF80E0FFU, bg); line++;
+
+    n = 0; kv_append(l, &n, "served=", rt_served());
+    draw_string_at(xb, yb + line*LH, l, 0xFF80E0FFU, bg); line++;
+
+    n = 0; kv_append(l, &n, "girq=", genet_irq_count());
+    draw_string_at(xb, yb + line*LH, l, 0xFF80E0FFU, bg); line++;
+
+    /* vheap lock: owner pid (-1 free) + depth + watchdog force-steals.  When
+     * actor preemption wedges, this shows who holds the heap while hb freezes. */
+    n = 0;
+    { const char *a = "lock own="; while (*a) l[n++] = *a++; }
+    {
+        int own = proc_aipl_owner();
+        if (own < 0) { l[n++] = '-'; l[n++] = '1'; }
+        else { char t[12]; char *d = u_to_dec((unsigned long)own, t, sizeof t); while (*d) l[n++] = *d++; }
+        l[n++] = ' ';
+    }
+    kv_append(l, &n, "d=",  (unsigned long)proc_aipl_depth());
+    kv_append(l, &n, "to=", g_lock_timeouts);
+    draw_string_at(xb, yb + line*LH, l,
+        g_lock_timeouts ? 0xFFFF6060U : 0xFFFFC060U, bg);    /* red if watchdog fired */
+    line++;
+}
+
+/* WiFi indicator (M10): signal-bar icon (green=connected, gray=down) + SSID
+ * + leased IP.  Reads the live driver state. */
+static void win_wifi(window_t *self, unsigned int frame)
+{
+    extern int wifi_connected(void);
+    extern const char *wifi_ssid(void);
+    extern void wifi_ipaddr(unsigned char *o);
+    (void)frame;
+    int fs = self->font_scale > 0 ? self->font_scale : 1;
+    int xb = self->x + 8;
+    int yb = self->y + WM_TITLEBAR_H + 6;
+    int LH = 12 * fs;
+    unsigned int bg = self->content_bg;
+    int up = wifi_connected();
+    unsigned int on = 0xFF40E060U, off = 0xFF606060U;   /* green / gray */
+    int i, bx = xb, by = yb + 4*fs;
+
+    /* 4 signal bars of increasing height */
+    for (i = 0; i < 4; i++) {
+        int h = (i + 1) * 4 * fs, w = 5 * fs;
+        fill_rect(bx + i*(w+2*fs), by - h, w, h, up ? on : off);
+    }
+    draw_string_at(xb + 30*fs, yb, up ? "WiFi: connected" : "WiFi: down",
+                   up ? on : off, bg);
+
+    /* SSID */
+    { const char *s = wifi_ssid();
+      draw_string_at(xb, yb + 2*LH, "SSID:", 0xFFFFFFFFU, bg);
+      draw_string_at(xb + 44*fs, yb + 2*LH, (s && s[0]) ? s : "-", 0xFFCCE0FFU, bg); }
+
+    /* IP a.b.c.d */
+    { unsigned char ip[4]; char l[20]; int n = 0; char t[8]; char *d; int k;
+      wifi_ipaddr(ip);
+      if (up) {
+          for (k = 0; k < 4; k++) {
+              d = u_to_dec((unsigned long)ip[k], t, sizeof t);
+              while (*d) l[n++] = *d++;
+              if (k < 3) l[n++] = '.';
+          }
+      } else { l[n++] = '-'; }
+      l[n] = 0;
+      draw_string_at(xb, yb + 3*LH, "IP:", 0xFFFFFFFFU, bg);
+      draw_string_at(xb + 44*fs, yb + 3*LH, l, 0xFFCCE0FFU, bg); }
 }
 
 static void win_anim(window_t *self, unsigned int frame)
@@ -453,7 +723,7 @@ static void sd_visit(const char *name, int is_dir, unsigned long size,
 
 /* Mount real SD-card FAT32 partition under /sd/.  No-op (graceful
  * fallback) if the controller fails to init or the partition isn't
- * FAT32; that lets the QEMU / Pi 5 builds compile and run identically
+ * FAT32; that lets the QEMU / Pi 4 builds compile and run identically
  * to before. */
 static void vfs_mount_sd(void)
 {
@@ -512,12 +782,44 @@ static void vfs_populate_demo(void)
             vfs_write_str(f, "kmalloc-backed tmpfs, no input yet.");
         }
     }
+
+    /* Sample C programs for the on-device compiler: run e.g. `cc /examples/fib.c`. */
+    vfs_node_t *ex = vfs_mkdir(r, "examples");
+    if (ex) {
+        vfs_node_t *f;
+        f = vfs_create_file(ex, "fib.c");
+        vfs_write_str(f,
+            "int fib(int n) {\n"
+            "  if (n < 2) return n;\n"
+            "  return fib(n-1) + fib(n-2);\n"
+            "}\n"
+            "int main() {\n"
+            "  int i;\n"
+            "  for (i = 0; i < 10; i = i + 1) print(fib(i));\n"
+            "  return fib(10);\n"
+            "}\n");
+        f = vfs_create_file(ex, "hello.c");
+        vfs_write_str(f,
+            "int main() {\n"
+            "  puts(\"hello from a JIT-compiled C program\");\n"
+            "  return 0;\n"
+            "}\n");
+        f = vfs_create_file(ex, "actor.c");
+        vfs_write_str(f,
+            "/* compiled C driving the Xinu actor runtime */\n"
+            "int main() {\n"
+            "  print(actor_send(0, \"bump\", 0));\n"
+            "  print(actor_send(0, \"add\", 40));\n"
+            "  return actor_send(0, \"get\", 0);\n"
+            "}\n");
+    }
 }
 
 /* ---- File-tree window ------------------------------------------- */
 struct ftree_ctx {
     int x, y;          /* cursor inside content area in PIXEL coords */
     int max_y;
+    int fs;            /* font scale (line height / indent multiplier) */
     unsigned int fg;
     unsigned int bg;
     unsigned int dir_fg;
@@ -529,15 +831,16 @@ static void ftree_visit_safe(int depth, vfs_node_t *node, void *vctx)
 {
     struct ftree_ctx *c = (struct ftree_ctx *)vctx;
     if (c->y > c->max_y) return;
-    int xb = c->x + depth * 16;
-    if (depth > 0) draw_string_at(xb - 14, c->y, "|-", c->fg, c->bg);
+    int fs = c->fs > 0 ? c->fs : 1;
+    int xb = c->x + depth * 16 * fs;
+    if (depth > 0) draw_string_at(xb - 14 * fs, c->y, "|-", c->fg, c->bg);
     const char *nm = (depth == 0) ? "/" : node->name;
     unsigned int colour = (node->kind == VFS_DIR) ? c->dir_fg : c->fg;
     draw_string_at(xb, c->y, nm, colour, c->bg);
     if (node->kind == VFS_DIR) {
-        draw_string_at(xb + 8 * simple_strlen(nm), c->y, "/", colour, c->bg);
+        draw_string_at(xb + 8 * fs * simple_strlen(nm), c->y, "/", colour, c->bg);
     }
-    c->y += 10;
+    c->y += 10 * fs;
 }
 
 static void win_ftree(window_t *self, unsigned int frame)
@@ -548,6 +851,7 @@ static void win_ftree(window_t *self, unsigned int frame)
         .x      = self->x + 8,
         .y     = self->y + WM_TITLEBAR_H + 6,
         .max_y = self->y + self->height - 12,
+        .fs    = self->font_scale > 0 ? self->font_scale : 1,
         .fg    = 0xFFCCCCCCU,
         .bg    = self->content_bg,
         .dir_fg= 0xFF60D0FFU
@@ -563,57 +867,159 @@ static void win_mem(window_t *self, unsigned int frame)
     unsigned int fg = 0xFFFFFFFFU;
     unsigned int hi = 0xFFFFD060U;
     unsigned int bg = self->content_bg;
+    int fs = self->font_scale > 0 ? self->font_scale : 1;
+    int lh = 10 * fs, cw = 88 * fs;     /* line height + value column, scaled */
     int xb = self->x + 8;
     int yb = self->y + WM_TITLEBAR_H + 6;
     int line = 0;
 
-    draw_string_at(xb, yb + (line++) * 10, "Heap (getmem)",   hi, bg);
+    draw_string_at(xb, yb + (line++) * lh, "Heap (getmem)",   hi, bg);
     char *p;
     p = u_to_dec(mem_total_bytes() >> 10, tmp, sizeof tmp);
-    draw_string_at(xb, yb + line * 10, "  total:", fg, bg);
-    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+    draw_string_at(xb, yb + line * lh, "  total:", fg, bg);
+    draw_string_at(xb + cw, yb + (line++) * lh, p, fg, bg);
 
     p = u_to_dec(mem_free_bytes() >> 10, tmp, sizeof tmp);
-    draw_string_at(xb, yb + line * 10, "  free :", fg, bg);
-    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+    draw_string_at(xb, yb + line * lh, "  free :", fg, bg);
+    draw_string_at(xb + cw, yb + (line++) * lh, p, fg, bg);
 
     p = u_to_dec(mem_largest_block() >> 10, tmp, sizeof tmp);
-    draw_string_at(xb, yb + line * 10, "  larg :", fg, bg);
-    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+    draw_string_at(xb, yb + line * lh, "  larg :", fg, bg);
+    draw_string_at(xb + cw, yb + (line++) * lh, p, fg, bg);
 
     line++;
-    draw_string_at(xb, yb + (line++) * 10, "kmalloc",         hi, bg);
+    draw_string_at(xb, yb + (line++) * lh, "kmalloc",         hi, bg);
     p = u_to_dec(kmalloc_live_blocks(), tmp, sizeof tmp);
-    draw_string_at(xb, yb + line * 10, "  live :", fg, bg);
-    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+    draw_string_at(xb, yb + line * lh, "  live :", fg, bg);
+    draw_string_at(xb + cw, yb + (line++) * lh, p, fg, bg);
 
     p = u_to_dec(kmalloc_live_bytes(), tmp, sizeof tmp);
-    draw_string_at(xb, yb + line * 10, "  bytes:", fg, bg);
-    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+    draw_string_at(xb, yb + line * lh, "  bytes:", fg, bg);
+    draw_string_at(xb + cw, yb + (line++) * lh, p, fg, bg);
 
     p = u_to_dec(kmalloc_total_allocs(), tmp, sizeof tmp);
-    draw_string_at(xb, yb + line * 10, "  allocs:", fg, bg);
-    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+    draw_string_at(xb, yb + line * lh, "  allocs:", fg, bg);
+    draw_string_at(xb + cw, yb + (line++) * lh, p, fg, bg);
 
     p = u_to_dec(kmalloc_total_frees(), tmp, sizeof tmp);
-    draw_string_at(xb, yb + line * 10, "  frees:", fg, bg);
-    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+    draw_string_at(xb, yb + line * lh, "  frees:", fg, bg);
+    draw_string_at(xb + cw, yb + (line++) * lh, p, fg, bg);
 
     line++;
-    draw_string_at(xb, yb + (line++) * 10, "VFS",              hi, bg);
+    draw_string_at(xb, yb + (line++) * lh, "VFS",              hi, bg);
     p = u_to_dec(vfs_node_count(), tmp, sizeof tmp);
-    draw_string_at(xb, yb + line * 10, "  nodes:", fg, bg);
-    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+    draw_string_at(xb, yb + line * lh, "  nodes:", fg, bg);
+    draw_string_at(xb + cw, yb + (line++) * lh, p, fg, bg);
 
     p = u_to_dec(vfs_total_file_bytes(), tmp, sizeof tmp);
-    draw_string_at(xb, yb + line * 10, "  bytes:", fg, bg);
-    draw_string_at(xb + 88, yb + (line++) * 10, p, fg, bg);
+    draw_string_at(xb, yb + line * lh, "  bytes:", fg, bg);
+    draw_string_at(xb + cw, yb + (line++) * lh, p, fg, bg);
+}
+
+/* Resident actor's class name + a field value (cc/cc.c) — for the Actors
+ * window.  cc_actor_field(apid,1) is the philosopher's meal count. */
+extern int  cc_actor_name(int apid, char *out, int cap);
+extern long cc_actor_field(int apid, int fidx);
+
+/* "Actors (live)" window — shows the JIT/AIPL resident actors (loaded via
+ * /actor/load: e.g. the dining philosophers), one row each with the Xinu pid,
+ * scheduler state, and the number of messages queued in its mailbox.  Reads
+ * are lock-free (display only); a torn value just blinks for one frame. */
+static void win_actors(window_t *self, unsigned int frame)
+{
+    (void)frame;
+    int fs = self->font_scale > 0 ? self->font_scale : 1;
+    int LH = 12 * fs;
+    int xb = self->x + 8;
+    int yb = self->y + WM_TITLEBAR_H + 6;
+    int line = 0;
+    unsigned int fg = 0xFFFFFFFFU, bg = self->content_bg;
+    char tmp[24]; char *p;
+
+    /* ap_live_count() is a HIGH-WATER MARK (g_nact, the largest slot id
+     * ever spawned), NOT the current alive count.  When the GC sweep or
+     * suicide() frees a slot, g_act[i].pid goes to -1 but g_obj[i].cls
+     * stays set — so a naive loop redraws class names of dead actors
+     * for as long as the slot's never re-used.  Count alive separately
+     * (pid != -1) and skip dead rows in the display. */
+    int n_high = ap_live_count();
+    int n_alive = 0;
+    for (int i = 0; i < n_high; i++) {
+        int pid = -1;
+        if (ap_actor_stat(i, &pid, 0, 0, 0) == 0 && pid != -1) n_alive++;
+    }
+    draw_string_scaled(xb, yb + line*LH, "Live actors:", 0xFF80FF80U, bg, fs);
+    p = u_to_dec((unsigned long)n_alive, tmp, sizeof tmp);
+    draw_string_scaled(xb + 104*fs, yb + line*LH, p, fg, bg, fs);
+    line += 2;
+
+    if (n_alive <= 0) {
+        draw_string_scaled(xb, yb + line*LH, "(none - POST /actor/load)", 0xFF909090U, bg, fs);
+        return;
+    }
+
+    /* columns: id, name(class), pid, state, msgq, total msgs, meals (eats) */
+    draw_string_scaled(xb, yb + line*LH, "id name        pid st     q msg eat",
+                       0xFFB0B0B0U, bg, fs);
+    line++;
+    for (int i = 0; i < n_high; i++) {
+        int pid = -1, qlen = 0, waiting = 0; unsigned int nmsg = 0;
+        if (ap_actor_stat(i, &pid, &qlen, &waiting, &nmsg) != 0) continue;
+        if (pid == -1) continue;      /* killed/recycled slot — skip */
+
+        char name[16];
+        if (cc_actor_name(i, name, sizeof name) <= 0) { name[0] = '-'; name[1] = 0; }
+
+        const char *st = "?";
+        if (waiting) {
+            st = "WAITmsg";                  /* blocked on an empty mailbox */
+        } else if (pid > 0 && pid < NPROC) {
+            switch (proctab[pid].state) {
+                case PR_READY: st = "READY"; break;
+                case PR_CURR:  st = "RUN";   break;
+                case PR_WAIT:  st = "WAIT";  break;
+                case PR_TERM:  st = "TERM";  break;
+                default:       st = "FREE";  break;
+            }
+        }
+
+        long meals = cc_actor_field(i, 1);   /* Philosopher field 1 = meal count */
+
+        int col = xb, yy = yb + line*LH;
+        p = u_to_dec((unsigned long)i,   tmp, sizeof tmp);
+        draw_string_scaled(col, yy, p, fg, bg, fs);              col += 20*fs;
+        draw_string_scaled(col, yy, name, 0xFF80FFD0U, bg, fs);  col += 92*fs;
+        p = u_to_dec((unsigned long)pid, tmp, sizeof tmp);
+        draw_string_scaled(col, yy, p, fg, bg, fs);              col += 28*fs;
+        draw_string_scaled(col, yy, st, 0xFFFFD080U, bg, fs);    col += 58*fs;
+        p = u_to_dec((unsigned long)qlen, tmp, sizeof tmp);
+        draw_string_scaled(col, yy, p, 0xFF80D0FFU, bg, fs);     col += 18*fs;
+        p = u_to_dec((unsigned long)nmsg, tmp, sizeof tmp);
+        draw_string_scaled(col, yy, p, 0xFFD0D0D0U, bg, fs);     col += 30*fs;
+        if (meals >= 0) { p = u_to_dec((unsigned long)meals, tmp, sizeof tmp); }
+        else            { tmp[0] = '-'; tmp[1] = 0; p = tmp; }
+        draw_string_scaled(col, yy, p, 0xFF80FF80U, bg, fs);     /* meals: green */
+        line++;
+    }
 }
 
 /* Static window descriptors — laid out after video_init() picks the
  * actual screen dimensions in kernel_main(). */
 static window_t banner_win;
+static window_t actors_win;
+static window_t gfx_win;
+static window_t runtime_win;
+static window_t wifi_win;
 static window_t status_win;
+
+/* Graphics window — replays the actor-drawn line/circle command list (the
+ * gfx_* AIPL builtins) into its content area each frame. */
+static void win_gfx(window_t *self, unsigned int frame)
+{
+    (void)frame;
+    gfx_render(self->x + 1, self->y + WM_TITLEBAR_H + 2,
+               self->width - 2, self->height - WM_TITLEBAR_H - 3);
+}
 static window_t anim_win;
 static window_t ftree_win;
 static window_t mem_win;
@@ -630,7 +1036,7 @@ void kernel_main(void)
      * on (or near) the firmware's framebuffer and visibly stamp
      * over the rainbow boot pattern — telling us simultaneously
      * "the kernel runs" and "the framebuffer lives around HERE".
-     * Safe on Pi 5 because all candidate addresses are within
+     * Safe on Pi 4 because all candidate addresses are within
      * mapped low-4-GiB RAM; QEMU virt only has 256 MiB so the
      * higher candidates fault, but with -DSKIP_MBOX we don't run
      * this in QEMU at all. */
@@ -645,10 +1051,19 @@ void kernel_main(void)
      *       silently freezing the kernel. */
     exception_init();
 
+    /* Virtual memory: install an identity-mapped page table and turn on
+     * the MMU + D/I caches.  Done right after the exception vectors so a
+     * misconfiguration is reported rather than hanging silently.  The map
+     * is identity, so every pointer below stays valid — we just gain
+     * caching and the attributes later VM stages build on. */
+    uart_puts("mmu: enabling translation (identity map, W^X, I-cache)...\n");
+    mmu_init();
+    uart_puts("mmu: on (D-cache off for DMA coherency)\n");
+
     /* Try to bring up the HDMI framebuffer before printing anything,
      * so the banner appears on both UART and the monitor.  Failure
-     * is benign — on QEMU virt and on Pi 5 revisions where the VC
-     * mailbox is elsewhere this just leaves screen_putc() as a no-op. */
+     * is benign — on QEMU virt where the VC mailbox is absent this
+     * just leaves screen_putc() as a no-op. */
     video_rc = video_init();
 
     /* BOARD_NAME / SOC_NAME / KERNEL_NAME come from the Makefile
@@ -709,7 +1124,7 @@ void kernel_main(void)
     }
 
     /* Mount the SD card's FAT32 partition under /sd/.  Silently
-     * skipped on builds where SD_BASE isn't defined (Pi 5 / QEMU) —
+     * skipped on builds where SD_BASE isn't defined (QEMU) —
      * the /sd directory will simply not appear in the VFS tree. */
     vfs_mount_sd();
     {
@@ -734,10 +1149,50 @@ void kernel_main(void)
     uart_puts("gic+timer: 100 Hz PPI 30 armed; unmasking DAIF.I\n");
     irq_enable_all();
 
-    /* XHCI-A — PCIe-1 controller MMIO probe.  Skipped at boot: the
-     * controller is clock/power-gated until we implement CPRMAN
-     * + brcmstb-pcie bring-up, so the dump just slows the log.
-     * Re-enable once XHCI-B lands. */
+    /* XHCI-A — moved off the boot path.  First flash attempt: all reads
+     * returned 0x00000000 (controller is clock-gated, MMIO not faulting
+     * but unresponsive), AND something downstream (likely the VC mailbox
+     * notify-xhci-reset waiting on firmware) hung the boot so the network
+     * never came up.  Probe now lives behind /pcie + /xhci-reset HTTP
+     * routes (see system/tcp_server.c) so the box always boots and we
+     * can iterate without losing diagnostics. */
+    /* PCIe RC bring-up at BOOT (single-threaded): uart_puts is safe here, but
+     * DEADLOCKS in the HTTP worker context (screen/shellwin fanout lock).  The
+     * full brcmstb sequence touches only always-on wrapper regs until
+     * DL_ACTIVE, so it completes (link up or timeout) without hanging.  Serial
+     * shows the per-step [pcie] log.  Enum (downstream config) stays off until
+     * link-up is confirmed. */
+    {
+        extern int xhci_pcie_bring_up(void);
+        extern int xhci_pcie_enum_vl805(void);
+        extern int xhci_vl805_init(void);
+        extern int xhci_notify_reset_call(void);
+        int up = xhci_pcie_bring_up();
+        if (up == 0) {
+            uart_puts("[pcie] boot: *** LINK UP *** -> enumerating VL805\n");
+            if (xhci_pcie_enum_vl805() == 0) {
+                /* VL805 has no firmware after an SD (non-USB-MSD) boot — the
+                 * VPU left PCIe in reset.  Ask the firmware to reset the xHC and
+                 * (re)load VL805 firmware (Linux xhci-pci.c VL805 quirk), then
+                 * re-enumerate (the reset re-PERSTs) and init. */
+                int nr = xhci_notify_reset_call();
+                uart_puts("[pcie] boot: notify-xhci-reset rc=");
+                { char b[11]; b[0]='0';b[1]='x'; for(int i=0;i<8;i++){unsigned n=((unsigned)nr>>((7-i)*4))&0xF; b[2+i]=(char)(n<10?'0'+n:'a'+n-10);} b[10]=0; uart_puts(b);}
+                uart_puts("\n");
+                delay_ms(200);
+                xhci_pcie_enum_vl805();      /* re-program BAR/cmd after the reset */
+                if (xhci_vl805_init() == 0) {       /* M4: reset + rings + run */
+                    extern int xhci_vl805_enum_full(void);
+                    extern void xhci_mouse_pump(void);
+                    extern void wm_set_tick(void (*)(void));
+                    xhci_vl805_enum_full();         /* M5/M5.5/M6: enum hubs + HID setup */
+                    wm_set_tick(xhci_mouse_pump);   /* drive the cursor from the wm loop */
+                }
+            }
+        } else {
+            uart_puts("[pcie] boot: link NOT up\n");
+        }
+    }
 #if 0
     xhci_init();
 #endif
@@ -746,6 +1201,21 @@ void kernel_main(void)
      * if SYS_REV_CTRL responds with a sane value (expected to be
      * ~0x06000000 on Pi 4) so we know the controller is powered. */
     genet_init();
+
+    /* NET-D — IRQ-driven RX via a net process + app worker (preemptive net).
+     * The GENET RX done IRQ (INTRL2_0 bit 13 = RXDMA_DONE, GIC SPI 157 =
+     * INTID 189) wakes net_proc_main, which drains + runs the TCP/ARP/ICMP
+     * state machine and queues complete HTTP requests for app_proc_main
+     * (cc/llm on its own stack).  Create both processes *before* enabling the
+     * IRQ so their waiter pids are valid when it fires.  Preemption stays OFF
+     * at boot — enable it at runtime via /netpreempt once verified. */
+    g_net_w.pid     = proc_create(net_proc_main,  8192,  "net");
+    g_app_w.pid     = proc_create(app_proc_main,  16384, "app");
+    g_aipl_w.pid    = proc_create(aipl_proc_main, 32768, "aipl");   /* big stack: llm */
+    connect_interrupt(189, net_irq_handler, 0);
+    gic_enable_irq(189);
+    genet_irq_enable();
+    uart_puts("net: GENET RX IRQ -> net process + app worker (INTID 189)\n");
 
     /* Pass our MAC to the responder so ARP replies carry the
      * right source MAC.  d8:3a:dd:a7:fd:bf — confirmed from
@@ -831,10 +1301,10 @@ void kernel_main(void)
         /* Title-bar window: full *virtual* desktop width, slimmer
          * to make room for everything below.  Only the part inside
          * the viewport (0..sw) shows at any moment. */
-        banner_win.x = 0;
-        banner_win.y = 0;
-        banner_win.width  = WM_DESKTOP_W;
-        banner_win.height = 28;
+        banner_win.x = 0;            /* default layout from the AIPL designer (1024x768) */
+        banner_win.y = 10;
+        banner_win.width  = 469;
+        banner_win.height = 94;
         const char *bt = "Xinu " BOARD_NAME " on " SOC_NAME;
         for (int i = 0; i < WM_TITLE_MAX && bt[i]; i++) banner_win.title[i] = bt[i];
         banner_win.chrome_color = 0xFFAACCEEU;
@@ -846,10 +1316,10 @@ void kernel_main(void)
 
         /* Status window: right side of the initial viewport so
          * the shell on the left has room to show the full log. */
-        status_win.x = 320;
-        status_win.y = 32;
-        status_win.width  = 320;
-        status_win.height = 200;
+        status_win.x = 338;
+        status_win.y = 267;
+        status_win.width  = 280;
+        status_win.height = 193;
         const char *st = "System status";
         for (int i = 0; i < WM_TITLE_MAX && st[i]; i++) status_win.title[i] = st[i];
         status_win.chrome_color = 0xFF60FF60U;
@@ -861,10 +1331,10 @@ void kernel_main(void)
 
         /* File-tree window: well off the initial viewport so the
          * user can pan right to discover it. */
-        ftree_win.x = WM_DESKTOP_W - 320;
-        ftree_win.y = 32;
-        ftree_win.width  = 320;
-        ftree_win.height = 200;
+        ftree_win.x = 330;
+        ftree_win.y = 471;
+        ftree_win.width  = 285;
+        ftree_win.height = 280;
         const char *ft = "VFS tree";
         for (int i = 0; i < WM_TITLE_MAX && ft[i]; i++) ftree_win.title[i] = ft[i];
         ftree_win.chrome_color = 0xFF60D0FFU;
@@ -874,12 +1344,13 @@ void kernel_main(void)
         ftree_win.draw_content = win_ftree;
         wm_add(&ftree_win);
 
-        /* Memory window: right side, below status so it sits in
-         * the initial viewport with the shell on the left. */
-        mem_win.x = 320;
-        mem_win.y = 240;
-        mem_win.width  = 320;
-        mem_win.height = 220;
+        /* Memory window: moved to the far-right of the virtual desktop
+         * (pan right to see it) so the Actors window can take the visible
+         * right-bottom slot of the initial viewport. */
+        mem_win.x = 3;
+        mem_win.y = 443;
+        mem_win.width  = 316;
+        mem_win.height = 171;
         const char *mt = "Memory";
         for (int i = 0; i < WM_TITLE_MAX && mt[i]; i++) mem_win.title[i] = mt[i];
         mem_win.chrome_color = 0xFFFFE060U;
@@ -893,10 +1364,10 @@ void kernel_main(void)
          * boot log lives here and must stay visible without any
          * scrolling so the user can read what happened during
          * USPi init. */
-        shell_win.x = 0;
-        shell_win.y = 32;
-        shell_win.width  = 320;
-        shell_win.height = 432;
+        shell_win.x = 474;
+        shell_win.y = 2;
+        shell_win.width  = 534;
+        shell_win.height = 245;
         const char *swt = "Shell (UART)";
         for (int i = 0; i < WM_TITLE_MAX && swt[i]; i++) shell_win.title[i] = swt[i];
         shell_win.chrome_color = 0xFF80E080U;
@@ -905,12 +1376,12 @@ void kernel_main(void)
         shell_win.content_bg   = 0xFF000010U;
         shell_win.draw_content = shellwin_draw;
         wm_add(&shell_win);
-        wm_set_tick(genet_rx_tick);
+        wm_set_tick(net_yield_tick);   /* yield to the IRQ-woken net process */
 
         /* Soft keyboard window: bottom-left of the initial 640×480
          * viewport.  Half-size as the user requested. */
-        softkbd_win.x = 0;
-        softkbd_win.y = 360;
+        softkbd_win.x = 4;
+        softkbd_win.y = 622;
         softkbd_win.width  = 320;
         softkbd_win.height = 120;
         const char *kbt = "Soft keyboard";
@@ -922,11 +1393,78 @@ void kernel_main(void)
         softkbd_win.draw_content = softkbd_draw;
         wm_add(&softkbd_win);
 
+        /* Actors window: visible right-bottom slot of the initial viewport,
+         * and added LAST so it is the front-most window (wm draws head->tail,
+         * so the last-added one is painted on top).  Shows the live JIT/AIPL
+         * resident actors + their state + mailbox depth. */
+        actors_win.x = 2;
+        actors_win.y = 258;
+        actors_win.width  = 319;
+        actors_win.height = 177;
+        const char *at = "Actors (live)";
+        for (int i = 0; i < WM_TITLE_MAX && at[i]; i++) actors_win.title[i] = at[i];
+        actors_win.chrome_color = 0xFFFF80E0U;
+        actors_win.title_bg     = 0xFF602050U;
+        actors_win.title_fg     = 0xFFFFFFFFU;
+        actors_win.content_bg   = 0xFF181018U;
+        actors_win.draw_content = win_actors;
+        wm_add(&actors_win);
+
+        /* Graphics window: right side of the 1024x768 screen.  AIPL actors
+         * draw line segments / circles into it via the gfx_* builtins. */
+        gfx_win.x = 626;
+        gfx_win.y = 261;
+        gfx_win.width  = 383;
+        gfx_win.height = 502;
+        const char *gt = "Graphics";
+        for (int i = 0; i < WM_TITLE_MAX && gt[i]; i++) gfx_win.title[i] = gt[i];
+        gfx_win.chrome_color = 0xFF80FFC0U;
+        gfx_win.title_bg     = 0xFF205040U;
+        gfx_win.title_fg     = 0xFFFFFFFFU;
+        gfx_win.content_bg   = 0xFF0A1014U;
+        gfx_win.draw_content = win_gfx;
+        wm_add(&gfx_win);
+
+        /* Runtime monitor: a compact live view of the app worker, sat over the
+         * top of the Graphics window (above the wine glass).  Added LAST so the
+         * wm paints it front-most and it is always readable. */
+        runtime_win.x = 0;
+        runtime_win.y = 118;
+        runtime_win.width  = 467;
+        runtime_win.height = 121;
+        runtime_win.font_scale = 1;
+        const char *rt = "Runtime";
+        for (int i = 0; i < WM_TITLE_MAX && rt[i]; i++) runtime_win.title[i] = rt[i];
+        runtime_win.chrome_color = 0xFFFFD060U;
+        runtime_win.title_bg     = 0xFF504010U;
+        runtime_win.title_fg     = 0xFFFFFFFFU;
+        runtime_win.content_bg   = 0xFF14100AU;
+        runtime_win.draw_content = win_runtime;
+        wm_add(&runtime_win);
+
+        /* WiFi indicator: bottom-right corner of the screen, front-most. */
+        wifi_win.x = 626;
+        wifi_win.y = 90;
+        wifi_win.width  = 200;
+        wifi_win.height = 96;
+        wifi_win.font_scale = 1;
+        { const char *wt = "WiFi"; int i; for (i = 0; i < WM_TITLE_MAX && wt[i]; i++) wifi_win.title[i] = wt[i]; }
+        wifi_win.chrome_color = 0xFF60FF60U;
+        wifi_win.title_bg     = 0xFF205020U;
+        wifi_win.title_fg     = 0xFFFFFFFFU;
+        wifi_win.content_bg   = 0xFF0A140AU;
+        wifi_win.draw_content = win_wifi;
+        wm_add(&wifi_win);
+
         /* Start the cursor at the centre of the *screen* (not the
          * virtual desktop) so it stays in view as the viewport
          * pans.  USPi (later) will drive it from mouse reports. */
         wm_cursor_set((int)sw / 2, (int)sh / 2, 1);
 
+        /* Initial serial-shell prompt: shellwin_handle_key() only re-prints
+         * xinu-pi4$ after each command, so without this the serial (screen)
+         * user sees no prompt at boot and thinks the shell never came up. */
+        uart_puts("\nxinu-pi4$ ");
         wm_run();   /* never returns */
     }
 

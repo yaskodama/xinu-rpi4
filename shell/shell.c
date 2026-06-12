@@ -2,7 +2,7 @@
 //
 // Follows the davidxyz/xinuPi shell.c shape: a `centry` table maps
 // command name → handler.  We don't have thread, tty, file
-// descriptors or printf yet on Pi 5 AArch64, so each handler talks
+// descriptors or printf yet on Pi 4 AArch64, so each handler talks
 // directly to the UART through the helpers in uart.h.
 //
 // The REPL loop:
@@ -18,7 +18,7 @@
 //   hello                friendly greeting (smoke marker)
 //   mem                  link-script symbols: __bss_start, __bss_end, _end
 //   peek  <hex_addr>     read 32-bit word at MMIO address (default base
-//                        BCM2712 — try `peek 0x107d001018` for UART_FR)
+//                        BCM2711 — try `peek 0xfe201018` for UART_FR)
 //   uptime               printed since this is bare metal: stub "?", later
 //                        bound to the generic timer in phase S1
 //   ps                   tiny core-status table (the scheduler isn't
@@ -27,15 +27,14 @@
 //                        per boot.S)
 //   halt                 mask interrupts, ask PSCI SYSTEM_OFF
 //                        (HVC at EL2, SMC at EL1 — QEMU virt
-//                        actually exits; real Pi 5 falls through to
+//                        actually exits; real Pi 4 falls through to
 //                        the WFE park)
 //   pingpong [N]         run a 2-actor AIPL-style PingPong: two
 //                        cooperative "processes" exchange messages
 //                        through 1-slot inboxes for N rounds (default
 //                        5, capped at 50) then self-terminate when
 //                        both stop sending and the inboxes drain
-//   reboot               watchdog-driven reset via RP1 (stub — needs
-//                        more work; for now just spins)
+//   reboot               watchdog-driven reset via the BCM2711 PM block
 //
 // Designed so phase S0 (thread switch) and S1 (clock IRQ) can later
 // replace these stubs without touching the dispatch code.
@@ -158,7 +157,7 @@ static int cmd_echo(int argc, char **argv)
 static int cmd_hello(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    uart_puts("hello from Xinu on Raspberry Pi 5 (BCM2712, AArch64)\n");
+    uart_puts("hello from Xinu on " BOARD_NAME " (" SOC_NAME ", AArch64)\n");
     return 0;
 }
 
@@ -419,12 +418,13 @@ static int cmd_procdemo(int argc, char **argv)
     return 0;
 }
 
+extern void pm_reset(void);
 static int cmd_reboot(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    uart_puts("reboot: RP1 watchdog not wired up yet — spinning in WFE.\n");
-    uart_puts("        (power-cycle the board to recover)\n");
-    for (;;) __asm__ volatile ("wfe");
+    uart_puts("reboot: triggering BCM2711 watchdog reset...\n");
+    pm_reset();                /* never returns; SoC resets immediately */
+    return 0;                  /* unreachable */
 }
 
 static int cmd_ps(int argc, char **argv)
@@ -594,7 +594,7 @@ static int cmd_usb(int argc, char **argv)
     (void)argc; (void)argv;
     if (!usb_present()) {
         uart_puts("usb: no DWC2 USB controller on this board\n");
-        uart_puts("     (Pi 5 routes USB through RP1; QEMU virt has no DWC2)\n");
+        uart_puts("     (QEMU virt has no DWC2; Pi 4 USB-A is via the VL805 PCIe xHCI)\n");
         return 0;
     }
     unsigned int id = usb_synopsys_id();
@@ -632,7 +632,7 @@ static int cmd_halt(int argc, char **argv)
      *
      * QEMU virt's PSCI conduit is HVC even when the guest is at EL1
      * (the emulator catches the call regardless of EL3 presence).
-     * Real Pi 5 firmware may or may not implement PSCI — we fall
+     * Real Pi 4 firmware may or may not implement PSCI — we fall
      * through to WFE if HVC returns at all.
      *
      * We can't try SMC as a fallback first: with no exception
@@ -645,8 +645,175 @@ static int cmd_halt(int argc, char **argv)
     for (;;) __asm__ volatile ("wfe");
 }
 
+/* Filesystem commands live in shell/fscmd.c. */
+extern int cmd_pwd(int, char **);
+extern int cmd_ls(int, char **);
+extern int cmd_cd(int, char **);
+extern int cmd_mkdir(int, char **);
+extern int cmd_touch(int, char **);
+extern int cmd_cat(int, char **);
+extern int cmd_write(int, char **);
+extern int cmd_edit(int, char **);
+extern int cmd_rm(int, char **);
+extern int cmd_rmdir(int, char **);
+extern int cmd_tree(int, char **);
+extern int cmd_cp(int, char **);
+extern int cmd_mv(int, char **);
+/* C compiler command lives in cc/cc.c. */
+extern int cmd_cc(int, char **);
+extern int cmd_repro(int, char **);   /* TEMPORARY: QEMU actor+select repro */
+extern int cmd_aload(int, char **);
+extern int cmd_amsg(int, char **);
+/* Virtual-memory demos live in system/mmu.c. */
+extern int cmd_vmtest(int, char **);
+extern int cmd_vmdemand(int, char **);
+/* Actors-as-Xinu-processes demo lives in system/actorproc.c. */
+extern int cmd_actordemo(int, char **);
+extern int cmd_selectdemo(int, char **);
+/* On-device LLM (baked stories260K) lives in llm/llm.c. */
+extern int cmd_llm(int, char **);
+/* Preemptive-scheduling demo lives in system/actorproc.c. */
+extern int cmd_preempt(int, char **);
+
+/* WiFi (BCM43455) control — runs on the shell/main context (not the app
+ * worker), so it can drive bring-up/scan/join interactively over serial.
+ *   wifi probe            M0+M1 bring-up (firmware download)
+ *   wifi scan             escan for APs
+ *   wifi join <ssid> <pw> WPA2-PSK join */
+static int cmd_wifi(int argc, char **argv)
+{
+    extern int wifi_probe(void);
+    extern int wifi_scan_run(void);
+    extern int wifi_join_run(const char *ssid, const char *pass);
+    extern int wifi_dhcp(void);
+    extern int wifi_serve(int secs);
+    extern int wifi_ping(const unsigned char *ip, int count);
+    extern unsigned long wifi_ntp(const unsigned char *srv);
+    extern int wifi_http(const unsigned char *ip, const char *host);
+    extern int wifi_resolve(const char *host, unsigned char *out);
+    extern int wifi_tftp_get(const unsigned char *srv, const char *fname, unsigned char *dst, int maxlen);
+    extern int wifi_netboot(const unsigned char *srv, const char *fname);
+    extern int wifi_adhoc(const char *ssid, int channel, int n);
+    extern int wifi_aodv(const unsigned char *dst);
+    if (argc < 2) { uart_puts("usage: wifi ...|adhoc <ssid> <ch> <n>|aodv <ip>\n"); return 0; }
+    if (str_eq(argv[1], "probe"))      wifi_probe();
+    else if (str_eq(argv[1], "scan"))  wifi_scan_run();
+    else if (str_eq(argv[1], "off"))   { extern void wifi_off(void); wifi_off(); uart_puts("wifi: off (radio down, disconnected)\n"); }
+    else if (str_eq(argv[1], "dhcp"))  wifi_dhcp();
+    else if (str_eq(argv[1], "serve")) {
+        int s = 30;
+        if (argc >= 3) { const char *p = argv[2]; s = 0; while (*p>='0'&&*p<='9') s = s*10 + (*p++ - '0'); }
+        wifi_serve(s);
+    }
+    else if (str_eq(argv[1], "join")) {
+        if (argc < 3) { uart_puts("usage: wifi join <ssid> <pass>\n"); return 0; }
+        wifi_join_run(argv[2], argc >= 4 ? argv[3] : "");
+    } else if (str_eq(argv[1], "up")) {            /* join + dhcp (responder is now persistent) */
+        if (argc < 3) { uart_puts("usage: wifi up <ssid> <pass>\n"); return 0; }
+        if (wifi_join_run(argv[2], argc >= 4 ? argv[3] : "") == 0 && wifi_dhcp() == 0)
+            uart_puts("wifi up: connected; ARP/ICMP responder is now persistent.\n");
+    } else if (str_eq(argv[1], "ping")) {          /* ping a host: wifi ping <ip> [count] */
+        unsigned char ip[4] = {0,0,0,0}; int oct = 0, val = 0, cnt = 4; const char *p;
+        if (argc < 3) { uart_puts("usage: wifi ping <a.b.c.d> [count]\n"); return 0; }
+        for (p = argv[2]; ; p++) {
+            if (*p >= '0' && *p <= '9') val = val*10 + (*p - '0');
+            else { if (oct < 4) ip[oct] = (unsigned char)val; oct++; val = 0; if (!*p) break; }
+        }
+        if (argc >= 4) { cnt = 0; for (p = argv[3]; *p>='0'&&*p<='9'; p++) cnt = cnt*10 + (*p-'0'); }
+        wifi_ping(ip, cnt);
+    } else if (str_eq(argv[1], "ntp")) {           /* wifi ntp [a.b.c.d] (default NICT) */
+        unsigned char srv[4] = {162,159,200,1};     /* time.cloudflare.com (NICT/gw無応答) */
+        if (argc >= 3) {
+            int oct = 0, val = 0; const char *p;
+            for (p = argv[2]; ; p++) {
+                if (*p >= '0' && *p <= '9') val = val*10 + (*p - '0');
+                else { if (oct < 4) srv[oct] = (unsigned char)val; oct++; val = 0; if (!*p) break; }
+            }
+        }
+        wifi_ntp(srv);
+    } else if (str_eq(argv[1], "http")) {          /* wifi http <a.b.c.d> <host> */
+        unsigned char ip[4] = {0,0,0,0}; int oct = 0, val = 0; const char *p;
+        if (argc < 4) { uart_puts("usage: wifi http <ip> <host>\n"); return 0; }
+        for (p = argv[2]; ; p++) {
+            if (*p >= '0' && *p <= '9') val = val*10 + (*p - '0');
+            else { if (oct < 4) ip[oct] = (unsigned char)val; oct++; val = 0; if (!*p) break; }
+        }
+        wifi_http(ip, argv[3]);
+    } else if (str_eq(argv[1], "resolve")) {       /* wifi resolve <host> */
+        unsigned char ip[4];
+        if (argc < 3) { uart_puts("usage: wifi resolve <host>\n"); return 0; }
+        wifi_resolve(argv[2], ip);
+    } else if (str_eq(argv[1], "web")) {            /* wifi web <host> = DNS + HTTP GET */
+        unsigned char ip[4];
+        if (argc < 3) { uart_puts("usage: wifi web <host>\n"); return 0; }
+        if (wifi_resolve(argv[2], ip) == 0) wifi_http(ip, argv[2]);
+    } else if (str_eq(argv[1], "tftp")) {          /* wifi tftp <ip> <file> -> RAM 0x4000000 */
+        unsigned char ip[4] = {0,0,0,0}; int oct = 0, val = 0; const char *p;
+        unsigned char *dst = (unsigned char *)0x4000000UL; int got;
+        if (argc < 4) { uart_puts("usage: wifi tftp <ip> <file>\n"); return 0; }
+        for (p = argv[2]; ; p++) {
+            if (*p >= '0' && *p <= '9') val = val*10 + (*p - '0');
+            else { if (oct < 4) ip[oct] = (unsigned char)val; oct++; val = 0; if (!*p) break; }
+        }
+        got = wifi_tftp_get(ip, argv[3], dst, 8*1024*1024);
+        if (got > 0) {
+            int i;
+            uart_puts("tftp: first 16 bytes: ");
+            for (i = 0; i < 16 && i < got; i++) { puts_hex(dst[i]); uart_putc(' '); }
+            uart_puts("\n");
+        }
+    } else if (str_eq(argv[1], "netboot")) {       /* wifi netboot <ip> <file> — fetch + chainload */
+        unsigned char ip[4] = {0,0,0,0}; int oct = 0, val = 0; const char *p;
+        if (argc < 4) { uart_puts("usage: wifi netboot <ip> <file>\n"); return 0; }
+        for (p = argv[2]; ; p++) {
+            if (*p >= '0' && *p <= '9') val = val*10 + (*p - '0');
+            else { if (oct < 4) ip[oct] = (unsigned char)val; oct++; val = 0; if (!*p) break; }
+        }
+        wifi_netboot(ip, argv[3]);                 /* never returns on success */
+    } else if (str_eq(argv[1], "adhoc")) {         /* wifi adhoc <ssid> <ch> <n> (IBSS, ip 10.0.0.n) */
+        int ch = 6, node = 1; const char *p;
+        if (argc < 3) { uart_puts("usage: wifi adhoc <ssid> [ch] [node]\n"); return 0; }
+        if (argc >= 4) { ch = 0; for (p = argv[3]; *p>='0'&&*p<='9'; p++) ch = ch*10 + (*p-'0'); }
+        if (argc >= 5) { node = 0; for (p = argv[4]; *p>='0'&&*p<='9'; p++) node = node*10 + (*p-'0'); }
+        wifi_adhoc(argv[2], ch, node);
+    } else if (str_eq(argv[1], "aodv")) {          /* wifi aodv <a.b.c.d> — discover route */
+        unsigned char ip[4] = {0,0,0,0}; int oct = 0, val = 0; const char *p;
+        if (argc < 3) { uart_puts("usage: wifi aodv <ip>\n"); return 0; }
+        for (p = argv[2]; ; p++) {
+            if (*p >= '0' && *p <= '9') val = val*10 + (*p - '0');
+            else { if (oct < 4) ip[oct] = (unsigned char)val; oct++; val = 0; if (!*p) break; }
+        }
+        wifi_aodv(ip);
+    } else uart_puts("wifi: unknown subcommand (...|adhoc|aodv)\n");
+    return 0;
+}
+
 static const struct centry commandtab[] = {
+    { "wifi",   "wifi probe|scan|join <ssid> <pass>",       cmd_wifi   },
     { "help",   "list the commands",                       cmd_help   },
+    { "pwd",    "print the current directory",             cmd_pwd    },
+    { "ls",     "ls [path] — list a directory",            cmd_ls     },
+    { "cd",     "cd [path] — change directory",            cmd_cd     },
+    { "mkdir",  "mkdir <path> — make a directory",         cmd_mkdir  },
+    { "touch",  "touch <path> — create an empty file",     cmd_touch  },
+    { "cat",    "cat <path>... — print file contents",     cmd_cat    },
+    { "write",  "write <path> [text] — overwrite a file",  cmd_write  },
+    { "edit",   "edit <path> — type lines, end with '.'",  cmd_edit   },
+    { "rm",     "rm <file>... — remove files",             cmd_rm     },
+    { "rmdir",  "rmdir <dir> — remove an empty directory", cmd_rmdir  },
+    { "tree",   "tree [path] — show the directory tree",   cmd_tree   },
+    { "cp",     "cp <src> <dst> — copy a file",            cmd_cp     },
+    { "mv",     "mv <src> <dst> — move/rename a file",     cmd_mv     },
+    { "cc",     "cc <file.c> — compile & run a C program", cmd_cc     },
+    { "repro",  "TEMP: run SelMin (actors+select+vheap)",   cmd_repro  },
+    { "aload",  "aload <file.c> — load resident actors",    cmd_aload  },
+    { "amsg",   "amsg <actor> <method> [arg] — send msg",   cmd_amsg   },
+    { "vmtest", "demo: VA->PA virtual-memory translation",  cmd_vmtest },
+    { "vmdemand", "demo: demand-paged virtual memory (page faults)", cmd_vmdemand },
+    { "actordemo","actors as Xinu processes (ping-pong)",   cmd_actordemo },
+    { "selectdemo","select: receive a named message first",  cmd_selectdemo },
+    { "llm",    "llm [prompt] — generate text (baked LLM)",  cmd_llm    },
+    { "preempt","preempt — demo timer-driven preemptive RR",  cmd_preempt },
     { "echo",   "echo the remaining words back",           cmd_echo   },
     { "hello",  "smoke marker — say hello",                cmd_hello  },
     { "mem",    "show __bss_start / __bss_end / _end",     cmd_mem    },
@@ -712,7 +879,7 @@ void shell_main(void)
     uart_puts("type `help` for the command list.\n");
 
     for (;;) {
-        uart_puts("xinu-pi5$ ");
+        uart_puts("xinu-pi4$ ");
         int n = uart_getline(line, SHELL_BUFLEN);
         if (n <= 0) continue;
         shell_dispatch_line(line);
