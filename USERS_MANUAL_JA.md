@@ -382,6 +382,74 @@ xinu-pi4$ ticks
 つまり「動くコードはあるが既定では呼ばれない」状態。再有効化は今後の
 スプリント (NET-G bisect) で対応予定。
 
+### 7.5 WiFi (BCM43455)
+
+Pi 4 はオンボードの BCM43455 WiFi チップを持ちます (§7.1 の有線 GENET とは別系統)。操作はすべてシリアルシェル (`xinu-pi4$`) から行います: ファームウェアを起こし、スキャンし、接続します。**起動時に自動接続はしません。**
+
+| コマンド | 説明 |
+| --- | --- |
+| `wifi probe` | M0/M1 bring-up: チップにファームウェアをダウンロード (起動ごとに 1 回) |
+| `wifi scan` | 近隣 AP を escan |
+| `wifi up <ssid> <pass>` | join (WPA2-PSK) + DHCP。常駐 ARP/ICMP 応答を開始 |
+| `wifi join <ssid> <pass>` | join のみ (DHCP なし) |
+| `wifi dhcp` | DHCP リース取得 |
+| `wifi off` | 無線停止 / 切断 |
+| `wifi ping <a.b.c.d> [count]` | ICMP echo クライアント |
+| `wifi serve [secs]` | ARP/ICMP 応答を N 秒間実行 (既定 30) |
+| `wifi resolve <host>` / `wifi web <host>` | DNS / DNS + HTTP GET |
+| `wifi ntp [a.b.c.d]` | NTP 時刻クライアント |
+| `wifi tftp <ip> <file>` / `wifi netboot <ip> <file>` | TFTP 取得 / 取得 + チェインロード |
+
+接続の典型例:
+
+```
+xinu-pi4$ wifi probe          # ファームウェア DL (起動ごとに 1 回)
+xinu-pi4$ wifi scan           # 周囲の AP を確認
+xinu-pi4$ wifi up MyHome-5G mypassword
+wifi up: connected; ARP/ICMP responder is now persistent.
+xinu-pi4$ wifi ping 8.8.8.8
+```
+
+> 再起動後は自動再接続しません。起動のたびに `wifi probe` + `wifi up` を実行してください。`wifi netboot <ip> <file>` は WiFi 越しにカーネルを取得してチェインロードします (有線の chainload と同様、SD 交換なしの更新経路)。
+
+### 7.6 複数 Xinu でのメッシュネットワーク (MANET ad-hoc)
+
+複数の Pi 4 (および Pi 3) Xinu ボードを **アクセスポイント無し** で直接つなぎ、ピアツーピアのメッシュを組めます。802.11 の IBSS (ad-hoc) モード + オンデマンドの AODV ルーティングを使います (ドローン HIL デモの Pi 4 + Pi 3 ノードと同じ MANET スタック)。
+
+各ノードは同じ ad-hoc セルに、別々のノード番号で参加します:
+
+```
+xinu-pi4$ wifi probe                       # 起動ごとに 1 回
+xinu-pi4$ wifi adhoc <cell-ssid> [ch] [node]
+```
+
+- `<cell-ssid>` — ad-hoc セル名。**全ノードで同じ名前・同じチャンネル**にすること。
+- `[ch]` — 802.11 チャンネル (既定 6)。
+- `[node]` — 自分のノード番号 (既定 1)。静的 IP `10.0.0.<node>/24` を得ます。**ノードごとに別の番号**を与えること。
+
+**例 — チャンネル 6 の 3 ノードセル:**
+
+```
+xinu-pi4$ wifi adhoc mesh1 6 1      # → 10.0.0.1
+xinu-pi4$ wifi adhoc mesh1 6 2      # → 10.0.0.2
+xinu-pi4$ wifi adhoc mesh1 6 3      # → 10.0.0.3
+```
+
+電波の届く範囲のノードは `10.0.0.x` で直接通信できます (`wifi ping 10.0.0.2`)。
+
+**マルチホップ (AODV)。** 宛先が直接届かないとき、`wifi aodv <ip>` でオンデマンドに経路探索します:
+
+```
+xinu-pi4$ wifi aodv 10.0.0.3
+[wifi] === AODV discover 10.0.0.3 ===
+[wifi] aodv: RREQ id=1 for 10.0.0.3
+[wifi] *** AODV route: 10.0.0.3 via 10.0.0.2, 2 hop ***
+```
+
+最小 AODV モジュール (M13, RFC 3561 コア) が RREQ をブロードキャスト (UDP port 654) し、範囲内の各ノードが中継して逆経路を記録、宛先が RREP を返して順経路を確立します。各ノードはピアのために自動で中継するので、直接届かない宛先も中間ノードが転送します (経路表は最大 16 エントリ)。
+
+> IBSS/ad-hoc はインフラ (`wifi up`) モードとは独立です。AP に繋がっている場合は先に `wifi off`。ad-hoc も再起動後は復元しないので、各ノードで `wifi probe` + `wifi adhoc` を再実行してください。
+
 ----------------------------------------------------------------------
 
 ## 8. QEMU で試す

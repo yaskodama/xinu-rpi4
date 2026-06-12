@@ -353,6 +353,77 @@ GENET TX ring が劣化し ICMP が止まる、また \verb|tcp_handle_packet()|
 \verb|rx_tick| から呼ぶと以降の ICMP echo reply が止まるため。再有効化は今後の
 スプリント (NET-G bisect) で対応予定。
 
+\subsection{WiFi (BCM43455)}
+Pi 4 はオンボードの BCM43455 WiFi チップを持ちます (上記の有線 GENET とは別系統)。
+操作はすべてシリアルシェル (\verb|xinu-pi4$|) から行います: ファームウェアを起こし、
+スキャンし、接続します。\textbf{起動時に自動接続はしません。}
+\begin{center}\footnotesize
+\begin{tabular}{@{}l p{8.2cm}@{}}
+\toprule \textbf{コマンド} & \textbf{説明}\\ \midrule
+\verb|wifi probe| & M0/M1 bring-up: チップにファームウェアを DL (起動ごとに 1 回)\\
+\verb|wifi scan| & 近隣 AP を escan\\
+\verb|wifi up <ssid> <pass>| & join (WPA2-PSK) + DHCP。常駐 ARP/ICMP 応答を開始\\
+\verb|wifi join <ssid> <pass>| & join のみ (DHCP なし)\\
+\verb|wifi dhcp| & DHCP リース取得\\
+\verb|wifi off| & 無線停止 / 切断\\
+\verb|wifi ping <a.b.c.d> [count]| & ICMP echo クライアント\\
+\verb|wifi serve [secs]| & ARP/ICMP 応答を N 秒間実行 (既定 30)\\
+\verb|wifi resolve <host>| / \verb|wifi web <host>| & DNS / DNS + HTTP GET\\
+\verb|wifi ntp [a.b.c.d]| & NTP 時刻クライアント\\
+\verb|wifi tftp <ip> <file>| / \verb|wifi netboot <ip> <file>| & TFTP 取得 / 取得 + チェインロード\\
+\bottomrule
+\end{tabular}
+\end{center}
+\begin{code}
+xinu-pi4$ wifi probe          # ファームウェア DL (起動ごとに 1 回)
+xinu-pi4$ wifi scan           # 周囲の AP を確認
+xinu-pi4$ wifi up MyHome-5G mypassword
+wifi up: connected; ARP/ICMP responder is now persistent.
+xinu-pi4$ wifi ping 8.8.8.8
+\end{code}
+再起動後は自動再接続しません。起動のたびに \verb|wifi probe| + \verb|wifi up| を
+実行してください。\verb|wifi netboot <ip> <file>| は WiFi 越しにカーネルを取得して
+チェインロードします (有線 chainload と同様、SD 交換なしの更新経路)。
+
+\subsection{複数 Xinu でのメッシュネットワーク (MANET ad-hoc)}
+複数の Pi 4 (および Pi 3) Xinu ボードを \textbf{アクセスポイント無し} で直接つなぎ、
+ピアツーピアのメッシュを組めます。802.11 の IBSS (ad-hoc) モード + オンデマンドの
+AODV ルーティングを使います (ドローン HIL デモの Pi 4 + Pi 3 ノードと同じ MANET
+スタック)。各ノードは同じ ad-hoc セルに、別々のノード番号で参加します:
+\begin{code}
+xinu-pi4$ wifi probe                       # 起動ごとに 1 回
+xinu-pi4$ wifi adhoc <cell-ssid> [ch] [node]
+\end{code}
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item \verb|<cell-ssid>| --- ad-hoc セル名。\textbf{全ノードで同じ名前・同じ
+  チャンネル}にすること。
+\item \verb|[ch]| --- 802.11 チャンネル (既定 6)。
+\item \verb|[node]| --- 自分のノード番号 (既定 1)。静的 IP \verb|10.0.0.<node>/24|
+  を得ます。\textbf{ノードごとに別の番号}を与えること。
+\end{itemize}
+例 --- チャンネル 6 の 3 ノードセル:
+\begin{code}
+xinu-pi4$ wifi adhoc mesh1 6 1      # -> 10.0.0.1
+xinu-pi4$ wifi adhoc mesh1 6 2      # -> 10.0.0.2
+xinu-pi4$ wifi adhoc mesh1 6 3      # -> 10.0.0.3
+\end{code}
+電波の届く範囲のノードは \verb|10.0.0.x| で直接通信できます (\verb|wifi ping 10.0.0.2|)。
+
+\textbf{マルチホップ (AODV)。} 宛先が直接届かないとき、\verb|wifi aodv <ip>| で
+オンデマンドに経路探索します:
+\begin{code}
+xinu-pi4$ wifi aodv 10.0.0.3
+[wifi] === AODV discover 10.0.0.3 ===
+[wifi] aodv: RREQ id=1 for 10.0.0.3
+[wifi] *** AODV route: 10.0.0.3 via 10.0.0.2, 2 hop ***
+\end{code}
+最小 AODV モジュール (M13, RFC 3561 コア) が RREQ をブロードキャスト (UDP port 654)
+し、範囲内の各ノードが中継して逆経路を記録、宛先が RREP を返して順経路を確立します。
+各ノードはピアのために自動で中継するので、直接届かない宛先も中間ノードが転送します
+(経路表は最大 16 エントリ)。IBSS/ad-hoc はインフラ (\verb|wifi up|) モードとは独立
+です (AP に繋がっている場合は先に \verb|wifi off|)。再起動後は復元しないので、各
+ノードで \verb|wifi probe| + \verb|wifi adhoc| を再実行してください。
+
 %======================================================================
 \section{QEMU で試す}
 \begin{code}

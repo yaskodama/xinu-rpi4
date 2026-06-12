@@ -365,6 +365,79 @@ degrades the GENET TX ring and stalls ICMP, and routing \verb|tcp_handle_packet(
 from \verb|rx_tick| stops subsequent ICMP echo replies. Re-enabling is planned in
 a future sprint (NET-G bisect).
 
+\subsection{WiFi (BCM43455)}
+The Pi 4 has an on-board BCM43455 WiFi chip (separate from the wired GENET
+above). It is driven entirely from the serial shell (\verb|xinu-pi4$|): bring up
+the firmware, scan, then connect. It does \textbf{not} auto-connect at boot.
+\begin{center}\footnotesize
+\begin{tabular}{@{}l p{8.6cm}@{}}
+\toprule \textbf{Command} & \textbf{What it does}\\ \midrule
+\verb|wifi probe| & M0/M1 bring-up: download the firmware to the chip (once per boot)\\
+\verb|wifi scan| & escan for nearby APs\\
+\verb|wifi up <ssid> <pass>| & join (WPA2-PSK) + DHCP; starts the persistent ARP/ICMP responder\\
+\verb|wifi join <ssid> <pass>| & join only (no DHCP)\\
+\verb|wifi dhcp| & request a DHCP lease\\
+\verb|wifi off| & radio down / disconnect\\
+\verb|wifi ping <a.b.c.d> [count]| & ICMP echo client\\
+\verb|wifi serve [secs]| & run the ARP/ICMP responder for N seconds (default 30)\\
+\verb|wifi resolve <host>| / \verb|wifi web <host>| & DNS / DNS + HTTP GET\\
+\verb|wifi ntp [a.b.c.d]| & NTP time client\\
+\verb|wifi tftp <ip> <file>| / \verb|wifi netboot <ip> <file>| & TFTP fetch / fetch + chainload\\
+\bottomrule
+\end{tabular}
+\end{center}
+\begin{code}
+xinu-pi4$ wifi probe          # download firmware (once per boot)
+xinu-pi4$ wifi scan           # see what's around
+xinu-pi4$ wifi up MyHome-5G mypassword
+wifi up: connected; ARP/ICMP responder is now persistent.
+xinu-pi4$ wifi ping 8.8.8.8
+\end{code}
+WiFi does not auto-reconnect after a reboot --- re-run \verb|wifi probe| +
+\verb|wifi up| each boot. \verb|wifi netboot <ip> <file>| fetches a kernel over
+WiFi and chainloads it (a no-SD-swap update path, like the wired chainload).
+
+\subsection{Mesh networking: multiple Xinu nodes (MANET ad-hoc)}
+Several Pi 4 (and Pi 3) Xinu boards can form a peer-to-peer mesh with \textbf{no
+access point}, using 802.11 IBSS (ad-hoc) mode plus on-demand AODV routing ---
+the same MANET stack used in the drone-HIL demo (Pi 4 + Pi 3 nodes). Each node
+joins the same ad-hoc cell with a distinct node number:
+\begin{code}
+xinu-pi4$ wifi probe                       # once per boot
+xinu-pi4$ wifi adhoc <cell-ssid> [ch] [node]
+\end{code}
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item \verb|<cell-ssid>| --- the cell name; \textbf{all nodes must use the same
+  name and channel}.
+\item \verb|[ch]| --- 802.11 channel (default 6).
+\item \verb|[node]| --- this node's number (default 1); it gets the static IP
+  \verb|10.0.0.<node>/24|. \textbf{Give every node a distinct number.}
+\end{itemize}
+Example --- a 3-node cell on channel 6:
+\begin{code}
+xinu-pi4$ wifi adhoc mesh1 6 1      # -> 10.0.0.1
+xinu-pi4$ wifi adhoc mesh1 6 2      # -> 10.0.0.2
+xinu-pi4$ wifi adhoc mesh1 6 3      # -> 10.0.0.3
+\end{code}
+Nodes within radio range reach each other directly at \verb|10.0.0.x|
+(\verb|wifi ping 10.0.0.2|).
+
+\textbf{Multi-hop (AODV).} When a destination is not in direct range, discover a
+route on demand with \verb|wifi aodv <ip>|:
+\begin{code}
+xinu-pi4$ wifi aodv 10.0.0.3
+[wifi] === AODV discover 10.0.0.3 ===
+[wifi] aodv: RREQ id=1 for 10.0.0.3
+[wifi] *** AODV route: 10.0.0.3 via 10.0.0.2, 2 hop ***
+\end{code}
+The minimal AODV module (M13, RFC 3561 core) broadcasts an RREQ (UDP port 654);
+each in-range node relays it and records a reverse route; the destination answers
+with an RREP that installs the forward route. Every node relays for its peers
+automatically (route table: up to 16 entries). IBSS / ad-hoc is independent of
+the infrastructure \verb|wifi up| mode (run \verb|wifi off| to leave an AP first)
+and is not restored after reboot --- re-run \verb|wifi probe| + \verb|wifi adhoc|
+on each node.
+
 %======================================================================
 \section{Running under QEMU}
 \begin{code}

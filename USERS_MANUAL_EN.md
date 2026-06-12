@@ -382,6 +382,88 @@ dispatch is **OFF**:
 So the code exists but the default boot has it sleeping. Re-enabling is
 planned in a future sprint (NET-G bisect).
 
+### 7.5 WiFi (BCM43455)
+
+The Pi 4 has an on-board BCM43455 WiFi chip (separate from the wired GENET of
+§7.1). It is driven entirely from the serial shell (`xinu-pi4$`): bring up the
+firmware, scan, then connect. It does **not** auto-connect at boot.
+
+| Command | What it does |
+| --- | --- |
+| `wifi probe` | M0/M1 bring-up: download the firmware to the chip (run once per boot) |
+| `wifi scan` | escan for nearby APs |
+| `wifi up <ssid> <pass>` | join (WPA2-PSK) + DHCP; starts the persistent ARP/ICMP responder |
+| `wifi join <ssid> <pass>` | join only (no DHCP) |
+| `wifi dhcp` | request a DHCP lease |
+| `wifi off` | radio down / disconnect |
+| `wifi ping <a.b.c.d> [count]` | ICMP echo client |
+| `wifi serve [secs]` | run the ARP/ICMP responder for N seconds (default 30) |
+| `wifi resolve <host>` / `wifi web <host>` | DNS / DNS + HTTP GET |
+| `wifi ntp [a.b.c.d]` | NTP time client |
+| `wifi tftp <ip> <file>` / `wifi netboot <ip> <file>` | TFTP fetch / fetch + chainload |
+
+Typical connect:
+
+```
+xinu-pi4$ wifi probe          # download firmware (once per boot)
+xinu-pi4$ wifi scan           # see what's around
+xinu-pi4$ wifi up MyHome-5G mypassword
+wifi up: connected; ARP/ICMP responder is now persistent.
+xinu-pi4$ wifi ping 8.8.8.8
+```
+
+> WiFi does not auto-reconnect after a reboot — re-run `wifi probe` + `wifi up`
+> each boot. `wifi netboot <ip> <file>` fetches a kernel over WiFi and chainloads
+> it (a no-SD-swap update path, like the wired chainload).
+
+### 7.6 Mesh networking with multiple Xinu nodes (MANET ad-hoc)
+
+Several Pi 4 (and Pi 3) Xinu boards can form a peer-to-peer mesh with **no access
+point**, using 802.11 IBSS (ad-hoc) mode plus on-demand AODV routing — the same
+MANET stack used in the drone-HIL demo (Pi 4 + Pi 3 nodes).
+
+Each node joins the same ad-hoc cell with a distinct node number:
+
+```
+xinu-pi4$ wifi probe                       # once per boot
+xinu-pi4$ wifi adhoc <cell-ssid> [ch] [node]
+```
+
+- `<cell-ssid>` — the cell name; **all nodes must use the same name and channel**.
+- `[ch]` — 802.11 channel (default 6).
+- `[node]` — this node's number (default 1); it gets the static IP `10.0.0.<node>/24`. **Give every node a distinct number.**
+
+**Example — a 3-node cell on channel 6:**
+
+```
+xinu-pi4$ wifi adhoc mesh1 6 1      # -> 10.0.0.1
+xinu-pi4$ wifi adhoc mesh1 6 2      # -> 10.0.0.2
+xinu-pi4$ wifi adhoc mesh1 6 3      # -> 10.0.0.3
+```
+
+Nodes within radio range reach each other directly at `10.0.0.x`
+(`wifi ping 10.0.0.2`).
+
+**Multi-hop (AODV).** When a destination is not in direct range, discover a route
+on demand with `wifi aodv <ip>`:
+
+```
+xinu-pi4$ wifi aodv 10.0.0.3
+[wifi] === AODV discover 10.0.0.3 ===
+[wifi] aodv: RREQ id=1 for 10.0.0.3
+[wifi] *** AODV route: 10.0.0.3 via 10.0.0.2, 2 hop ***
+```
+
+The minimal AODV module (M13, RFC 3561 core) broadcasts an RREQ (UDP port 654);
+each in-range node relays it and records a reverse route; the destination answers
+with an RREP that installs the forward route. Every node relays for its peers
+automatically, so intermediate nodes forward traffic beyond direct range (route
+table: up to 16 entries).
+
+> IBSS / ad-hoc is independent of the infrastructure `wifi up` mode — run
+> `wifi off` to leave an AP first. Ad-hoc is not restored after reboot; re-run
+> `wifi probe` + `wifi adhoc` on each node.
+
 ----------------------------------------------------------------------
 
 ## 8. Running under QEMU
