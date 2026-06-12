@@ -273,27 +273,33 @@ xinu-pi4$ _
 
 ## 6. Shell Command Reference
 
-`help` or `?` always shows the live list. Standard commands:
+`help` or `?` always shows the live list. The current command set:
 
-| Command            | Purpose                                                      |
-|--------------------|--------------------------------------------------------------|
-| `help` / `?`       | List registered commands                                     |
-| `echo <words…>`    | Echo args back (whitespace-collapsed)                        |
-| `hello`            | Smoke marker — greeting                                      |
-| `mem`              | Show `__bss_start` / `__bss_end` / `_end` (from `link.ld`)   |
-| `peek <hex_addr>`  | Read a 32-bit MMIO word (e.g. `peek 0xfe201018`)             |
-| `uptime`           | Raw `CNTPCT_EL0` (generic timer counter)                     |
-| `ticks`            | 100 Hz timer tick counter (S1)                               |
-| `ps`               | Core / EL status (placeholder until full scheduler)          |
-| `halt`             | Mask DAIF + PSCI `SYSTEM_OFF` (QEMU `virt` exits cleanly)    |
-| `reboot`           | Stub — spins until power-cycle                               |
-| `pingpong [N]`     | AIPL-style 2-actor cooperative PingPong, N=1..50 (default 5) |
-| `procdemo [N]`     | Real 2-process ctxsw demo, N=1..30 (default 5)               |
-| `usb`              | DWC2 USB HCD diagnostics (Pi 4 only)                         |
-| `rxstat`           | Drain RX ring + show packet / byte counters                  |
-| `pan <dx> <dy>`    | Scroll the virtual 1280×960 desktop viewport                 |
-| `view`             | Show viewport / desktop sizes                                |
-| `autopan [on|off]` | Toggle demo auto-scroll                                      |
+| Command | Purpose |
+|---------|---------|
+| `help` / `?` | List registered commands |
+| `echo <words…>` | Echo args back (whitespace-collapsed) |
+| `hello` | Smoke marker — greeting |
+| `mem` | Show `__bss_start` / `__bss_end` / `_end` (from `link.ld`) |
+| `peek <hex_addr>` | Read a 32-bit MMIO word (e.g. `peek 0xfe201018`) |
+| `uptime` | Raw `CNTPCT_EL0` (generic timer counter) |
+| `ticks` | 100 Hz timer tick counter (S1) |
+| `ps` | Core / EL status |
+| `halt` | Mask DAIF + PSCI `SYSTEM_OFF` (QEMU `virt` exits cleanly) |
+| `reboot` | Stub — spins until power-cycle |
+| `pwd` `ls` `cd` `mkdir` `rmdir` `touch` `cat` `write` `edit` `rm` `cp` `mv` `tree` | In-RAM filesystem (volatile; see §6.3) |
+| `cc <file.c>` | Compile & run a C program on-device (JIT → AArch64; §6.3) |
+| `aload` / `amsg` | Load resident AIPL actors / send a message (§6.3) |
+| `actordemo` / `selectdemo` | Actor ping-pong / guarded named-message receive (§6.3) |
+| `vmtest` / `vmdemand` | VA≠PA remap / demand-paged virtual memory (§6.4) |
+| `llm [prompt]` | Generate text from the baked-in LLM (§6.3) |
+| `preempt` | Demo the timer-driven preemptive round-robin scheduler |
+| `pingpong [N]` | AIPL-style 2-actor cooperative PingPong, N=1..50 (default 5) |
+| `procdemo [N]` | Real 2-process ctxsw demo, N=1..30 (default 5) |
+| `usb` | xHCI / DWC2 USB diagnostics (Pi 4 only) |
+| `wifi …` | WiFi + mesh — `probe`/`scan`/`up`/`adhoc`/`aodv`/… (§7.5–§7.6) |
+| `rxstat` / `tcpstat` | RX-ring / TCP-listener counters |
+| `pan <dx> <dy>` `view` `autopan [on|off]` | Window-manager viewport controls |
 
 ### 6.1 procdemo — real context switch
 
@@ -327,6 +333,39 @@ will let the dispatcher reap them.
 | Actors            | Two static (`Ping`, `Pong`)      | Real procs created via `proc_create`    |
 | Switch mechanism  | Single-stack dispatcher loop     | Real ctxsw via `ctxsw.S` (callee-saved) |
 | Termination       | Both inboxes empty               | Both call `proc_exit()`                 |
+
+### 6.3 On-device tooling (filesystem, C JIT, actors, LLM)
+
+Beyond the demos above, the shell carries a self-contained toolchain — you can
+write, compile, and run code on the board itself.
+
+- **In-RAM filesystem** — `pwd` `ls` `cd` `mkdir` `rmdir` `touch` `cat` `write`
+  `edit` `rm` `cp` `mv` `tree` operate on a small in-memory tree (volatile;
+  cleared on reboot).
+- **C JIT (`cc`)** — `cc <file.c>` compiles a C subset to native AArch64 and runs
+  it in place. The same compiler is reachable over HTTP as `POST /compile`
+  (body = C source).
+- **AIPL actors** — `aload <file.c>` loads resident actors; `amsg <actor>
+  <method> [arg]` sends a message. `actordemo` runs a 2-actor ping-pong as real
+  Xinu processes; `selectdemo` shows a guarded receive (take a named message
+  first). HTTP `/actor`, `/send`, and `/gc` expose the actor inventory, message
+  send, and the actor-pool GC.
+- **Embedded LLM (`llm`)** — a tiny transformer is baked into the image; `llm
+  [prompt]` generates text on-device (also `/chat` over HTTP).
+
+### 6.4 Virtual memory (`vmtest` / `vmdemand`)
+
+The kernel runs with the MMU on (identity map) plus a **demand-paged window** at
+VA `0x80000000`..`0x80400000` (4 MiB, 512-frame pool):
+
+- `vmtest` — map a physical page at a different virtual address and prove the
+  translation (VA ≠ PA).
+- `vmdemand` — touch 64 pages in the demand window; the first run takes `0x40`
+  page faults (one per page) and reads back OK, the second run takes `0x0` faults
+  (already mapped). Check the fault counter with `/fault` (HTTP).
+
+Both run locally or remotely, e.g. `curl
+"http://192.168.3.100/shell?cmd=vmdemand"`.
 
 ----------------------------------------------------------------------
 
@@ -463,6 +502,35 @@ table: up to 16 entries).
 > IBSS / ad-hoc is independent of the infrastructure `wifi up` mode — run
 > `wifi off` to leave an AP first. Ad-hoc is not restored after reboot; re-run
 > `wifi probe` + `wifi adhoc` on each node.
+
+### 7.7 HTTP control plane & remote shell
+
+`system/tcp_server.c` runs an HTTP server on the wired interface (default port
+80, `192.168.3.100`), so the board can be driven entirely over the network:
+
+| Route | What it does |
+| --- | --- |
+| `GET /shell?cmd=<cmd>` | run any shell command, return its output (commands have no stdin) |
+| `POST /compile` | JIT-compile and run a C program (body = source) |
+| `GET /chat` | on-device LLM chat |
+| `GET /actor` `/send` `/gc` `/jitstats` | actor inventory / message send / actor-pool GC / JIT counters |
+| `GET /usbdiag` `/pcie-init` `/pcie-enum` `/xhci-reset` | USB / PCIe bring-up diagnostics |
+| `GET /fault` `/mmio-read` `/mmio-write` `/mmio-sweep` | fault counters + raw MMIO peek/poke |
+| `POST /reboot` | BCM2711 watchdog reset |
+| `POST /chainload` | upload + jump to a new kernel (no SD swap) |
+
+Runtime diagnostics use these HTTP counters because `uart_puts` deadlocks in the
+HTTP-worker context — all PCIe/xHCI bring-up logging is done at boot over serial.
+
+**Network kernel update (chainload — no SD swap).** `POST /chainload` uploads a
+new kernel and jumps to it in RAM. A helper script wraps the upload:
+
+```sh
+python3 tools/remote_chainload.py 192.168.3.100 compile/kernel8.img
+```
+
+A bad image just needs a power cycle (the SD card is untouched), which keeps the
+dev loop fast. It needs the HTTP server to be responsive to accept the upload.
 
 ----------------------------------------------------------------------
 

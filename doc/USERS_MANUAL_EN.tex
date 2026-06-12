@@ -22,6 +22,7 @@
 \newunicodechar{×}{\ensuremath{\times}}
 \newunicodechar{…}{\dots}
 \newunicodechar{≥}{\ensuremath{\geq}}
+\newunicodechar{≠}{\ensuremath{\neq}}
 \newunicodechar{✅}{\textcolor{green!55!black}{\checkmark}}
 \newunicodechar{⏳}{\textcolor{orange!80!black}{\textbf{\small WIP}}}
 \newunicodechar{❌}{\textcolor{red!70!black}{\ensuremath{\times}}}
@@ -285,11 +286,12 @@ xinu-pi4$ _
 
 %======================================================================
 \section{Shell Command Reference}
+\verb|help| or \verb|?| always shows the live list. The current command set:
 \begin{center}\footnotesize
-\begin{tabular}{@{}l p{9.4cm}@{}}
+\begin{longtable}{@{}l p{9.0cm}@{}}
 \toprule
 \textbf{Command} & \textbf{Purpose}\\
-\midrule
+\midrule \endhead
 \verb|help| / \verb|?|    & List registered commands\\
 \verb|echo <words>|       & Echo args back (whitespace-collapsed)\\
 \verb|hello|              & Smoke marker --- greeting\\
@@ -299,16 +301,22 @@ xinu-pi4$ _
 \verb|ticks|             & 100 Hz timer tick counter (S1)\\
 \verb|ps|                & Core / EL status\\
 \verb|halt|              & Mask DAIF + PSCI \verb|SYSTEM_OFF| (QEMU exits cleanly)\\
-\verb|reboot|            & Watchdog-driven reset via the BCM2711 PM block\\
+\verb|reboot|            & Stub --- spins until power-cycle\\
+\verb|pwd ls cd mkdir rmdir touch cat write edit rm cp mv tree| & In-RAM filesystem (volatile; §6.3)\\
+\verb|cc <file.c>|        & Compile \& run a C program on-device (JIT \textrightarrow{} AArch64; §6.3)\\
+\verb|aload| / \verb|amsg| & Load resident AIPL actors / send a message (§6.3)\\
+\verb|actordemo| / \verb|selectdemo| & Actor ping-pong / guarded named-message receive (§6.3)\\
+\verb|vmtest| / \verb|vmdemand| & VA≠PA remap / demand-paged virtual memory (§6.4)\\
+\verb|llm [prompt]|       & Generate text from the baked-in LLM (§6.3)\\
+\verb|preempt|           & Demo the timer-driven preemptive round-robin scheduler\\
 \verb|pingpong [N]|       & AIPL-style 2-actor cooperative PingPong, N=1..50\\
 \verb|procdemo [N]|       & Real 2-process ctxsw demo, N=1..30\\
-\verb|usb|               & DWC2 USB HCD diagnostics (Pi 4 only)\\
-\verb|rxstat|            & Drain RX ring + show packet / byte counters\\
-\verb|pan <dx> <dy>|      & Scroll the virtual 1280×960 desktop viewport\\
-\verb|view|              & Show viewport / desktop sizes\\
-\verb!autopan [on|off]!   & Toggle demo auto-scroll\\
+\verb|usb|               & xHCI / DWC2 USB diagnostics (Pi 4 only)\\
+\verb|wifi ...|           & WiFi + mesh: \verb|probe|/\verb|scan|/\verb|up|/\verb|adhoc|/\verb|aodv|/\dots\ (§7.5--§7.6)\\
+\verb|rxstat| / \verb|tcpstat| & RX-ring / TCP-listener counters\\
+\verb|pan <dx> <dy>| \verb|view| \verb!autopan [on|off]! & Window-manager viewport controls\\
 \bottomrule
-\end{tabular}
+\end{longtable}
 \end{center}
 
 \subsection{procdemo --- real context switch}
@@ -341,6 +349,39 @@ Terminate  & Both inboxes empty & Both call \verb|proc_exit()|\\
 \bottomrule
 \end{tabular}
 \end{center}
+
+\subsection{On-device tooling (filesystem, C JIT, actors, LLM)}
+Beyond the demos above, the shell carries a self-contained toolchain --- you can
+write, compile, and run code on the board itself.
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item \textbf{In-RAM filesystem} --- \verb|pwd| \verb|ls| \verb|cd| \verb|mkdir|
+  \verb|rmdir| \verb|touch| \verb|cat| \verb|write| \verb|edit| \verb|rm|
+  \verb|cp| \verb|mv| \verb|tree| operate on a small in-memory tree (volatile;
+  cleared on reboot).
+\item \textbf{C JIT (\texttt{cc})} --- \verb|cc <file.c>| compiles a C subset to
+  native AArch64 and runs it in place; the same compiler is reachable over HTTP
+  as \verb|POST /compile| (body = C source).
+\item \textbf{AIPL actors} --- \verb|aload <file.c>| loads resident actors;
+  \verb|amsg <actor> <method> [arg]| sends a message. \verb|actordemo| runs a
+  2-actor ping-pong as real Xinu processes; \verb|selectdemo| shows a guarded
+  receive. HTTP \verb|/actor|, \verb|/send|, \verb|/gc| expose the actor
+  inventory, message send, and the actor-pool GC.
+\item \textbf{Embedded LLM (\texttt{llm})} --- a tiny transformer is baked into
+  the image; \verb|llm [prompt]| generates text on-device (also \verb|/chat|).
+\end{itemize}
+
+\subsection{Virtual memory (\texttt{vmtest} / \texttt{vmdemand})}
+The kernel runs with the MMU on (identity map) plus a \textbf{demand-paged
+window} at VA \verb|0x80000000|..\verb|0x80400000| (4 MiB, 512-frame pool):
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item \verb|vmtest| --- map a physical page at a different virtual address and
+  prove the translation (VA ≠ PA).
+\item \verb|vmdemand| --- touch 64 pages in the demand window; the first run
+  takes \verb|0x40| page faults (one per page) and reads back OK, the second run
+  takes \verb|0x0| faults (already mapped). Check the counter with \verb|/fault|.
+\end{itemize}
+Both run locally or remotely, e.g.\
+\verb|curl "http://192.168.3.100/shell?cmd=vmdemand"|.
 
 %======================================================================
 \section{Networking (Pi 4)}
@@ -437,6 +478,36 @@ automatically (route table: up to 16 entries). IBSS / ad-hoc is independent of
 the infrastructure \verb|wifi up| mode (run \verb|wifi off| to leave an AP first)
 and is not restored after reboot --- re-run \verb|wifi probe| + \verb|wifi adhoc|
 on each node.
+
+\subsection{HTTP control plane \& remote shell}
+\verb|system/tcp_server.c| runs an HTTP server on the wired interface (default
+port 80, \verb|192.168.3.100|), so the board can be driven entirely over the
+network:
+\begin{center}\footnotesize
+\begin{tabular}{@{}l p{8.4cm}@{}}
+\toprule \textbf{Route} & \textbf{What it does}\\ \midrule
+\verb|GET /shell?cmd=<cmd>| & run any shell command, return its output (no stdin)\\
+\verb|POST /compile| & JIT-compile and run a C program (body = source)\\
+\verb|GET /chat| & on-device LLM chat\\
+\verb|GET /actor| \verb|/send| \verb|/gc| \verb|/jitstats| & actor inventory / send / GC / JIT counters\\
+\verb|GET /usbdiag| \verb|/pcie-init| \verb|/pcie-enum| \verb|/xhci-reset| & USB / PCIe bring-up diagnostics\\
+\verb|GET /fault| \verb|/mmio-read| \verb|/mmio-write| \verb|/mmio-sweep| & fault counters + raw MMIO peek/poke\\
+\verb|POST /reboot| & BCM2711 watchdog reset\\
+\verb|POST /chainload| & upload + jump to a new kernel (no SD swap)\\
+\bottomrule
+\end{tabular}
+\end{center}
+Runtime diagnostics use these HTTP counters because \verb|uart_puts| deadlocks in
+the HTTP-worker context --- all PCIe/xHCI bring-up logging is done at boot over
+serial.
+
+\textbf{Network kernel update (chainload --- no SD swap).} \verb|POST /chainload|
+uploads a new kernel and jumps to it in RAM. A helper script wraps the upload:
+\begin{code}
+python3 tools/remote_chainload.py 192.168.3.100 compile/kernel8.img
+\end{code}
+A bad image just needs a power cycle (the SD card is untouched), which keeps the
+dev loop fast. It needs the HTTP server to be responsive to accept the upload.
 
 %======================================================================
 \section{Running under QEMU}
