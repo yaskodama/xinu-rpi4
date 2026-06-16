@@ -11,6 +11,14 @@ serial hello-world into a small interactive system with an HDMI window manager,
 USB-A input, virtual memory, networking (wired + WiFi mesh), an on-device C JIT,
 an actor runtime, and an HTTP control plane.
 
+![Xinu on a Raspberry Pi 4 over HDMI: the window manager showing the runtime
+monitor, UART shell, live actors, system status, graphics, and an on-screen
+BASIC window drawing a Koch-snowflake fractal.](doc/pi4-basic-koch.jpg)
+
+*Real hardware (Pi 4 / BCM2711) over HDMI — the window manager with the runtime
+monitor, UART shell, live-actor and system-status panels, and the on-screen
+**BASIC** window running its `koch` sample to draw a Koch snowflake.*
+
 ## What works
 
 **Boot & core kernel**
