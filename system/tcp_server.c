@@ -840,6 +840,35 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, " served=");    bl = s_putdec(body, bl, (long)g_app_served);
         bl = s_put(body, bl, " preempt=");   bl = s_put(body, bl, g_net_preempt ? "on" : "off");
         bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "GET /dhcp") || starts_with(req, "POST /dhcp")) {
+        /* DHCP client status (system/dhcp_client.c).  The active responder IP
+         * stays static; this reports the lease the DHCP client obtained. */
+        ctype = "text/plain";
+        extern int dhcp_is_bound(void);
+        extern unsigned char dhcp_state(void);
+        extern unsigned long dhcp_discover_count(void), dhcp_offer_count(void),
+                             dhcp_request_count(void), dhcp_ack_count(void),
+                             dhcp_lease_seconds(void);
+        extern void dhcp_get_ip(unsigned char[4]), dhcp_get_router(unsigned char[4]),
+                    dhcp_get_netmask(unsigned char[4]);
+        static const char *dst[] = { "INIT", "DISCOVER_SENT", "REQUEST_SENT", "BOUND" };
+        unsigned char ip[4], gw[4], mask[4];
+        int s = dhcp_state(); if (s < 0 || s > 3) s = 0;
+        dhcp_get_ip(ip); dhcp_get_router(gw); dhcp_get_netmask(mask);
+        bl = s_put(body, bl, "state=");     bl = s_put(body, bl, dst[s]);
+        bl = s_put(body, bl, " bound=");    bl = s_put(body, bl, dhcp_is_bound() ? "yes" : "no");
+        bl = s_put(body, bl, " discover="); bl = s_putdec(body, bl, (long)dhcp_discover_count());
+        bl = s_put(body, bl, " offer=");    bl = s_putdec(body, bl, (long)dhcp_offer_count());
+        bl = s_put(body, bl, " request=");  bl = s_putdec(body, bl, (long)dhcp_request_count());
+        bl = s_put(body, bl, " ack=");      bl = s_putdec(body, bl, (long)dhcp_ack_count());
+        bl = s_put(body, bl, "\nlease_ip=");
+        for (int i = 0; i < 4; i++) { bl = s_putdec(body, bl, ip[i]); if (i < 3) bl = s_put(body, bl, "."); }
+        bl = s_put(body, bl, " mask=");
+        for (int i = 0; i < 4; i++) { bl = s_putdec(body, bl, mask[i]); if (i < 3) bl = s_put(body, bl, "."); }
+        bl = s_put(body, bl, " gw=");
+        for (int i = 0; i < 4; i++) { bl = s_putdec(body, bl, gw[i]); if (i < 3) bl = s_put(body, bl, "."); }
+        bl = s_put(body, bl, " lease_s="); bl = s_putdec(body, bl, (long)dhcp_lease_seconds());
+        bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "GET /windows") || starts_with(req, "POST /windows")) {
         /* Read-only window inventory for the Py-I layout designer: id, name,
          * and current geometry of every wm window (JSON). */

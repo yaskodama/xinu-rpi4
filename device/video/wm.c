@@ -136,6 +136,31 @@ static void cursor_vis_show(void)
         }
 }
 
+/* Re-stamp the cursor onto the visible buffer after an OUT-OF-BAND present.
+ * A long-running BASIC graphics loop blocks wm_run (single thread) and flips
+ * frames itself via video_present(), which wipes the cursor; this redraws it
+ * (frozen at its last position) so the pointer doesn't vanish during the run. */
+void wm_cursor_repaint(void)
+{
+    cur_bak_valid = 0;          /* the flip invalidated the cached backing */
+    cursor_vis_show();
+}
+
+/* As wm_cursor_repaint, but FIRST pump the mouse so the pointer keeps moving
+ * during a blocking BASIC graphics loop.  Keyboard reports drained by the pump
+ * are dropped (xhci_keyboard_event guards on basic_is_running), and clicks are
+ * ignored (xhci_mouse_event skips wm_pointer during a run) — so this can't
+ * re-enter the interpreter. */
+void wm_cursor_after_blit(void)
+{
+    cur_bak_valid = 0;          /* the present wiped the visible buffer */
+    xhci_mouse_pump();          /* update cursor_x/y from HID motion */
+    cursor_vis_show();          /* stamp the cursor at its current position */
+}
+
+/* The window the user last clicked (keyboard input is routed here). */
+window_t *wm_active(void) { return active_win; }
+
 void wm_add(window_t *w)
 {
     w->next = 0;
@@ -306,6 +331,9 @@ static void wm_raise(window_t *w)
 void wm_pointer(int sx, int sy, int left)
 {
     int dx = sx + vp_x, dy = sy + vp_y;         /* screen -> desktop */
+    static int prev_left;                        /* for press-edge detection */
+    int press_edge = (left && !prev_left);
+    prev_left = left;
     if (left) {
         if (!drag_win) {
             window_t *w = window_at_resize(dx, dy);     /* corner first (it's inside the window) */
@@ -313,6 +341,25 @@ void wm_pointer(int sx, int sy, int left)
                      drag_off_y = dy - (w->y + w->height); active_win = w; wm_raise(w); }
             else if ((w = window_at_titlebar(dx, dy)) != 0) {
                 drag_win = w; drag_mode = 1; drag_off_x = dx - w->x; drag_off_y = dy - w->y; active_win = w; wm_raise(w);
+            }
+            else {
+                /* Click inside a window BODY (not titlebar/resize corner):
+                 * focus it (so the keyboard routes here) and raise it, but do
+                 * NOT start a drag.  Without this, clicking the shell window's
+                 * content didn't give it keyboard focus, so typed commands went
+                 * to whatever window was last title-bar-clicked (e.g. BASIC). */
+                window_t *hit = 0;
+                for (window_t *t = wm_head; t; t = t->next)
+                    if (dx >= t->x && dx < t->x + t->width &&
+                        dy >= t->y && dy < t->y + t->height)
+                        hit = t;                       /* topmost = last in list */
+                if (hit) {
+                    active_win = hit; wm_raise(hit);
+                    /* Fire the window's click handler once per press (e.g. the
+                     * BASIC window's toolbar buttons).  Local coords. */
+                    if (press_edge && hit->on_click)
+                        hit->on_click(hit, dx - hit->x, dy - hit->y);
+                }
             }
         } else if (drag_mode == 2) {                    /* resize bottom-right */
             int nw = dx - drag_off_x - drag_win->x;

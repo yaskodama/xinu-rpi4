@@ -1053,6 +1053,7 @@ static unsigned char   x_hid_buf[XMAXSLOT][8]   __attribute__((aligned(64)));
 static int x_mouse_slot=-1, x_mouse_dci, x_mouse_iface, x_kbd_slot=-1, x_kbd_dci, x_kbd_iface;
 static unsigned char x_kbd_prev[8];
 static unsigned long x_mouse_reports, x_kbd_reports;
+static volatile int  x_ctrl_c_pending; /* sticky: set when a report shows Ctrl+'c' */
 static int x_poll_mode = 0;   /* 0 = interrupt EP (drain event ring); 1 = EP0 GET_REPORT poll */
 static unsigned x_xfer_events, x_last_xfer_cc, x_last_xfer_slot, x_last_xfer_dci;
 
@@ -1155,9 +1156,62 @@ static const char x_km[64] = {
     [0x0c]='i',[0x0d]='j',[0x0e]='k',[0x0f]='l',[0x10]='m',[0x11]='n',[0x12]='o',[0x13]='p',
     [0x14]='q',[0x15]='r',[0x16]='s',[0x17]='t',[0x18]='u',[0x19]='v',[0x1a]='w',[0x1b]='x',
     [0x1c]='y',[0x1d]='z',[0x1e]='1',[0x1f]='2',[0x20]='3',[0x21]='4',[0x22]='5',[0x23]='6',
-    [0x24]='7',[0x25]='8',[0x26]='9',[0x27]='0',[0x28]='\n',[0x2b]='\t',[0x2c]=' ',
-    [0x2d]='-',[0x2e]='=',[0x2f]='[',[0x30]=']',[0x33]=';',[0x34]='\'',[0x36]=',',[0x37]='.',[0x38]='/',
+    [0x24]='7',[0x25]='8',[0x26]='9',[0x27]='0',[0x28]='\n',[0x2a]='\b',[0x2b]='\t',[0x2c]=' ',
+    [0x2d]='-',[0x2e]='=',[0x2f]='[',[0x30]=']',[0x31]='\\',[0x33]=';',[0x34]='\'',[0x35]='`',
+    [0x36]=',',[0x37]='.',[0x38]='/',
 };
+
+/* Apply Shift to a base (unshifted) US-layout character: upper-case letters and
+ * map the number row / punctuation to their shifted symbols.  Without this,
+ * Shift only upper-cased a-z and e.g. the double-quote (Shift+') needed for
+ * RUN "name" was unreachable. */
+static char x_shift_char(char c)
+{
+    if (c >= 'a' && c <= 'z') return (char)(c - 32);
+    switch (c) {
+        case '1': return '!';  case '2': return '@';  case '3': return '#';
+        case '4': return '$';  case '5': return '%';  case '6': return '^';
+        case '7': return '&';  case '8': return '*';  case '9': return '(';
+        case '0': return ')';  case '-': return '_';  case '=': return '+';
+        case '[': return '{';  case ']': return '}';  case '\\': return '|';
+        case ';': return ':';  case '\'': return '"'; case '`': return '~';
+        case ',': return '<';  case '.': return '>';  case '/': return '?';
+        default:  return c;
+    }
+}
+
+/* Translate one fresh HID key usage to character(s) and deliver them.
+ *   - Ctrl+letter   -> control code (Ctrl+C = 0x03, Ctrl+H = 0x08, ...)
+ *   - arrows / nav  -> ANSI escape sequence (ESC [ X) the editors expect
+ *   - otherwise     -> x_km, with Shift applied via x_shift_char.
+ * Backspace (0x2a) maps through x_km to 0x08. */
+static void x_deliver_key(unsigned u, int shift, int ctrl)
+{
+    extern void xhci_keyboard_event(char);
+    /* Navigation / cursor keys (HID 0x4a..0x52) have no x_km ASCII; emit the
+     * 3-byte ESC sequence atomically so the editors' esc parser sees it. */
+    char nav = 0;
+    switch (u) {
+        case 0x4a: nav = 'H'; break;   /* Home      */
+        case 0x4d: nav = 'F'; break;   /* End       */
+        case 0x4b: nav = '5'; break;   /* Page Up   */
+        case 0x4e: nav = '6'; break;   /* Page Down */
+        case 0x4f: nav = 'C'; break;   /* Right     */
+        case 0x50: nav = 'D'; break;   /* Left      */
+        case 0x51: nav = 'B'; break;   /* Down      */
+        case 0x52: nav = 'A'; break;   /* Up        */
+        case 0x4c: xhci_keyboard_event(0x7f); return;   /* Delete -> DEL */
+        default: break;
+    }
+    if (nav) { xhci_keyboard_event(0x1b); xhci_keyboard_event('['); xhci_keyboard_event(nav); return; }
+
+    if (u >= 0x40) return;
+    char c = x_km[u];
+    if (!c) return;
+    if (ctrl && c >= 'a' && c <= 'z') { xhci_keyboard_event((char)(c & 0x1f)); return; }
+    if (shift) c = x_shift_char(c);
+    xhci_keyboard_event(c);
+}
 
 /* Called periodically (wm tick): drain the event ring, deliver HID reports. */
 static unsigned long x_pump_calls;
@@ -1187,9 +1241,11 @@ void xhci_mouse_pump(void)
             if (n >= 3) {
                 unsigned char *b=x_hbuf;
                 int shift=(b[0]&0x22)!=0;
-                for (int i=2;i<8;i++){ unsigned u=b[i]; if (!u||u>=0x40) continue;
+                int ctrl=(b[0]&0x11)!=0;
+                if (ctrl) for (int i=2;i<8;i++) if (b[i]==0x06) { x_ctrl_c_pending=1; break; }
+                for (int i=2;i<8;i++){ unsigned u=b[i]; if (!u) continue;
                     int held=0; for (int j=2;j<8;j++) if (x_kbd_prev[j]==u){held=1;break;}
-                    if (held) continue; char c=x_km[u]; if(c){ if(shift&&c>='a'&&c<='z') c-=32; xhci_keyboard_event(c);} }
+                    if (held) continue; x_deliver_key(u, shift, ctrl); }
                 for (int i=0;i<8;i++) x_kbd_prev[i]=b[i];
                 x_kbd_reports++;
             }
@@ -1221,9 +1277,11 @@ void xhci_mouse_pump(void)
         } else if (eslot==x_kbd_slot && edci==x_kbd_dci){
             unsigned char *b=x_hid_buf[x_kbd_slot];
             int shift=(b[0]&0x22)!=0;
-            for (int i=2;i<8;i++){ unsigned u=b[i]; if (!u||u>=0x40) continue;
+            int ctrl=(b[0]&0x11)!=0;
+            if (ctrl) for (int i=2;i<8;i++) if (b[i]==0x06) { x_ctrl_c_pending=1; break; }
+            for (int i=2;i<8;i++){ unsigned u=b[i]; if (!u) continue;
                 int held=0; for (int j=2;j<8;j++) if (x_kbd_prev[j]==u){held=1;break;}
-                if (held) continue; char c=x_km[u]; if(c){ if(shift&&c>='a'&&c<='z') c-=32; xhci_keyboard_event(c);} }
+                if (held) continue; x_deliver_key(u, shift, ctrl); }
             for (int i=0;i<8;i++) x_kbd_prev[i]=b[i];
             x_kbd_reports++;
             x_hid_arm(x_kbd_slot, x_kbd_dci);
@@ -1233,6 +1291,22 @@ void xhci_mouse_pump(void)
 unsigned long xhci_mouse_reports(void){ return x_mouse_reports; }
 unsigned long xhci_kbd_reports(void)  { return x_kbd_reports; }
 int           xhci_mouse_ok(void)     { return x_mouse_slot>=0; }
+
+/* Did the user press Ctrl+C?  A long-running BASIC program blocks the wm pump
+ * (single thread), so the RUN loop calls this to honour Ctrl-C break.  The
+ * keyboard runs in interrupt mode (EP0 GET_REPORT is unreliable mid-run), so
+ * we drain the HID event ring here — x_ctrl_c_pending is set by the report
+ * processing when it sees Ctrl + 'c' — then return and clear that sticky flag.
+ * Keyboard reports drained are NOT dispatched (xhci_keyboard_event drops them
+ * while a program runs), so this can't re-enter the interpreter. */
+int xhci_poll_ctrl_c(void)
+{
+    if (x_kbd_slot < 0 && x_mouse_slot < 0) return x_ctrl_c_pending;
+    xhci_mouse_pump();                 /* drain fresh HID reports -> sets flag */
+    int v = x_ctrl_c_pending;
+    x_ctrl_c_pending = 0;
+    return v;
+}
 unsigned long xhci_pump_calls(void)   { return x_pump_calls; }
 unsigned int  xhci_mfindex(void)      { return x_running ? (XR(x_rt,0)&0x3fff) : 0; }
 int           xhci_mouse_slot_dbg(void){ return x_mouse_slot; }
@@ -1404,6 +1478,7 @@ void xhci_mouse_pump(void)                          { }
 unsigned long xhci_pump_calls(void)                 { return 0; }
 unsigned long xhci_mouse_reports(void)              { return 0; }
 unsigned long xhci_kbd_reports(void)                { return 0; }
+int           xhci_poll_ctrl_c(void)                { return 0; }
 unsigned int  xhci_mfindex(void)                    { return 0; }
 int           xhci_mouse_slot_dbg(void)             { return -1; }
 unsigned int  xhci_mouse_ep_state(void)             { return 0; }

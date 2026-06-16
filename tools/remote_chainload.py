@@ -18,13 +18,34 @@ CHUNK = 16384
 data = open(img, "rb").read()
 n = len(data)
 print(f"[chainload] {img}: {n} bytes -> http://{host}  ({(n+CHUNK-1)//CHUNK} chunks of {CHUNK}B)")
-t0 = time.time()
-for off in range(0, n, CHUNK):
-    chunk = data[off:off+CHUNK]
+def post_chunk(off, chunk):
     req = urllib.request.Request(f"http://{host}/chainload?off={off}",
                                  data=chunk, method="POST",
                                  headers={"Content-Type": "application/octet-stream"})
-    r = urllib.request.urlopen(req, timeout=20).read().decode("ascii", "replace").strip()
+    return urllib.request.urlopen(req, timeout=20).read().decode("ascii", "replace").strip()
+
+t0 = time.time()
+for off in range(0, n, CHUNK):
+    chunk = data[off:off+CHUNK]
+    # Validate + retry: the running server occasionally mishandles the FIRST
+    # POST after handoff (the request arrives split across TCP segments and
+    # falls through to the generic 404 fallback), silently dropping that chunk.
+    # If chunk 0 is lost the staged image keeps stale bytes 0..16KB and the
+    # relocated kernel hangs on boot.  So require an "ok off=<off>" ack and
+    # retry up to 5x before aborting.
+    want = f"ok off={off}"
+    r = ""
+    for attempt in range(5):
+        try:
+            r = post_chunk(off, chunk)
+        except Exception as e:
+            r = f"<{type(e).__name__}>"
+        if r.startswith(want):
+            break
+        time.sleep(0.3)
+    if not r.startswith(want):
+        sys.exit(f"[chainload] FATAL: chunk off={off} not acked after 5 tries "
+                 f"(last reply: {r!r}). Aborting — staged image would be corrupt.")
     if off % (CHUNK*16) == 0 or off + CHUNK >= n:
         print(f"  off={off:>8} -> {r}")
 print(f"[chainload] staged {n} bytes in {time.time()-t0:.1f}s. triggering boot...")

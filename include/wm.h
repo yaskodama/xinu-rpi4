@@ -38,6 +38,12 @@ typedef struct window {
      * (x+1 .. x+width-2  ×  y+TITLEBAR_H+1 .. y+height-2). */
     void        (*draw_content)(struct window *self, unsigned int frame);
 
+    /* Optional: called once on the left-button PRESS edge when the click
+     * lands inside this window's body (not the title bar / resize corner).
+     * (lx,ly) are window-local pixel coords.  Used by the BASIC window for
+     * its toolbar buttons.  NULL = no click handling. */
+    void        (*on_click)(struct window *self, int lx, int ly);
+
     struct window *next;          /* internal — set by wm_add() */
 } window_t;
 
@@ -45,6 +51,10 @@ typedef struct window {
  * everything previously added, so later windows are "on top" in
  * draw order, though we don't currently overlap them). */
 void wm_add(window_t *w);
+
+/* The window the user last clicked (NULL until the first click).  Keyboard
+ * input is routed to this window (e.g. the BASIC window vs. the shell). */
+window_t *wm_active(void);
 
 /* Runtime window geometry — driven by the AIPL screen-layout designer.
  * Windows are addressed by their add order (0-based).  move/resize take
@@ -71,6 +81,11 @@ void wm_set_tick(void (*fn)(void));
  * wm_run() after all windows so it stays on top.  Visible=0 hides
  * the cursor entirely.  Caller chooses screen-space pixel coords. */
 void wm_cursor_set(int x, int y, int visible);
+
+/* Re-stamp the cursor onto the visible buffer after an out-of-band present
+ * (used by the BASIC graphics animation loop, which flips frames while it
+ * blocks the wm render loop). */
+void wm_cursor_repaint(void);
 
 /* Virtual desktop is WM_DESKTOP_W × WM_DESKTOP_H.  Viewport (the
  * camera onto the desktop) is the size of the physical screen.

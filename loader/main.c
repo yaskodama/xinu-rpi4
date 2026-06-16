@@ -68,10 +68,22 @@ static int g_rx_log_left = 2;
 static unsigned long g_rx_tick_count = 0;
 static void genet_rx_tick(void)
 {
-    /* DHCP retry path disabled — was disrupting the GENET TX ring
-     * after repeated DISCOVER bursts.  Code in system/dhcp_client.c
-     * stays in place for future re-activation. */
     g_rx_tick_count++;
+
+    /* DHCP: a LIMITED, spaced retry (re-enabled).  The old code re-sent
+     * DISCOVER every tick, bursting the GENET TX ring; here we re-send at most
+     * a few times, ~3 s apart, and stop the moment we are BOUND.  The rx tick
+     * runs ~20x/s, so 64 ticks ≈ 3 s. */
+    {
+        extern int dhcp_is_bound(void);
+        extern void dhcp_send_discover(void);
+        static int dhcp_tries = 0;
+        if (!dhcp_is_bound() && dhcp_tries < 4 &&
+            g_rx_tick_count > 0 && (g_rx_tick_count % 64) == 0) {
+            dhcp_send_discover();
+            dhcp_tries++;
+        }
+    }
 
     unsigned char *pkt;
     int len;
@@ -280,7 +292,19 @@ static void net_yield_tick(void)
  * Keyboard input from the future xHCI HID driver will land here. */
 void xhci_keyboard_event(char c)
 {
-    shellwin_handle_key(c);
+    /* Drop keystrokes while a BASIC program is RUNning: the run loop pumps the
+     * mouse (to keep the cursor alive) which also drains keyboard reports, and
+     * dispatching them here would re-enter the interpreter.  Ctrl-C still works
+     * — it's read via a separate poll inside the run loop, not this path. */
+    extern int basic_is_running(void);
+    if (basic_is_running()) return;
+    /* Route the key to whichever window the user last clicked: the BASIC
+     * window when it is active, otherwise the (default) shell window. */
+    extern window_t *wm_active(void);
+    extern window_t  basic_win;
+    extern void      basicwin_handle_key(char);
+    if (wm_active() == &basic_win) basicwin_handle_key(c);
+    else                           shellwin_handle_key(c);
 }
 
 static int  g_cursor_x = 320;
@@ -298,8 +322,14 @@ void xhci_mouse_event(unsigned nButtons, int dx, int dy)
     if (g_cursor_x >= sw)      { wm_pan(g_cursor_x - sw + 1, 0); g_cursor_x = sw - 1; }
     if (g_cursor_y >= sh)      { wm_pan(0, g_cursor_y - sh + 1); g_cursor_y = sh - 1; }
     wm_cursor_set(g_cursor_x, g_cursor_y, 1);
-    { extern void wm_pointer(int, int, int);          /* left-drag a title bar -> move window */
-      wm_pointer(g_cursor_x, g_cursor_y, (int)(nButtons & 1)); }
+    /* During a BASIC RUN, move the cursor but don't process clicks/drags — that
+     * would re-enter the interpreter via a toolbar on_click.  (The run loop
+     * pumps the mouse only to keep the pointer from freezing.) */
+    extern int basic_is_running(void);
+    if (!basic_is_running()) {
+        extern void wm_pointer(int, int, int);        /* left-drag a title bar -> move window */
+        wm_pointer(g_cursor_x, g_cursor_y, (int)(nButtons & 1));
+    }
 }
 
 extern unsigned char _end[];   /* set by link.ld — top of static image */
@@ -1224,8 +1254,16 @@ void kernel_main(void)
         extern void net_responder_set_mac(const unsigned char mac[6]);
         unsigned char mymac[6] = { 0xd8, 0x3a, 0xdd, 0xa7, 0xfd, 0xbf };
         net_responder_set_mac(mymac);
+        /* Kick the DHCP client: set our MAC + send ONE DISCOVER now.  Incoming
+         * OFFER/ACK are processed by genet_rx_tick -> dhcp_handle_packet, which
+         * on ACK records the lease (BOUND).  The active responder IP stays
+         * static 192.168.3.100 for reachability — DHCP obtains + reports a lease
+         * (see /dhcp).  A single DISCOVER (plus a few spaced retries in the rx
+         * tick) avoids the old burst that disrupted the GENET TX ring. */
+        dhcp_set_mac(mymac);
+        dhcp_send_discover();
     }
-    uart_puts("net: ARP+ICMP responder armed; static IP 192.168.3.100\n");
+    uart_puts("net: ARP+ICMP responder armed; static IP 192.168.3.100; DHCP DISCOVER sent\n");
     /* Re-read link status here so it shows up at the *end* of the
      * boot log (after the shell-window ring has scrolled past the
      * original PHY-init lines). */
@@ -1316,10 +1354,10 @@ void kernel_main(void)
 
         /* Status window: right side of the initial viewport so
          * the shell on the left has room to show the full log. */
-        status_win.x = 338;
-        status_win.y = 267;
-        status_win.width  = 280;
-        status_win.height = 193;
+        status_win.x = 340;
+        status_win.y = 247;
+        status_win.width  = 278;
+        status_win.height = 187;
         const char *st = "System status";
         for (int i = 0; i < WM_TITLE_MAX && st[i]; i++) status_win.title[i] = st[i];
         status_win.chrome_color = 0xFF60FF60U;
@@ -1331,8 +1369,8 @@ void kernel_main(void)
 
         /* File-tree window: well off the initial viewport so the
          * user can pan right to discover it. */
-        ftree_win.x = 330;
-        ftree_win.y = 471;
+        ftree_win.x = 339;
+        ftree_win.y = 766;
         ftree_win.width  = 285;
         ftree_win.height = 280;
         const char *ft = "VFS tree";
@@ -1347,8 +1385,8 @@ void kernel_main(void)
         /* Memory window: moved to the far-right of the virtual desktop
          * (pan right to see it) so the Actors window can take the visible
          * right-bottom slot of the initial viewport. */
-        mem_win.x = 3;
-        mem_win.y = 443;
+        mem_win.x = 8;
+        mem_win.y = 776;
         mem_win.width  = 316;
         mem_win.height = 171;
         const char *mt = "Memory";
@@ -1380,10 +1418,10 @@ void kernel_main(void)
 
         /* Soft keyboard window: bottom-left of the initial 640×480
          * viewport.  Half-size as the user requested. */
-        softkbd_win.x = 4;
-        softkbd_win.y = 622;
-        softkbd_win.width  = 320;
-        softkbd_win.height = 120;
+        softkbd_win.x = 635;
+        softkbd_win.y = 773;
+        softkbd_win.width  = 375;
+        softkbd_win.height = 173;
         const char *kbt = "Soft keyboard";
         for (int i = 0; i < WM_TITLE_MAX && kbt[i]; i++) softkbd_win.title[i] = kbt[i];
         softkbd_win.chrome_color = 0xFFFFB060U;
@@ -1397,10 +1435,10 @@ void kernel_main(void)
          * and added LAST so it is the front-most window (wm draws head->tail,
          * so the last-added one is painted on top).  Shows the live JIT/AIPL
          * resident actors + their state + mailbox depth. */
-        actors_win.x = 2;
-        actors_win.y = 258;
-        actors_win.width  = 319;
-        actors_win.height = 177;
+        actors_win.x = 1;
+        actors_win.y = 246;
+        actors_win.width  = 328;
+        actors_win.height = 176;
         const char *at = "Actors (live)";
         for (int i = 0; i < WM_TITLE_MAX && at[i]; i++) actors_win.title[i] = at[i];
         actors_win.chrome_color = 0xFFFF80E0U;
@@ -1424,6 +1462,29 @@ void kernel_main(void)
         gfx_win.content_bg   = 0xFF0A1014U;
         gfx_win.draw_content = win_gfx;
         wm_add(&gfx_win);
+
+        /* BASIC interpreter window (device/video/basicwin.c).  Click it to make
+         * it the wm-active window, then the keyboard types into the BASIC REPL.
+         * Drag the title bar to reposition; grab the bottom-right to resize. */
+        {
+            extern window_t basic_win;
+            extern void basicwin_init(void);
+            extern void basicwin_draw(window_t *, unsigned int);
+            basic_win.x = 2;            /* bottom-left of the desktop */
+            basic_win.y = 439;
+            basic_win.width  = 618;
+            basic_win.height = 319;
+            basic_win.font_scale = 1;
+            const char *bt = "BASIC";
+            for (int i = 0; i < WM_TITLE_MAX && bt[i]; i++) basic_win.title[i] = bt[i];
+            basic_win.chrome_color = 0xFF40A0FFU;
+            basic_win.title_bg     = 0xFF103060U;
+            basic_win.title_fg     = 0xFFFFFFFFU;
+            basic_win.content_bg   = 0xFF000810U;
+            basic_win.draw_content = basicwin_draw;
+            wm_add(&basic_win);
+            basicwin_init();
+        }
 
         /* Runtime monitor: a compact live view of the app worker, sat over the
          * top of the Graphics window (above the wine glass).  Added LAST so the
