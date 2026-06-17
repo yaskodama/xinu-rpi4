@@ -1,7 +1,63 @@
 # Pi4 (xinu-rpi4) — Next-Session Handoff
 
-Last updated: 2026-06-10.  Branch `feat/wifi-pi4`, HEAD **`1cc794b`** (all pushed to
-`github.com/yaskodama/xinu-rpi4`).
+Last updated: **2026-06-16**.  Branch **`main`**, HEAD **`c16321f`** (pushed to
+`github.com/yaskodama/xinu-rpi4`).  Older 2026-06-10 notes kept below for reference.
+
+---
+
+## ★ 2026-06-16 session — on-screen BASIC window (DONE) + koch cursor-freeze (OPEN)
+
+### Shipped (merged to `main`, pushed)
+- **`6b94c0b` feat(pi4): on-screen BASIC window + active-window input routing** —
+  ported the Pi 3 desktop's BASIC to the Pi 4 WM.  New files:
+  - `device/video/basic.c` (interpreter core, `double` number type — built with
+    `PI4_FP_CFLAGS`, see the explicit `basic.o` rule in `compile/Makefile`).
+  - `device/video/basicwin.c` + `include/basicwin.h` (wm-managed window: text
+    ring, line editor, toolbar buttons FILES/LIST/hanoi/bsort/fizz/qsort/koch,
+    LINE/CIRCLE/PLOT → shared `gfx_*` display list).
+  - `device/video/wm.c` + `include/wm.h`: `window.on_click` seam, `wm_active()`
+    (keyboard routes to last-clicked window), press-edge click detect,
+    `wm_cursor_repaint()` / `wm_cursor_after_blit()` (pump mouse + re-stamp
+    cursor during a blocking BASIC graphics loop).
+  - `device/usb/xhci/xhci.c`: full Shift/Ctrl/nav-key translation (`x_deliver_key`,
+    `x_shift_char`), `xhci_poll_ctrl_c()` (sticky Ctrl-C for the RUN loop).
+  - `system/tcp_server.c`: `/dhcp` endpoint (DHCP lease report).
+  - `tools/remote_chainload.py`: require `ok off=<off>` ack + 5× retry per chunk
+    (first POST after handoff could be silently dropped → corrupt staged image).
+- **`c16321f` docs(README)**: real-hardware HDMI screenshot
+  `doc/pi4-basic-koch.jpg` (BASIC koch fractal).  ★EXIF/GPS stripped + resized
+  (`magick … -resize 1600x -strip -quality 85`); original had Tokyo GPS coords.
+- Verified on **real hardware** (photo + `/windows` shows the "BASIC" window).
+  Current-source build: `compile/kernel8.img` **md5 `5c05d662`**, 1,925,976 B.
+
+### ★ OPEN BUG — mouse cursor freezes while `koch` (any long BASIC gfx run) runs
+- Repro: BASIC window → click **koch** (or `RUN "koch"`).  Cursor stops moving.
+- The koch sample (`S_koch` in `basic.c`) is a `*LOOP / WAIT 0.1 / GOTO *LOOP`
+  loop, so it SHOULD pump every 0.1 s:
+  `WAIT` → `bw_pause()` (basicwin.c) → `bw_present_gfx()` → `wm_cursor_after_blit()`
+  → `xhci_mouse_pump()` (updates `cursor_x/y`) + `cursor_vis_show()`.
+- **Lead / prime suspect**: `xhci_mouse_pump()` drains the HID event ring but the
+  **mouse** interrupt-IN transfer likely is not being **re-armed** during a
+  blocking run (the diff re-arms only the *keyboard* slot: `x_hid_arm(x_kbd_slot,
+  x_kbd_dci)` — check whether the mouse slot gets an equivalent `x_hid_arm(
+  x_mouse_slot, x_mouse_dci)` on its branch).  Without re-arming, the first motion
+  report is delivered then no more arrive → cursor stuck.  ALSO check the long
+  no-WAIT path: `*REDRAW`/`*KOCH` recursion (D up to 10 → ~4^10 segments) runs with
+  no `WAIT`, so no pump at all during a redraw — consider pumping inside `bw_line`
+  every N segments.
+- Files to edit: `device/usb/xhci/xhci.c` (`xhci_mouse_pump`, `x_hid_arm` for the
+  mouse branch), `device/video/basicwin.c` (`bw_line` periodic pump option).
+
+### Deploy gotcha hit this session
+- `remote_chainload.py` aborted on chunk 0 (`<URLError>`) — the **HTTP worker had
+  wedged** (known: `/usbdiag` went 200→000, TCP :80 NO CONNECT).  The new retry
+  guard correctly refused to stage a corrupt image (SD untouched).  Fix =
+  **physical power-cycle** (then it boots SD; re-chainload `5c05d662` once HTTP is
+  healthy).  After the user's power-cycle the device returned healthy (HTTP 200,
+  BASIC window present).
+
+---
+
 
 ## What this session built (bare-metal Pi4 / BCM2711, AArch64)
 
