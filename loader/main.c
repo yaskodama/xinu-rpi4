@@ -1179,6 +1179,14 @@ void kernel_main(void)
     uart_puts("gic+timer: 100 Hz PPI 30 armed; unmasking DAIF.I\n");
     irq_enable_all();
 
+    /* Bring up the other 3 Cortex-A72 cores as compute workers (worker-pool
+     * SMP; see system/smp.c + docs/SMP_REPORT_JA.md).  Core 0 keeps running the
+     * whole single-core OS unchanged.  Safe if the cores never respond — they
+     * just stay offline and parallel jobs fall back to core 0. */
+    { extern void smp_init(void); extern int smp_cores_online(void);
+      smp_init();
+      uart_puts("smp: cores online = "); uart_putc((char)('0' + smp_cores_online())); uart_puts("\n"); }
+
     /* XHCI-A — moved off the boot path.  First flash attempt: all reads
      * returned 0x00000000 (controller is clock-gated, MMIO not faulting
      * but unresponsive), AND something downstream (likely the VC mailbox

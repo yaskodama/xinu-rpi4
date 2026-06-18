@@ -170,6 +170,36 @@ void mmu_init(void)
     vm_demand_init();      /* arm the demand-paged virtual window (no backing yet) */
 }
 
+/* Bring a secondary core's MMU up to the SAME configuration core 0 uses, so
+ * all four cores execute identically (fair benchmarking): identity map via the
+ * page tables core 0 already built (l1_table), MMU + I-cache ON, D-cache OFF
+ * (SCTLR.C=0 — see the note in mmu_init).  Called from smp_secondary_entry()
+ * (system/smp.c) on cores 1-3.  Does NOT rebuild the tables. */
+void mmu_enable_secondary(void)
+{
+    unsigned long mair = (0x00UL << (8 * ATTR_DEVICE)) | (0xFFUL << (8 * ATTR_NORMAL));
+    unsigned long tcr =
+          (25UL << 0)     /* T0SZ = 39-bit VA      */
+        | (0UL  << 8)     /* IRGN0 = Non-cacheable */
+        | (0UL  << 10)    /* ORGN0 = Non-cacheable */
+        | (3UL  << 12)    /* SH0   = inner shareable */
+        | (0UL  << 14)    /* TG0   = 4 KiB         */
+        | (1UL  << 23)    /* EPD1  = disable TTBR1 */
+        | (2UL  << 32);   /* IPS   = 40-bit PA     */
+    __asm__ volatile (
+        "dsb sy\n tlbi vmalle1\n dsb sy\n isb\n"
+        "msr mair_el1, %0\n"
+        "msr tcr_el1,  %1\n"
+        "msr ttbr0_el1,%2\n"
+        "isb\n"
+        :: "r"(mair), "r"(tcr), "r"((unsigned long)l1_table) : "memory");
+    unsigned long sctlr;
+    __asm__ volatile ("ic iallu\n dsb sy\n isb\n mrs %0, sctlr_el1\n" : "=r"(sctlr));
+    sctlr |= (1UL << 0);    /* M — MMU enable    */
+    sctlr |= (1UL << 12);   /* I — I-cache enable (D-cache C stays OFF) */
+    __asm__ volatile ("msr sctlr_el1, %0\n isb\n" :: "r"(sctlr) : "memory");
+}
+
 /* ====================================================================
  *  Stage 3: map an arbitrary virtual address to a chosen physical page
  *  and demonstrate that translation works.

@@ -16,6 +16,7 @@
 #include "genet.h"
 #include "actor.h"
 #include "cc.h"
+#include "smp.h"
 
 /* On-device LLM (llm/llm.c): generate text into `out`, return token count. */
 extern int llm_run(const char *prompt, int max_new, char *out, int outcap, int echo);
@@ -534,6 +535,35 @@ static int find_header_end(const char *s)
 
 static int lc(char c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
 
+/* ---- SMP benchmark kernel: count primes in [lo,hi) by trial division.
+ * Pure integer compute (mul/mod in registers) so it scales with CPU cores,
+ * not memory bandwidth (the D-cache is off — see mmu.c).  Matches the
+ * smp_range_fn signature so smp_parallel_sum can split it across cores. */
+static long bench_count_primes(long lo, long hi, int core)
+{
+    (void)core;
+    if (lo < 2) lo = 2;
+    long cnt = 0;
+    for (long n = lo; n < hi; n++) {
+        int prime = 1;
+        for (long d = 2; d * d <= n; d++) {
+            if (n % d == 0) { prime = 0; break; }
+        }
+        cnt += prime;
+    }
+    return cnt;
+}
+
+/* Free-running counter in milliseconds (CNTPCT_EL0 / CNTFRQ_EL0 * 1000). */
+static unsigned long now_ms(void)
+{
+    unsigned long ct, hz;
+    __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(ct));
+    __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz));
+    if (!hz) return 0;
+    return (ct * 1000UL) / hz;
+}
+
 /* Value of the Content-Length header (case-insensitive), or -1. */
 static int content_length(const char *s)
 {
@@ -693,6 +723,35 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, " cntp_ctl=");  bl = s_putdec(body, bl, (long)ctl);   /* bit0=EN bit1=IMASK bit2=ISTATUS */
         bl = s_put(body, bl, " daif=");      bl = s_putdec(body, bl, (long)((daif >> 6) & 0xf));
         bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "GET /smp-bench") || starts_with(req, "POST /smp-bench")) {
+        /* SMP benchmark: count primes in [0,n) on 1 core, then on all online
+         * cores, and report wall-clock times + speedup.  The two counts MUST
+         * match (correctness check).  Query: ?n=<upper bound> (default 300000).
+         *   curl 'http://192.168.3.100/smp-bench?n=300000' */
+        ctype = "text/plain";
+        long n = (long)q_int(req, "n", 300000);
+        if (n < 1) n = 1;
+        int online = smp_cores_online();
+
+        unsigned long t0 = now_ms();
+        long c1 = smp_parallel_sum(bench_count_primes, n, 1);
+        unsigned long t1 = now_ms();
+        long cN = smp_parallel_sum(bench_count_primes, n, online);
+        unsigned long t2 = now_ms();
+
+        unsigned long ms1 = t1 - t0;
+        unsigned long msN = t2 - t1;
+        bl = s_put(body, bl, "SMP prime-count benchmark\n");
+        bl = s_put(body, bl, "cores_online = "); bl = s_putdec(body, bl, (long)online); bl = s_put(body, bl, "\n");
+        bl = s_put(body, bl, "n            = "); bl = s_putdec(body, bl, n); bl = s_put(body, bl, "\n");
+        bl = s_put(body, bl, "primes       = "); bl = s_putdec(body, bl, c1);
+        bl = s_put(body, bl, (c1 == cN) ? " (match)\n" : " MISMATCH!\n");
+        bl = s_put(body, bl, "1-core   ms  = "); bl = s_putdec(body, bl, (long)ms1); bl = s_put(body, bl, "\n");
+        bl = s_put(body, bl, "N-core   ms  = "); bl = s_putdec(body, bl, (long)msN); bl = s_put(body, bl, "\n");
+        /* speedup x100 (integer) = ms1*100/msN */
+        bl = s_put(body, bl, "speedup x100 = ");
+        bl = s_putdec(body, bl, msN ? (long)((ms1 * 100UL) / msN) : 0);
+        bl = s_put(body, bl, "  (e.g. 385 = 3.85x)\n");
     } else if (starts_with(req, "GET /preempt") || starts_with(req, "POST /preempt")) {
         /* Demo: 2 CPU-bound procs time-sliced by the timer.  Cooperative ->
          * "AAAA...BBBB"; preemptive -> interleaved "ABABAB...". */
