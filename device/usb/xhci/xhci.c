@@ -1272,10 +1272,15 @@ void xhci_mouse_pump(void)
                 unsigned btn=b[0]; int dx=(int)(signed char)b[1]; int dy=(int)(signed char)b[2];
                 for (int i=0;i<4 && i<8;i++) x_hid_buf[x_mouse_slot][i]=b[i];
                 x_mouse_reports++;
+                int chg=((int)btn!=(int)x_mouse_prev_btn);
                 { extern int basic_is_running(void);
                   if ((btn&7) && !(x_mouse_prev_btn&7) && basic_is_running()) x_ctrl_c_pending=1; }
                 x_mouse_prev_btn = btn;
-                if (dx||dy||btn) xhci_mouse_event(btn,dx,dy);
+                /* Deliver on motion, any button held, OR a button-state CHANGE —
+                 * so a button RELEASE (btn 0, no motion) reaches xhci_mouse_event
+                 * and main.c's right/left edge detectors reset (else the context
+                 * menu only opens on the first right-click). */
+                if (dx||dy||btn||chg) xhci_mouse_event(btn,dx,dy);
             }
         }
         if (x_kbd_slot>=0) {
@@ -1315,6 +1320,7 @@ void xhci_mouse_pump(void)
             unsigned char *b=x_hid_buf[x_mouse_slot];
             unsigned btn=b[0]; int dx=(int)(signed char)b[1]; int dy=(int)(signed char)b[2];
             x_mouse_reports++;
+            int chg=((int)btn!=(int)x_mouse_prev_btn);
             /* No working keyboard on this Pi4 (kbd_reports stays 0), so a mouse
              * button is the only way to break an infinite program (e.g. koch).
              * Break on a button-press EDGE while a program runs — never on the
@@ -1323,7 +1329,10 @@ void xhci_mouse_pump(void)
             { extern int basic_is_running(void);
               if ((btn&7) && !(x_mouse_prev_btn&7) && basic_is_running()) x_ctrl_c_pending=1; }
             x_mouse_prev_btn = btn;
-            if (dx||dy||btn) xhci_mouse_event(btn,dx,dy);
+            /* Deliver on motion, any button held, OR a button-state CHANGE so a
+             * release (btn 0, no motion) reaches main.c and the right/left click
+             * edge detectors reset (else the menu only opens once). */
+            if (dx||dy||btn||chg) xhci_mouse_event(btn,dx,dy);
             x_hid_arm(x_mouse_slot, x_mouse_dci);
         } else if (eslot==x_kbd_slot && edci==x_kbd_dci){
             unsigned char *b=x_hid_buf[x_kbd_slot];

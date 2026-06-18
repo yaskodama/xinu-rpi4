@@ -22,6 +22,13 @@
 #define EMMC_DATA          (*(volatile unsigned int *)(SD_BASE + 0x20))
 #define EMMC_STATUS        (*(volatile unsigned int *)(SD_BASE + 0x24))
 #define EMMC_INTERRUPT     (*(volatile unsigned int *)(SD_BASE + 0x30))
+#define EMMC_IRPT_MASK     (*(volatile unsigned int *)(SD_BASE + 0x34))  /* status-latch enable */
+#define EMMC_IRPT_EN       (*(volatile unsigned int *)(SD_BASE + 0x38))  /* IRQ-signal enable   */
+
+/* STATUS register inhibit bits: a command must not be issued while either
+ * the command or data lines are still busy with a prior transaction. */
+#define STATUS_CMD_INHIBIT (1u << 0)
+#define STATUS_DAT_INHIBIT (1u << 1)
 
 /* CMDTM bit fields per SDHCI spec.
  *   bits 24-31 = command index
@@ -58,8 +65,30 @@ static int wait_intr(unsigned int flag)
     return -1;
 }
 
+/* Wait until the controller will accept a new command — both the CMD and DAT
+ * lines must be idle (inhibit bits clear).  Skipping this is the classic
+ * intermittent-read bug: CMD17 issued while the previous transfer still holds
+ * the bus is silently dropped and the read times out. */
+static int wait_ready(void)
+{
+    for (unsigned long t = 0; t < POLL_LIMIT; t++)
+        if (!(EMMC_STATUS & (STATUS_CMD_INHIBIT | STATUS_DAT_INHIBIT)))
+            return 0;
+    return -1;
+}
+
 int sd_init(void)
 {
+    /* The firmware left EMMC2 clocked and the card selected with block
+     * addressing (it just read kernel8.img off it).  We only need to make
+     * the controller's interrupt-status bits actually LATCH: without
+     * IRPT_MASK enabling them, the INTERRUPT register never sets CMD_DONE /
+     * READ_RDY and every wait_intr() times out.  Leave the IRQ *signal*
+     * (IRPT_EN) off — we poll, we don't take SD interrupts. */
+    EMMC_IRPT_MASK = 0xFFFFFFFFu;
+    EMMC_IRPT_EN   = 0u;
+    EMMC_INTERRUPT = 0xFFFFFFFFu;   /* clear any stale status */
+
     /* Sanity check: try reading LBA 0.  If that comes back with the
      * usual MBR signature (0x55 0xAA at offset 510) we're good. */
     unsigned char block[SD_BLOCK_SIZE];
@@ -70,6 +99,9 @@ int sd_init(void)
 
 int sd_read_block(unsigned long lba, void *buf)
 {
+    /* Don't issue CMD17 until the bus is idle. */
+    if (wait_ready() != 0) return -1;
+
     /* Clear any stale interrupt status from the previous transaction. */
     EMMC_INTERRUPT = 0xFFFFFFFFu;
 

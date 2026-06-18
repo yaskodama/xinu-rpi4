@@ -114,6 +114,7 @@ static void draw_cursor(void)
 extern void video_vis_save(int, int, int, int, unsigned int *);
 extern void video_vis_restore(int, int, int, int, const unsigned int *);
 extern void video_vis_pixel(int, int, unsigned int);
+extern void video_back_save(int, int, int, int, unsigned int *);
 extern void xhci_mouse_pump(void);     /* cheap event-ring drain -> cursor_x/y */
 #define WM_CURSOR_STEP_MS 2
 static unsigned int cur_bak[12*12];
@@ -357,12 +358,79 @@ static void wm_raise(window_t *w)
     t->next = w; w->next = 0;
 }
 
+/* ---- right-click context menu -------------------------------------------
+ * Opened by a right-button press (wm_menu_open(), called from xhci_mouse_event);
+ * the next left press selects the item under the cursor, or closes the menu if
+ * the press lands outside it.  Drawn each frame by wm_run() while open.  All
+ * coords are desktop-space (same as windows). */
+#define WM_MENU_ITEM_H 18
+#define WM_MENU_W      140
+static int menu_open, menu_x, menu_y;
+
+static void menu_action_shell(void)
+{
+    extern void shellwin_new(void);          /* create/raise an on-demand shell window */
+    shellwin_new();
+}
+static const struct { const char *label; void (*action)(void); } wm_menu_items[] = {
+    { "New Shell window", menu_action_shell },
+};
+#define WM_MENU_N ((int)(sizeof(wm_menu_items) / sizeof(wm_menu_items[0])))
+
+void wm_menu_open(int sx, int sy)
+{
+    menu_x = sx + vp_x;
+    menu_y = sy + vp_y;
+    if (menu_x + WM_MENU_W > WM_DESKTOP_W) menu_x = WM_DESKTOP_W - WM_MENU_W;
+    if (menu_y + WM_MENU_N * WM_MENU_ITEM_H + 2 > WM_DESKTOP_H)
+        menu_y = WM_DESKTOP_H - WM_MENU_N * WM_MENU_ITEM_H - 2;
+    if (menu_x < 0) menu_x = 0;
+    if (menu_y < 0) menu_y = 0;
+    menu_open = 1;
+}
+
+static void wm_menu_draw(void)
+{
+    int h = WM_MENU_N * WM_MENU_ITEM_H + 2;
+    fill_rect(menu_x, menu_y, WM_MENU_W, h, 0xFF202830U);
+    draw_rect(menu_x, menu_y, WM_MENU_W, h, 0xFFFFD23CU);   /* amber border */
+    for (int i = 0; i < WM_MENU_N; i++) {
+        int iy = menu_y + 1 + i * WM_MENU_ITEM_H;
+        draw_string_at(menu_x + 6, iy + 5, wm_menu_items[i].label, 0xFFFFFFFFU, 0xFF202830U);
+    }
+}
+
+/* Add `w` to the desktop if it isn't there yet, then focus + raise it.  Used
+ * by the context menu to pop up a window on demand. */
+void wm_show(window_t *w)
+{
+    for (window_t *t = wm_head; t; t = t->next)
+        if (t == w) { active_win = w; wm_raise(w); return; }
+    wm_add(w);
+    active_win = w;
+    wm_raise(w);
+}
+
 void wm_pointer(int sx, int sy, int left)
 {
     int dx = sx + vp_x, dy = sy + vp_y;         /* screen -> desktop */
     static int prev_left;                        /* for press-edge detection */
     int press_edge = (left && !prev_left);
     prev_left = left;
+    /* When the context menu is open, a left press is consumed by it: pick the
+     * item under the cursor, or just dismiss the menu if the press is outside. */
+    if (menu_open) {
+        if (press_edge) {
+            int idx = -1;
+            if (dx >= menu_x && dx < menu_x + WM_MENU_W &&
+                dy >= menu_y && dy < menu_y + WM_MENU_N * WM_MENU_ITEM_H)
+                idx = (dy - menu_y) / WM_MENU_ITEM_H;
+            menu_open = 0;
+            if (idx >= 0 && idx < WM_MENU_N && wm_menu_items[idx].action)
+                wm_menu_items[idx].action();
+        }
+        return;
+    }
     if (left) {
         if (!drag_win) {
             window_t *w = window_at_resize(dx, dy);     /* corner first (it's inside the window) */
@@ -473,9 +541,22 @@ void wm_run(void)
             }
         }
 
-        video_present();   /* flip the finished off-screen frame to HDMI (no cursor) */
-        cur_bak_valid = 0; /* the flip overwrote the visible buffer */
-        cursor_vis_show(); /* draw the cursor straight on the visible buffer */
+        if (menu_open) wm_menu_draw();     /* context menu on top of the windows */
+
+        /* Composite the cursor INTO the finished backbuffer *before* the flip
+         * so the pointer arrives in the same atomic present as the scene.  The
+         * old "present (wipes cursor) then redraw on the visible buffer" made
+         * the cursor vanish for the duration of every present → a ~20 Hz blink.
+         * First grab the cursor-free pixels under the pointer from the
+         * backbuffer so the fast sub-loop below can still move it smoothly via
+         * the visible-buffer backing store. */
+        cur_bak_valid = 0;
+        if (cursor_visible) {
+            video_back_save(cursor_x, cursor_y, 12, 12, cur_bak);
+            cur_bak_x = cursor_x; cur_bak_y = cursor_y; cur_bak_valid = 1;
+            draw_cursor();         /* stamp into the backbuffer */
+        }
+        video_present();   /* atomic flip: scene + cursor together (no blink) */
 
         /* Fast cursor sub-loop for the rest of the frame interval: pump the
          * mouse and move ONLY the cursor (backing store) at ~330 Hz, so the

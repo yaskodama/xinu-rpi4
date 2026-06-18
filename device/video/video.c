@@ -254,6 +254,21 @@ void video_vis_pixel(int x, int y, unsigned int color)
     ((volatile unsigned int *)(fb_base + y*fb_pitch))[x] = color;
 }
 
+/* Save a screen-coord region from the OFF-SCREEN backbuffer (the finished but
+ * not-yet-flipped frame).  Used to grab the cursor-free pixels under the mouse
+ * just before the cursor is composited into the backbuffer, so the flip is
+ * atomic (no blink) yet the visible-buffer backing store still has clean
+ * background to restore when the pointer next moves.  Falls back to the visible
+ * buffer when no backbuffer is active. */
+void video_back_save(int x, int y, int w, int h, unsigned int *buf)
+{
+    volatile unsigned char *src = fb_draw ? fb_draw : fb_base;
+    for (int j = 0; j < h; j++) { int py = y + j;
+        for (int i = 0; i < w; i++) { int px = x + i;
+            buf[j*w + i] = (px < 0 || py < 0 || px >= (int)fb_width || py >= (int)fb_height)
+                         ? 0u : ((volatile unsigned int *)(src + py*fb_pitch))[px]; } }
+}
+
 /* Viewport offset: subtracted from every virtual-coord input
  * before it touches the framebuffer.  All primitives also clip
  * to [0, fb_width) × [0, fb_height) so off-screen geometry

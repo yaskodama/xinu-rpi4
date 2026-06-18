@@ -85,12 +85,17 @@ void uart_init(void)
         v &= ~((7u << 12) | (7u << 15));   /* clear FSEL14, FSEL15        */
         v |=  ((4u << 12) | (4u << 15));   /* ALT0 (0b100) = TXD0/RXD0    */
         *gpfsel1 = v;
-        /* Pull-none on 14/15 (BCM2711 PUP_PDN_CNTRL_REG0: 2 bits each,
-         * GPIO14 = bits 29:28, GPIO15 = bits 31:30). */
+        /* BCM2711 PUP_PDN_CNTRL_REG0: 2 bits each (00=none,01=up,10=down),
+         * GPIO14 = bits 29:28, GPIO15 = bits 31:30.  TXD (14) stays pull-none;
+         * RXD (15) gets a PULL-UP so a disconnected / floating serial RX idles
+         * HIGH.  Without it the floating line produces phantom start bits →
+         * framing-error "garbage" bytes that the shell drains as keystrokes
+         * (Pi 4's serial RX is unreliable / often unwired). */
         volatile unsigned int *pud0 =
             (volatile unsigned int *)(GPIO_BASE + 0xE4);
         unsigned int p = *pud0;
         p &= ~((3u << 28) | (3u << 30));
+        p |=  (1u << 30);                  /* GPIO15 (RXD) = pull-up (01) */
         *pud0 = p;
         __asm__ volatile ("dsb sy" ::: "memory");
     }
@@ -224,10 +229,18 @@ char uart_getc(void)
 
 int uart_poll_char(void)
 {
-    if (UART_FR & FR_RXFE) return -1;
-    unsigned char c = (unsigned char)(UART_DR & 0xFF);
-    uart_rx_note(c);
-    return (int)c;
+    /* Drain, dropping any byte the PL011 flagged with a framing or break
+     * error (DR bit 8 = FE, bit 10 = BE).  A floating / disconnected RX line
+     * produces exactly these — discarding them stops phantom keystrokes from
+     * reaching the shell while still passing clean bytes from a real cable. */
+    while (!(UART_FR & FR_RXFE)) {
+        unsigned int dr = UART_DR;
+        if (dr & ((1u << 8) | (1u << 10))) continue;   /* FE/BE -> noise, skip */
+        unsigned char c = (unsigned char)(dr & 0xFF);
+        uart_rx_note(c);
+        return (int)c;
+    }
+    return -1;
 }
 
 /* Format a one-line snapshot of the RX hardware + drain state for the

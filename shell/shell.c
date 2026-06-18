@@ -161,6 +161,17 @@ static int cmd_hello(int argc, char **argv)
     return 0;
 }
 
+static int cmd_clear(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    /* ANSI erase-screen + home, so a connected serial terminal clears too. */
+    uart_puts("\033[2J\033[H");
+    /* Wipe the on-screen shell window's scrollback ring (HDMI). */
+    extern void shellwin_clear_current(void);
+    shellwin_clear_current();
+    return 0;
+}
+
 static int cmd_mem(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -816,6 +827,7 @@ static const struct centry commandtab[] = {
     { "preempt","preempt — demo timer-driven preemptive RR",  cmd_preempt },
     { "echo",   "echo the remaining words back",           cmd_echo   },
     { "hello",  "smoke marker — say hello",                cmd_hello  },
+    { "clear",  "clear the screen",                        cmd_clear  },
     { "mem",    "show __bss_start / __bss_end / _end",     cmd_mem    },
     { "peek",   "peek <hex_addr> — read 32-bit MMIO word", cmd_peek   },
     { "uptime", "raw CNTPCT_EL0 (generic timer)",          cmd_uptime },

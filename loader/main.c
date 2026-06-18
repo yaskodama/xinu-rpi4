@@ -303,8 +303,11 @@ void xhci_keyboard_event(char c)
     extern window_t *wm_active(void);
     extern window_t  basic_win;
     extern void      basicwin_handle_key(char);
-    if (wm_active() == &basic_win) basicwin_handle_key(c);
-    else                           shellwin_handle_key(c);
+    extern int       shellwin_route_key(window_t *, char);
+    window_t *aw = wm_active();
+    if      (aw == &basic_win)            basicwin_handle_key(c);
+    else if (shellwin_route_key(aw, c))   ;                /* on-demand Shell 2/3 */
+    else                                  shellwin_handle_key(c);  /* Shell 1 (default) */
 }
 
 static int  g_cursor_x = 320;
@@ -328,7 +331,13 @@ void xhci_mouse_event(unsigned nButtons, int dx, int dy)
     extern int basic_is_running(void);
     if (!basic_is_running()) {
         extern void wm_pointer(int, int, int);        /* left-drag a title bar -> move window */
+        extern void wm_menu_open(int, int);           /* right-click context menu */
         wm_pointer(g_cursor_x, g_cursor_y, (int)(nButtons & 1));
+        /* Right-button press edge pops up the context menu at the cursor. */
+        static int prev_right;
+        int right = (int)(nButtons & 2);
+        if (right && !prev_right) wm_menu_open(g_cursor_x, g_cursor_y);
+        prev_right = right;
     }
 }
 
@@ -751,25 +760,40 @@ static void sd_visit(const char *name, int is_dir, unsigned long size,
     }
 }
 
-/* Mount real SD-card FAT32 partition under /sd/.  No-op (graceful
- * fallback) if the controller fails to init or the partition isn't
- * FAT32; that lets the QEMU / Pi 4 builds compile and run identically
- * to before. */
+/* Mount the on-board microSD card's FAT32 partition under /microsd/ (this is
+ * the card the firmware booted kernel8.img from, on EMMC2).  Also create an
+ * empty /sd mount point reserved for a USB-attached SD card — there is no USB
+ * mass-storage driver yet (xHCI does HID only), so /sd stays empty until one
+ * is written.  No-op (graceful fallback) if the controller fails to init or
+ * the partition isn't FAT32, so the QEMU build still runs. */
 static void vfs_mount_sd(void)
 {
-    vfs_node_t *sd = vfs_mkdir(vfs_root(), "sd");
-    if (sd == 0) return;
+    /* /sd — reserved for a USB-attached SD card (no USB MSD driver yet). */
+    vfs_node_t *usbsd = vfs_mkdir(vfs_root(), "sd");
+    if (usbsd == 0) uart_puts("sd: /sd mkdir failed\n");
+    else            uart_puts("sd: /sd reserved for USB storage (no USB MSD driver yet — empty)\n");
 
-    if (sd_init() != 0) return;
+    /* /microsd — the on-board EMMC2 microSD card. */
+    vfs_node_t *msd = vfs_mkdir(vfs_root(), "microsd");
+    if (msd == 0) { uart_puts("microsd: /microsd mkdir failed\n"); return; }
+
+    if (sd_init() != 0) {
+        uart_puts("microsd: EMMC2 init failed (no card / read error) — /microsd empty\n");
+        return;
+    }
 
     fat32_t fs;
-    if (fat32_mount(&fs) != 0) return;
+    if (fat32_mount(&fs) != 0) {
+        uart_puts("microsd: partition is not FAT32 (or no MBR) — /microsd empty\n");
+        return;
+    }
 
     struct sd_walk_ctx ctx = {0};
     ctx.fs           = &fs;
-    ctx.parent[0]    = sd;
+    ctx.parent[0]    = msd;
     ctx.remaining[0] = SD_MAX_DIR_ENTRIES;
     fat32_walk_dir(&fs, fs.root_cluster, 0, sd_visit, &ctx);
+    uart_puts("microsd: FAT32 mounted under /microsd\n");
 }
 
 /* ---- VFS demo: populate a small tree at boot ------------------- */
@@ -1530,10 +1554,11 @@ void kernel_main(void)
          * pans.  USPi (later) will drive it from mouse reports. */
         wm_cursor_set((int)sw / 2, (int)sh / 2, 1);
 
-        /* Initial serial-shell prompt: shellwin_handle_key() only re-prints
-         * xinu-pi4$ after each command, so without this the serial (screen)
-         * user sees no prompt at boot and thinks the shell never came up. */
-        uart_puts("\nxinu-pi4$ ");
+        /* The shell window renders its prompt as a dedicated live bottom line
+         * (see shellwin_draw), so we must NOT tee a "xinu-pi4$ " into the
+         * scrollback ring here — that would leave a stale duplicate prompt
+         * above the live one.  Just emit a newline to the serial log. */
+        uart_puts("\n");
         wm_run();   /* never returns */
     }
 
