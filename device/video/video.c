@@ -295,8 +295,10 @@ void fill_rect(int x, int y, int w, int h, unsigned int color)
  */
 struct gfx_cmd { unsigned char type; int a, b, c, d; unsigned int color; };
 #define GFX_MAX 1024
-static struct gfx_cmd g_gfx[GFX_MAX];
+static struct gfx_cmd g_gfx[GFX_MAX];     /* actor canvas (Graphics window)   */
 static int g_gfx_n;
+static struct gfx_cmd g_bgfx[GFX_MAX];    /* BASIC canvas (BASIC window only) */
+static int g_bgfx_n;
 static const unsigned int gfx_palette[8] = {
     0xFF101010U,  /* 0 near-black */ 0xFFFF5050U, /* 1 red    */
     0xFF50FF50U,  /* 2 green      */ 0xFF5090FFU, /* 3 blue   */
@@ -352,21 +354,30 @@ static void gfx_ring(int cx, int cy, int r, unsigned int color,
     }
 }
 
-void gfx_clear(void) { g_gfx_n = 0; }
-
-void gfx_line(int x0, int y0, int x1, int y1, int color)
+/* shared list helpers — the actor (gfx_*) and BASIC (bgfx_*) canvases are
+ * independent command lists so each renders only in its own window. */
+static void gfx_push_line(struct gfx_cmd *list, int *n, int x0, int y0, int x1, int y1, int color)
 {
-    if (g_gfx_n >= GFX_MAX) return;
-    struct gfx_cmd *c = &g_gfx[g_gfx_n++];
+    if (*n >= GFX_MAX) return;
+    struct gfx_cmd *c = &list[(*n)++];
     c->type = 1; c->a = x0; c->b = y0; c->c = x1; c->d = y1; c->color = gfx_col(color);
 }
-
-void gfx_circle(int cx, int cy, int r, int color)
+static void gfx_push_circle(struct gfx_cmd *list, int *n, int cx, int cy, int r, int color)
 {
-    if (g_gfx_n >= GFX_MAX) return;
-    struct gfx_cmd *c = &g_gfx[g_gfx_n++];
+    if (*n >= GFX_MAX) return;
+    struct gfx_cmd *c = &list[(*n)++];
     c->type = 2; c->a = cx; c->b = cy; c->c = r; c->d = 0; c->color = gfx_col(color);
 }
+
+void gfx_clear(void) { g_gfx_n = 0; }
+void gfx_line(int x0, int y0, int x1, int y1, int color) { gfx_push_line(g_gfx, &g_gfx_n, x0, y0, x1, y1, color); }
+void gfx_circle(int cx, int cy, int r, int color)        { gfx_push_circle(g_gfx, &g_gfx_n, cx, cy, r, color); }
+
+/* BASIC graphics canvas — separate list so koch/hanoi/etc. draw only in the
+ * BASIC window and never bleed into the actor Graphics window. */
+void bgfx_clear(void) { g_bgfx_n = 0; }
+void bgfx_line(int x0, int y0, int x1, int y1, int color) { gfx_push_line(g_bgfx, &g_bgfx_n, x0, y0, x1, y1, color); }
+void bgfx_circle(int cx, int cy, int r, int color)        { gfx_push_circle(g_bgfx, &g_bgfx_n, cx, cy, r, color); }
 
 /* ---- 3D wireframe wine glass (a solid of revolution) -------------------
  * The bare-metal JIT has no libm, so a fixed-point sine table (sin*1024 for
@@ -442,17 +453,19 @@ void gfx_glass(int ax, int ay, int az)
 
 /* Replay the command list into a window content area at (ox,oy) of size w×h.
  * Command coordinates are relative to (ox,oy). */
-void gfx_render(int ox, int oy, int w, int h)
+static void gfx_render_list(const struct gfx_cmd *list, int n, int ox, int oy, int w, int h)
 {
     if (!fb_ready) return;
-    for (int i = 0; i < g_gfx_n; i++) {
-        struct gfx_cmd *c = &g_gfx[i];
+    for (int i = 0; i < n; i++) {
+        const struct gfx_cmd *c = &list[i];
         if (c->type == 1)
             gfx_seg(ox + c->a, oy + c->b, ox + c->c, oy + c->d, c->color, ox, oy, w, h);
         else if (c->type == 2)
             gfx_ring(ox + c->a, oy + c->b, c->c, c->color, ox, oy, w, h);
     }
 }
+void gfx_render(int ox, int oy, int w, int h)  { gfx_render_list(g_gfx,  g_gfx_n,  ox, oy, w, h); }
+void bgfx_render(int ox, int oy, int w, int h) { gfx_render_list(g_bgfx, g_bgfx_n, ox, oy, w, h); }
 
 void draw_rect(int x, int y, int w, int h, unsigned int color)
 {

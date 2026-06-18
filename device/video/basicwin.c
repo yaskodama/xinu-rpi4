@@ -118,7 +118,7 @@ static void bw_emit(const char *s) { while (*s) bw_putc(*s++); }
 static void bw_cls(int mode)
 {
     if (mode & 1) clear_all();
-    if (mode & 2) { gfx_clear(); gfx_on = 1; }
+    if (mode & 2) { bgfx_clear(); gfx_on = 1; }
     if (mode == 0) clear_all();          /* bare CLS == text clear */
 }
 
@@ -130,29 +130,39 @@ static void bw_present_gfx(void)
     int gx, gy, gw, gh;
     bw_gfx_rect(&basic_win, &gx, &gy, &gw, &gh);
     fill_rect(gx, gy, gw, gh, basic_win.content_bg);
-    gfx_render(gx, gy, gw, gh);
+    bgfx_render(gx, gy, gw, gh);
     video_present();
     wm_cursor_after_blit();   /* flip wiped the cursor — pump mouse + re-stamp */
 }
 
 static void bw_pause(int ms)
 {
+    extern void wm_cursor_delay_ms(int);
     if (gfx_on) bw_present_gfx();
     /* PAUSE/WAIT is the natural place to notice a Ctrl-C in a tight graphics
      * loop (guard-based polling is too coarse for WAIT loops). */
     if (xhci_poll_ctrl_c()) basic_break();
-    if (ms > 0) delay_ms((unsigned)ms);
+    /* Pump the cursor while waiting — a plain delay_ms() starves the HID
+     * interrupt EP and freezes the pointer for the whole WAIT (e.g. koch). */
+    if (ms > 0) wm_cursor_delay_ms(ms);
 }
 
 /* ---- graphics seams: BASIC LINE/CIRCLE/PLOT -> shared gfx_* display list.
  * Coords are window-local pixels; gfx_render() offsets them into the content
  * rect each frame.  Colours are BASIC palette indices (gfx uses idx & 7). */
 static void bw_line(int x1, int y1, int x2, int y2, int color)
-{ gfx_on = 1; gfx_line(x1, y1, x2, y2, color); }
+{
+    extern void wm_cursor_tick(void);
+    static int seg;
+    gfx_on = 1; bgfx_line(x1, y1, x2, y2, color);
+    /* A deep redraw (e.g. koch level 10 ~ 4^10 segments) runs with no WAIT, so
+     * pump the cursor every N segments to keep the pointer alive there too. */
+    if ((++seg & 63) == 0) wm_cursor_tick();
+}
 static void bw_circle(int cx, int cy, int r, int color)
-{ gfx_on = 1; gfx_circle(cx, cy, r, color); }
+{ gfx_on = 1; bgfx_circle(cx, cy, r, color); }
 static void bw_plot(int x, int y, int ch)
-{ (void)ch; gfx_on = 1; gfx_line(x, y, x, y, 7); }   /* 1px dot */
+{ (void)ch; gfx_on = 1; bgfx_line(x, y, x, y, 7); }   /* 1px dot */
 static int  bw_gfx_active(void) { return gfx_on; }
 
 /* Toolbar click: find the button under the local cursor, echo its command,
@@ -250,7 +260,7 @@ void basicwin_draw(window_t *self, unsigned int frame)
     if (gfx_on) {
         int gx, gy, gw, gh;
         bw_gfx_rect(self, &gx, &gy, &gw, &gh);
-        gfx_render(gx, gy, gw, gh);
+        bgfx_render(gx, gy, gw, gh);
     }
 }
 
@@ -292,7 +302,7 @@ static void do_enter(void)
     if (line[0]) {
         basic_exec_line(line);
     } else if (gfx_on) {
-        gfx_on = 0; gfx_clear();   /* Enter on an empty line dismisses graphics */
+        gfx_on = 0; bgfx_clear();  /* Enter on an empty line dismisses graphics */
     }
 }
 

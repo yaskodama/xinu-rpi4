@@ -1052,6 +1052,16 @@ static int             x_int_idx[XMAXSLOT], x_int_cyc[XMAXSLOT];
 static unsigned char   x_hid_buf[XMAXSLOT][8]   __attribute__((aligned(64)));
 static int x_mouse_slot=-1, x_mouse_dci, x_mouse_iface, x_kbd_slot=-1, x_kbd_dci, x_kbd_iface;
 static unsigned char x_kbd_prev[8];
+static unsigned x_mouse_prev_btn;   /* prev mouse button bits, for break edge-detect */
+
+/* Keyboard auto-repeat.  A HID boot keyboard reports only on key state change,
+ * so a held key arrives once; we synthesise repeats on the periodic pump.
+ * Timebase = timer_ticks() at TIMER_HZ=100 (1 tick = 10 ms). */
+#define KBD_RPT_DELAY 40            /* 400 ms before the first auto-repeat */
+#define KBD_RPT_RATE   4            /*  40 ms between repeats (~25 cps)    */
+static unsigned      x_kbd_rk;             /* HID usage being repeated (0 = none) */
+static int           x_kbd_rk_shift, x_kbd_rk_ctrl;
+static unsigned long x_kbd_rk_next;        /* timer_ticks() value for next repeat */
 static unsigned long x_mouse_reports, x_kbd_reports;
 static volatile int  x_ctrl_c_pending; /* sticky: set when a report shows Ctrl+'c' */
 static int x_poll_mode = 0;   /* 0 = interrupt EP (drain event ring); 1 = EP0 GET_REPORT poll */
@@ -1213,6 +1223,23 @@ static void x_deliver_key(unsigned u, int shift, int ctrl)
     xhci_keyboard_event(c);
 }
 
+/* Arm keyboard auto-repeat for a freshly-pressed key (the most recent press
+ * wins, matching desktop behaviour). */
+static void x_kbd_rep_arm(unsigned u, int shift, int ctrl)
+{
+    extern unsigned long timer_ticks(void);
+    x_kbd_rk = u; x_kbd_rk_shift = shift; x_kbd_rk_ctrl = ctrl;
+    x_kbd_rk_next = timer_ticks() + KBD_RPT_DELAY;
+}
+
+/* Cancel auto-repeat once the repeating key is no longer held in report b[]. */
+static void x_kbd_rep_check(const unsigned char *b)
+{
+    if (!x_kbd_rk) return;
+    for (int i=2;i<8;i++) if (b[i]==x_kbd_rk) return;
+    x_kbd_rk = 0;
+}
+
 /* Called periodically (wm tick): drain the event ring, deliver HID reports. */
 static unsigned long x_pump_calls;
 void xhci_mouse_pump(void)
@@ -1222,6 +1249,18 @@ void xhci_mouse_pump(void)
     x_pump_calls++;
     if (!x_running) return;
     if (x_mouse_slot<0 && x_kbd_slot<0) return;
+
+    /* Keyboard auto-repeat: emit the held key again once its delay/interval has
+     * elapsed.  Runs every pump call (not just on a HID event) since a held key
+     * produces no further reports. */
+    if (x_kbd_rk) {
+        extern unsigned long timer_ticks(void);
+        unsigned long now = timer_ticks();
+        if ((long)(now - x_kbd_rk_next) >= 0) {
+            x_deliver_key(x_kbd_rk, x_kbd_rk_shift, x_kbd_rk_ctrl);
+            x_kbd_rk_next = now + KBD_RPT_RATE;
+        }
+    }
 
     if (x_poll_mode) {
         /* Control-pipe poll: the interrupt EP is silent (LS device, hub TT), but
@@ -1233,6 +1272,9 @@ void xhci_mouse_pump(void)
                 unsigned btn=b[0]; int dx=(int)(signed char)b[1]; int dy=(int)(signed char)b[2];
                 for (int i=0;i<4 && i<8;i++) x_hid_buf[x_mouse_slot][i]=b[i];
                 x_mouse_reports++;
+                { extern int basic_is_running(void);
+                  if ((btn&7) && !(x_mouse_prev_btn&7) && basic_is_running()) x_ctrl_c_pending=1; }
+                x_mouse_prev_btn = btn;
                 if (dx||dy||btn) xhci_mouse_event(btn,dx,dy);
             }
         }
@@ -1245,7 +1287,8 @@ void xhci_mouse_pump(void)
                 if (ctrl) for (int i=2;i<8;i++) if (b[i]==0x06) { x_ctrl_c_pending=1; break; }
                 for (int i=2;i<8;i++){ unsigned u=b[i]; if (!u) continue;
                     int held=0; for (int j=2;j<8;j++) if (x_kbd_prev[j]==u){held=1;break;}
-                    if (held) continue; x_deliver_key(u, shift, ctrl); }
+                    if (held) continue; x_deliver_key(u, shift, ctrl); x_kbd_rep_arm(u, shift, ctrl); }
+                x_kbd_rep_check(b);
                 for (int i=0;i<8;i++) x_kbd_prev[i]=b[i];
                 x_kbd_reports++;
             }
@@ -1272,6 +1315,14 @@ void xhci_mouse_pump(void)
             unsigned char *b=x_hid_buf[x_mouse_slot];
             unsigned btn=b[0]; int dx=(int)(signed char)b[1]; int dy=(int)(signed char)b[2];
             x_mouse_reports++;
+            /* No working keyboard on this Pi4 (kbd_reports stays 0), so a mouse
+             * button is the only way to break an infinite program (e.g. koch).
+             * Break on a button-press EDGE while a program runs — never on the
+             * level — so the click that LAUNCHED it (still held as the program
+             * starts) doesn't immediately break it (e.g. qsort's first WAIT). */
+            { extern int basic_is_running(void);
+              if ((btn&7) && !(x_mouse_prev_btn&7) && basic_is_running()) x_ctrl_c_pending=1; }
+            x_mouse_prev_btn = btn;
             if (dx||dy||btn) xhci_mouse_event(btn,dx,dy);
             x_hid_arm(x_mouse_slot, x_mouse_dci);
         } else if (eslot==x_kbd_slot && edci==x_kbd_dci){
@@ -1281,7 +1332,8 @@ void xhci_mouse_pump(void)
             if (ctrl) for (int i=2;i<8;i++) if (b[i]==0x06) { x_ctrl_c_pending=1; break; }
             for (int i=2;i<8;i++){ unsigned u=b[i]; if (!u) continue;
                 int held=0; for (int j=2;j<8;j++) if (x_kbd_prev[j]==u){held=1;break;}
-                if (held) continue; x_deliver_key(u, shift, ctrl); }
+                if (held) continue; x_deliver_key(u, shift, ctrl); x_kbd_rep_arm(u, shift, ctrl); }
+            x_kbd_rep_check(b);
             for (int i=0;i<8;i++) x_kbd_prev[i]=b[i];
             x_kbd_reports++;
             x_hid_arm(x_kbd_slot, x_kbd_dci);

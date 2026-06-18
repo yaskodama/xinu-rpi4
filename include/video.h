@@ -103,6 +103,14 @@ void gfx_circle(int cx, int cy, int r, int color);
 void gfx_glass(int ax, int ay, int az);
 void gfx_render(int ox, int oy, int w, int h);
 
+/* BASIC graphics canvas: a separate command list so the BASIC window's
+ * LINE/CIRCLE/PLOT (koch, hanoi, …) render only in the BASIC window and never
+ * appear in the actor Graphics window. */
+void bgfx_clear(void);
+void bgfx_line(int x0, int y0, int x1, int y1, int color);
+void bgfx_circle(int cx, int cy, int r, int color);
+void bgfx_render(int ox, int oy, int w, int h);
+
 /* Busy-wait based on the AArch64 generic timer (CNTPCT_EL0).
  * Used for animation pacing in wm_run(). */
 void delay_ms(unsigned int ms);

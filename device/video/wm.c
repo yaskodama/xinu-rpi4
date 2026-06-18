@@ -158,6 +158,35 @@ void wm_cursor_after_blit(void)
     cursor_vis_show();          /* stamp the cursor at its current position */
 }
 
+/* Pump the mouse once and move ONLY the cursor (cheap 12x12 backing-store
+ * update, no full-scene present) when it moved.  Shared by the wm idle loop
+ * and by a blocking BASIC graphics run. */
+void wm_cursor_tick(void)
+{
+    int px = cursor_x, py = cursor_y;
+    xhci_mouse_pump();
+    if (cursor_x != px || cursor_y != py) { cursor_vis_hide(); cursor_vis_show(); }
+}
+
+/* delay_ms(), but pump the cursor every WM_CURSOR_STEP_MS.  A single-threaded
+ * BASIC program blocks wm_run during PAUSE/WAIT; without this the HID interrupt
+ * EP runs out of armed TRBs (only 2 primed) between the ~100 ms pumps and most
+ * mouse motion is lost, so the pointer appears frozen (e.g. the koch sample).
+ * Slicing the wait keeps a transfer in flight and the cursor smooth. */
+void wm_cursor_delay_ms(int ms)
+{
+    int n = 0;
+    for (int t = 0; t < ms; t += WM_CURSOR_STEP_MS) {
+        delay_ms(WM_CURSOR_STEP_MS);
+        wm_cursor_tick();
+        /* The wm idle loop is blocked while a BASIC program runs, so yield to
+         * the net/HTTP/wifi procs here (~every 20 ms) — otherwise a long or
+         * infinite program (e.g. koch) wedges the whole box: no ping, no HTTP,
+         * no remote chainload, only a power-cycle recovers it. */
+        if ((++n % 10) == 0 && wm_tick) wm_tick();
+    }
+}
+
 /* The window the user last clicked (keyboard input is routed here). */
 window_t *wm_active(void) { return active_win; }
 
@@ -453,9 +482,7 @@ void wm_run(void)
          * pointer is smooth even though the full scene repaints at 20 fps. */
         for (int t = 0; t < 1000 / DEFAULT_FPS; t += WM_CURSOR_STEP_MS) {
             delay_ms(WM_CURSOR_STEP_MS);
-            int px = cursor_x, py = cursor_y;
-            xhci_mouse_pump();                      /* tight: drain HID -> cursor_x/y */
-            if (cursor_x != px || cursor_y != py) { cursor_vis_hide(); cursor_vis_show(); }
+            wm_cursor_tick();                       /* tight: drain HID -> cursor_x/y */
             /* let the net/shell/wifi procs run a few times per frame, not every
              * 2 ms (proc_yield in the tick otherwise throttles cursor polling). */
             if ((t % 10) == 0 && wm_tick) wm_tick();
