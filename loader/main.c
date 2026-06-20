@@ -919,6 +919,163 @@ void microsd_fwrite(const char *name, const char *text)
     }
 }
 
+/* ===== WiFi saved access points — persisted on /microsd/WIFI.CFG ============
+ * Format: one AP per line, "SSID\tPASSWORD\n" (tab-separated so an SSID may
+ * contain spaces; a line with no tab = an open network).  '#' begins a comment.
+ * Line order = priority: `wifi on` tries them top-to-bottom and stops at the
+ * first that joins + gets DHCP.  Kept ≤512 B (~12 APs) so the whole file fits a
+ * single FAT cluster (fat32_write_file overwrites in place — no leak on re-save).
+ * The on-board microSD must be mounted (it auto-mounts at boot). */
+#define WIFI_CFG_NAME "WIFI.CFG"
+#define WIFI_CFG_MAX  512
+
+static int wstreq(const char *a, const char *b)
+{ while (*a && *b) { if (*a != *b) return 0; a++; b++; } return *a == *b; }
+
+/* Load WIFI.CFG into `buf` (NUL-terminated).  Returns length, or -1 if absent. */
+static int wcfg_load(char *buf, int max)
+{
+    fat32_t fs;
+    if (fat32_mount(&fs) != 0) { buf[0] = 0; return -1; }
+    int n = fat32_read_file(&fs, WIFI_CFG_NAME, buf, (unsigned)(max - 1));
+    if (n < 0) { buf[0] = 0; return -1; }
+    buf[n] = 0;
+    return n;
+}
+
+static int wcfg_store(const char *buf, int len)
+{
+    fat32_t fs;
+    if (fat32_mount(&fs) != 0) return -1;
+    return fat32_write_file(&fs, WIFI_CFG_NAME, buf, (unsigned)len) == 0 ? 0 : -1;
+}
+
+/* Parse one config line at `p` into ssid/pass (NUL-terminated, bounded).  Sets
+ * *skip for blank/comment lines.  Returns the start of the next line. */
+static const char *wcfg_line(const char *p, char *ssid, int ssidmax,
+                             char *pass, int passmax, int *skip)
+{
+    *skip = 0;
+    const char *e = p; while (*e && *e != '\n' && *e != '\r') e++;
+    const char *eol = e; while (*eol == '\r' || *eol == '\n') eol++;   /* next line */
+    if (p == e || *p == '#') { *skip = 1; return eol; }
+    const char *tab = p; while (tab < e && *tab != '\t') tab++;
+    int i = 0;
+    for (const char *s = p; s < tab && i < ssidmax - 1; s++) ssid[i++] = *s;
+    ssid[i] = 0;
+    i = 0;
+    if (tab < e) for (const char *s = tab + 1; s < e && i < passmax - 1; s++) pass[i++] = *s;
+    pass[i] = 0;
+    if (ssid[0] == 0) *skip = 1;
+    return eol;
+}
+
+/* Save (or update the password of) one AP, preserving line order.  Highest
+ * priority is whatever already sits earliest; a brand-new AP appends last. */
+int wifi_cfg_save_ap(const char *ssid, const char *pass)
+{
+    static char buf[WIFI_CFG_MAX], out[WIFI_CFG_MAX];
+    int max = (int)sizeof out;
+    wcfg_load(buf, sizeof buf);                       /* buf="" if none */
+    int o = 0, replaced = 0;
+    const char *p = buf; char es[33], ep[64]; int skip;
+    while (*p) {
+        const char *line = p;
+        const char *next = wcfg_line(p, es, sizeof es, ep, sizeof ep, &skip);
+        if (!skip && wstreq(es, ssid)) {              /* update in place */
+            for (const char *s = ssid; *s && o < max - 1; s++) out[o++] = *s;
+            if (o < max - 1) out[o++] = '\t';
+            for (const char *s = pass; *s && o < max - 1; s++) out[o++] = *s;
+            if (o < max - 1) out[o++] = '\n';
+            replaced = 1;
+        } else {                                      /* copy verbatim */
+            for (const char *s = line; s < next && o < max - 1; s++) out[o++] = *s;
+        }
+        p = next;
+    }
+    if (!replaced) {                                  /* append new AP */
+        if (o > 0 && out[o-1] != '\n' && o < max - 1) out[o++] = '\n';
+        for (const char *s = ssid; *s && o < max - 1; s++) out[o++] = *s;
+        if (o < max - 1) out[o++] = '\t';
+        for (const char *s = pass; *s && o < max - 1; s++) out[o++] = *s;
+        if (o < max - 1) out[o++] = '\n';
+    }
+    out[o] = 0;
+    if (wcfg_store(out, o) != 0) { uart_puts("wifi save: /microsd write FAILED (card mounted?)\n"); return -1; }
+    uart_puts("wifi save: stored '"); uart_puts(ssid);
+    uart_puts(replaced ? "' (updated) to /microsd/WIFI.CFG\n" : "' to /microsd/WIFI.CFG\n");
+    return 0;
+}
+
+/* Remove a saved AP. */
+int wifi_cfg_forget(const char *ssid)
+{
+    static char buf[WIFI_CFG_MAX], out[WIFI_CFG_MAX];
+    int max = (int)sizeof out;
+    if (wcfg_load(buf, sizeof buf) < 0) { uart_puts("wifi forget: no saved APs\n"); return -1; }
+    int o = 0, removed = 0;
+    const char *p = buf; char es[33], ep[64]; int skip;
+    while (*p) {
+        const char *line = p;
+        const char *next = wcfg_line(p, es, sizeof es, ep, sizeof ep, &skip);
+        if (!skip && wstreq(es, ssid)) removed = 1;   /* drop it */
+        else for (const char *s = line; s < next && o < max - 1; s++) out[o++] = *s;
+        p = next;
+    }
+    out[o] = 0;
+    if (!removed) { uart_puts("wifi forget: '"); uart_puts(ssid); uart_puts("' not found\n"); return -1; }
+    if (wcfg_store(out, o) != 0) { uart_puts("wifi forget: /microsd write FAILED\n"); return -1; }
+    uart_puts("wifi forget: removed '"); uart_puts(ssid); uart_puts("'\n");
+    return 0;
+}
+
+/* List saved APs (SSIDs + whether secured). */
+void wifi_cfg_list(void)
+{
+    static char buf[WIFI_CFG_MAX];
+    if (wcfg_load(buf, sizeof buf) <= 0) { uart_puts("wifi aps: none saved (use `wifi save <ssid> <pass>`)\n"); return; }
+    uart_puts("saved APs (priority order):\n");
+    const char *p = buf; char ssid[33], pass[64]; int skip, idx = 0;
+    while (*p) {
+        const char *next = wcfg_line(p, ssid, sizeof ssid, pass, sizeof pass, &skip);
+        p = next;
+        if (skip) continue;
+        char num[4] = { (char)('1' + idx), '.', ' ', 0 };
+        if (idx < 9) uart_puts(num); else uart_puts("   ");
+        uart_puts(ssid);
+        uart_puts(pass[0] ? "  [WPA2]\n" : "  [open]\n");
+        idx++;
+    }
+    if (idx == 0) uart_puts("  (none)\n");
+}
+
+/* `wifi on`: bring the radio up (lazily, via wifi_join_run) and try each saved
+ * AP in priority order until one joins and gets a DHCP lease. */
+int wifi_on(void)
+{
+    extern int wifi_join_run(const char *ssid, const char *pass);
+    extern int wifi_dhcp(void);
+    static char buf[WIFI_CFG_MAX];
+    if (wcfg_load(buf, sizeof buf) <= 0) {
+        uart_puts("wifi on: no saved APs — add one with `wifi save <ssid> <pass>`\n");
+        return -1;
+    }
+    const char *p = buf; char ssid[33], pass[64]; int skip;
+    while (*p) {
+        const char *next = wcfg_line(p, ssid, sizeof ssid, pass, sizeof pass, &skip);
+        p = next;
+        if (skip) continue;
+        uart_puts("wifi on: trying '"); uart_puts(ssid); uart_puts("'...\n");
+        if (wifi_join_run(ssid, pass) == 0 && wifi_dhcp() == 0) {
+            uart_puts("wifi on: CONNECTED to '"); uart_puts(ssid); uart_puts("' (DHCP ok)\n");
+            return 0;
+        }
+        uart_puts("wifi on: '"); uart_puts(ssid); uart_puts("' unavailable, trying next\n");
+    }
+    uart_puts("wifi on: no saved AP could be joined (out of range? wrong password?)\n");
+    return -1;
+}
+
 /* ================= /sd — USB mass-storage (thumb drive / SSD) =================
  * Same FAT32 reader/writer as /microsd, but bound to the USB Mass Storage block
  * device (usbmsd.c over the VL805 xHCI bulk endpoints) instead of the EMMC2.

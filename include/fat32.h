@@ -79,4 +79,14 @@ int fat32_find_free_lba(fat32_t *fs, unsigned long *lba);
  * Returns 0 ok, -1 I/O, -2 too big (>1 cluster), -3 no free cluster, -4 dir full. */
 int fat32_create_file(fat32_t *fs, const char *name, const void *data, unsigned int len);
 
+/* Read up to `max` bytes of the root-dir file `name` (8.3, first cluster only)
+ * into `out`.  Returns the byte count read, or -1 if not found / I/O error. */
+int fat32_read_file(fat32_t *fs, const char *name, void *out, unsigned int max);
+
+/* Create OR overwrite a single-cluster root-dir file `name` with `len` bytes.
+ * If it exists, its first cluster is rewritten in place and the dir-entry size
+ * updated (no leak); else like fat32_create_file.  Returns 0 ok, -1 I/O, -2 too
+ * big (>1 cluster), -3 no free cluster, -4 dir full. */
+int fat32_write_file(fat32_t *fs, const char *name, const void *data, unsigned int len);
+
 #endif /* XINU_RPI4_FAT32_H */

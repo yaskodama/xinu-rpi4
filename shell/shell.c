@@ -778,8 +778,22 @@ static int cmd_wifi(int argc, char **argv)
     extern int wifi_netboot(const unsigned char *srv, const char *fname);
     extern int wifi_adhoc(const char *ssid, int channel, int n);
     extern int wifi_aodv(const unsigned char *dst);
-    if (argc < 2) { uart_puts("usage: wifi ...|adhoc <ssid> <ch> <n>|aodv <ip>\n"); return 0; }
-    if (str_eq(argv[1], "probe"))      wifi_probe();
+    extern int  wifi_on(void);
+    extern int  wifi_cfg_save_ap(const char *ssid, const char *pass);
+    extern int  wifi_cfg_forget(const char *ssid);
+    extern void wifi_cfg_list(void);
+    if (argc < 2) { uart_puts("usage: wifi on|aps|save <ssid> <pass>|forget <ssid>|scan|up <ssid> <pass>|off|...\n"); return 0; }
+    if (str_eq(argv[1], "on"))         wifi_on();      /* join a saved AP (SD) */
+    else if (str_eq(argv[1], "aps"))   wifi_cfg_list();
+    else if (str_eq(argv[1], "save")) {                /* save AP to /microsd  */
+        if (argc < 3) { uart_puts("usage: wifi save <ssid> [pass]   (omit pass for open networks)\n"); return 0; }
+        wifi_cfg_save_ap(argv[2], argc >= 4 ? argv[3] : "");
+    }
+    else if (str_eq(argv[1], "forget")) {
+        if (argc < 3) { uart_puts("usage: wifi forget <ssid>\n"); return 0; }
+        wifi_cfg_forget(argv[2]);
+    }
+    else if (str_eq(argv[1], "probe"))      wifi_probe();
     else if (str_eq(argv[1], "scan"))  wifi_scan_run();
     else if (str_eq(argv[1], "off"))   { extern void wifi_off(void); wifi_off(); uart_puts("wifi: off (radio down, disconnected)\n"); }
     else if (str_eq(argv[1], "dhcp"))  wifi_dhcp();
@@ -872,7 +886,7 @@ static int cmd_wifi(int argc, char **argv)
 }
 
 static const struct centry commandtab[] = {
-    { "wifi",   "wifi probe|scan|join <ssid> <pass>",       cmd_wifi   },
+    { "wifi",   "wifi on|aps|save <ssid> <pass>|forget <ssid>|scan|up|off", cmd_wifi },
     { "help",   "list the commands",                       cmd_help   },
     { "pwd",    "print the current directory",             cmd_pwd    },
     { "ls",     "ls [path] — list a directory",            cmd_ls     },

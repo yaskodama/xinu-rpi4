@@ -266,3 +266,119 @@ int fat32_create_file(fat32_t *fs, const char *name,
     }
     return -4;   /* no free directory slot */
 }
+
+/* ---- read / overwrite a single-cluster file (used for small config files) -- */
+
+/* Build the raw 11-byte 8.3 name (space-padded, upper-cased) from a C string. */
+static void name_to_83(const char *name, unsigned char out[11])
+{
+    for (int i = 0; i < 11; i++) out[i] = ' ';
+    int i = 0, o = 0;
+    for (; name[i] && name[i] != '.' && o < 8; i++) out[o++] = up8((unsigned char)name[i]);
+    while (name[i] && name[i] != '.') i++;
+    if (name[i] == '.') { i++; int e = 8; for (; name[i] && e < 11; i++) out[e++] = up8((unsigned char)name[i]); }
+}
+
+/* Locate `name83` in the root directory.  On success returns 0 and fills the
+ * on-disk location of its 32-byte entry (*ent_lba sector + *ent_off byte offset)
+ * plus its first cluster and size.  Returns -1 if not found / I/O error. */
+static int find_in_root(fat32_t *fs, const unsigned char name83[11],
+                        unsigned long *ent_lba, unsigned int *ent_off,
+                        unsigned int *first_cluster, unsigned int *size)
+{
+    unsigned char dirsec[SD_BLOCK_SIZE];
+    unsigned int  cur = fs->root_cluster;
+    int           safety = 1024;
+    while (cur >= 2 && cur < 0x0FFFFFF8u && safety-- > 0) {
+        unsigned long base = cluster_to_lba(fs, cur);
+        for (unsigned int s = 0; s < fs->sectors_per_cluster; s++) {
+            if (fs->rd(base + s, dirsec) != 0) return -1;
+            for (unsigned int off = 0; off + 32 <= SD_BLOCK_SIZE; off += 32) {
+                unsigned char *e = &dirsec[off];
+                if (e[0] == 0x00) return -1;            /* end of directory      */
+                if (e[0] == 0xE5) continue;             /* deleted               */
+                if ((e[11] & 0x0F) == 0x0F) continue;   /* LFN chunk             */
+                if (e[11] & 0x08) continue;             /* volume label          */
+                int match = 1;
+                for (int k = 0; k < 11; k++) if (e[k] != name83[k]) { match = 0; break; }
+                if (!match) continue;
+                if (ent_lba) *ent_lba = base + s;
+                if (ent_off) *ent_off = off;
+                if (first_cluster) *first_cluster = (le16(&e[20]) << 16) | le16(&e[26]);
+                if (size) *size = le32(&e[28]);
+                return 0;
+            }
+        }
+        cur = fat32_next_cluster(fs, cur);
+    }
+    return -1;
+}
+
+/* Read up to `max` bytes of the root-dir file `name` (8.3) into `out`.  Reads
+ * only the file's first cluster (these helpers only ever write single-cluster
+ * files), capped at `max` and the file size.  Returns the byte count, or -1 if
+ * the file does not exist / on I/O error. */
+int fat32_read_file(fat32_t *fs, const char *name, void *out, unsigned int max)
+{
+    unsigned char name83[11];
+    unsigned int first = 0, size = 0;
+    name_to_83(name, name83);
+    if (find_in_root(fs, name83, 0, 0, &first, &size) != 0) return -1;
+    if (first < 2) return -1;
+
+    unsigned int cluster_bytes = (unsigned int)fs->sectors_per_cluster * SD_BLOCK_SIZE;
+    unsigned int n = size;
+    if (n > max)           n = max;
+    if (n > cluster_bytes) n = cluster_bytes;
+
+    unsigned long base = cluster_to_lba(fs, first);
+    unsigned char *o = (unsigned char *)out;
+    unsigned int nsec = (n + SD_BLOCK_SIZE - 1) / SD_BLOCK_SIZE;
+    unsigned char buf[SD_BLOCK_SIZE];
+    for (unsigned int s = 0; s < nsec; s++) {
+        if (fs->rd(base + s, buf) != 0) return -1;
+        unsigned int got = n - s * SD_BLOCK_SIZE;
+        if (got > SD_BLOCK_SIZE) got = SD_BLOCK_SIZE;
+        for (unsigned int i = 0; i < got; i++) o[s * SD_BLOCK_SIZE + i] = buf[i];
+    }
+    return (int)n;
+}
+
+/* Create OR overwrite a single-cluster root-dir file.  If `name` already exists
+ * its existing first cluster is rewritten in place (zero-padded) and the dir
+ * entry's size field updated — no cluster/dir leak — so a config file can be
+ * re-saved repeatedly.  Otherwise behaves like fat32_create_file.  Assumes the
+ * existing file is single-cluster (true for files these helpers create).
+ * Returns 0 ok, -1 I/O, -2 too big, -3 no free cluster, -4 dir full. */
+int fat32_write_file(fat32_t *fs, const char *name, const void *data, unsigned int len)
+{
+    unsigned int cluster_bytes = (unsigned int)fs->sectors_per_cluster * SD_BLOCK_SIZE;
+    if (len > cluster_bytes) return -2;
+
+    unsigned char name83[11];
+    unsigned long ent_lba = 0; unsigned int ent_off = 0, first = 0;
+    name_to_83(name, name83);
+    if (find_in_root(fs, name83, &ent_lba, &ent_off, &first, 0) != 0 || first < 2)
+        return fat32_create_file(fs, name, data, len);   /* new file */
+
+    /* Overwrite the existing cluster (zero-padded), then patch the dir size. */
+    unsigned long base = cluster_to_lba(fs, first);
+    unsigned int nsec = (len + SD_BLOCK_SIZE - 1) / SD_BLOCK_SIZE;
+    if (nsec == 0) nsec = 1;
+    const unsigned char *d = (const unsigned char *)data;
+    for (unsigned int s = 0; s < nsec; s++) {
+        unsigned char buf[SD_BLOCK_SIZE];
+        for (int i = 0; i < SD_BLOCK_SIZE; i++) {
+            unsigned int idx = s * SD_BLOCK_SIZE + (unsigned int)i;
+            buf[i] = (idx < len) ? d[idx] : 0;
+        }
+        if (fs->wr(base + s, buf) != 0) return -1;
+    }
+    if (fs->rd(ent_lba, scratch) != 0) return -1;
+    scratch[ent_off + 28] = (unsigned char)(len);
+    scratch[ent_off + 29] = (unsigned char)(len >> 8);
+    scratch[ent_off + 30] = (unsigned char)(len >> 16);
+    scratch[ent_off + 31] = (unsigned char)(len >> 24);
+    if (fs->wr(ent_lba, scratch) != 0) return -1;
+    return 0;
+}
