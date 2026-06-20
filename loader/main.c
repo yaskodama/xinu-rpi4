@@ -721,7 +721,9 @@ static void win_anim(window_t *self, unsigned int frame)
  * buffer stays empty.  Reading contents on demand requires a
  * vfs_node_t open() hook which we can add later.
  */
-#define SD_MAX_DEPTH        2     /* root + 1 level (0..2 inclusive)  */
+#define SD_MAX_DEPTH        1     /* root only — recursing into /overlays (100s of
+                                   * files) over the 244 kHz identify clock is far
+                                   * too slow; the boot files live in the root.   */
 #define SD_MAX_DIR_ENTRIES  256   /* per-directory entry cap          */
 
 struct sd_walk_ctx {
@@ -768,25 +770,71 @@ static void sd_visit(const char *name, int is_dir, unsigned long size,
  * the partition isn't FAT32, so the QEMU build still runs. */
 static void vfs_mount_sd(void)
 {
-    /* /sd — reserved for a USB-attached SD card (no USB MSD driver yet). */
+    /* /sd — a USB-attached mass-storage device (thumb drive / SSD on a USB-A
+     * port, via the VL805 xHCI Bulk-Only SCSI driver).  Create the mount point
+     * now; the actual FAT32 enumeration runs in a background process, because
+     * USB enumeration only configures the device later in boot (after this). */
     vfs_node_t *usbsd = vfs_mkdir(vfs_root(), "sd");
     if (usbsd == 0) uart_puts("sd: /sd mkdir failed\n");
-    else            uart_puts("sd: /sd reserved for USB storage (no USB MSD driver yet — empty)\n");
+    else            uart_puts("sd: /sd reserved for USB mass storage (auto-mount runs with /microsd)\n");
+    /* /sd is mounted by the same background worker as /microsd (see
+     * microsd_automount_proc) — serialising both keeps them off the shared
+     * FAT scratch buffer at the same time. */
 
-    /* /microsd — the on-board EMMC2 microSD card. */
+    /* /microsd — the on-board EMMC2 microSD card.  Create the mount point here,
+     * but do the (slow, 244 kHz) FAT enumeration in a BACKGROUND process rather
+     * than on the boot thread — enumerating inline would stall boot and delay
+     * the HTTP server / desktop.  The cooperative scheduler runs sdmount once
+     * wm_run starts yielding, i.e. after the desktop/network are up. */
     vfs_node_t *msd = vfs_mkdir(vfs_root(), "microsd");
     if (msd == 0) { uart_puts("microsd: /microsd mkdir failed\n"); return; }
+    extern void microsd_automount_proc(void);
+    proc_create(microsd_automount_proc, 8192, "sdmount");
+    uart_puts("microsd: auto-mount scheduled (background)\n");
+}
+
+/* Shell-callable diagnostic + retry for the microSD mount (the `mount` cmd).
+ * The boot-time vfs_mount_sd() runs very early; if the EMMC2 read wasn't ready
+ * then, /microsd is empty.  This re-probes LBA0 (so the failing stage is
+ * visible), reports it, and re-walks the FAT32 root into /microsd if it is
+ * still empty.  All output lands in the calling shell window. */
+void microsd_remount(void)
+{
+    extern int  sd_read_block(unsigned long, void *);
+    extern void uart_puthex(unsigned long);
+
+    vfs_node_t *msd = vfs_lookup("/microsd");
+    if (!msd) msd = vfs_mkdir(vfs_root(), "microsd");
+    if (!msd) { uart_puts("microsd: no /microsd node\n"); return; }
+    if (msd->children) { uart_puts("microsd: already mounted (/microsd non-empty)\n"); return; }
+
+    unsigned char b[512];
+    int rd = sd_read_block(0, b);
+    uart_puts("microsd: read LBA0 rc=");
+    uart_puts(rd == 0 ? "OK" : "ERR");
+    if (rd == 0) {
+        uart_puts(" sig=0x");   uart_puthex(((unsigned)b[510] << 8) | b[511]);
+        uart_puts(" p0type=0x"); uart_puthex(b[0x1C2]);
+    }
+    uart_puts("\n");
 
     if (sd_init() != 0) {
-        uart_puts("microsd: EMMC2 init failed (no card / read error) — /microsd empty\n");
+        extern int  sd_debug_step(void);
+        extern void sd_debug_regs(unsigned int *, unsigned int *, unsigned int *, unsigned int *, unsigned int *);
+        unsigned int c0 = 0, c1 = 0, st = 0, in = 0, r0 = 0;
+        sd_debug_regs(&c0, &c1, &st, &in, &r0);
+        uart_puts("microsd: sd_init failed at step "); uart_puthex((unsigned)sd_debug_step());
+        uart_puts("\n  (2=clk 40/41=CMD8 61=ACMD41 80=CMD2 90=CMD3 100=CMD7 110=CMD16)\n");
+        uart_puts("  CONTROL0="); uart_puthex(c0);
+        uart_puts(" CONTROL1="); uart_puthex(c1);
+        uart_puts(" STATUS=");    uart_puthex(st);
+        uart_puts("\n  INTERRUPT="); uart_puthex(in);
+        uart_puts(" RESP0=");     uart_puthex(r0);
+        uart_puts("\n  (INT bit16=cmd-timeout 17=cmd-CRC 20=data-timeout)\n");
         return;
     }
-
     fat32_t fs;
-    if (fat32_mount(&fs) != 0) {
-        uart_puts("microsd: partition is not FAT32 (or no MBR) — /microsd empty\n");
-        return;
-    }
+    if (fat32_mount(&fs) != 0) { uart_puts("microsd: fat32_mount failed (partition not FAT32 / no MBR)\n"); return; }
 
     struct sd_walk_ctx ctx = {0};
     ctx.fs           = &fs;
@@ -794,6 +842,180 @@ static void vfs_mount_sd(void)
     ctx.remaining[0] = SD_MAX_DIR_ENTRIES;
     fat32_walk_dir(&fs, fs.root_cluster, 0, sd_visit, &ctx);
     uart_puts("microsd: FAT32 mounted under /microsd\n");
+}
+
+/* Background auto-mount worker: enumerate /microsd (EMMC) and then /sd (USB mass
+ * storage) off the boot thread so the slow FAT walks never delay the desktop /
+ * HTTP server.  Both run in this one process so they never touch the shared FAT
+ * scratch buffer concurrently.  Runs once, then exits. */
+void microsd_automount_proc(void)
+{
+    extern void usbsd_remount(void);
+    microsd_remount();
+    usbsd_remount();          /* USB enumeration has completed by the time we run */
+    proc_exit();
+}
+
+/* Safe physical-write self-test for the microSD (the `sdwtest` command).
+ * Writes ONLY to a FREE data cluster (one the FAT marks unused and no file
+ * references), verifies the read-back, then restores the original bytes — so
+ * the FAT, directories, and every file on the (boot) card are left untouched.
+ * This proves the CMD24 write path works without any risk of FAT corruption. */
+void microsd_write_test(void)
+{
+    extern int  sd_read_block(unsigned long, void *);
+    extern int  sd_write_block(unsigned long, const void *);
+    extern void uart_puthex(unsigned long);
+    static unsigned char orig[512], test[512], back[512];
+
+    fat32_t fs;
+    if (fat32_mount(&fs) != 0) { uart_puts("sdwtest: fat32_mount failed\n"); return; }
+
+    unsigned long lba = 0;
+    if (fat32_find_free_lba(&fs, &lba) != 0) { uart_puts("sdwtest: no free cluster found\n"); return; }
+    uart_puts("sdwtest: using FREE sector LBA=0x"); uart_puthex(lba); uart_puts("\n");
+
+    if (sd_read_block(lba, orig) != 0) { uart_puts("sdwtest: read original FAILED\n"); return; }
+
+    /* Build a recognisable test pattern. */
+    for (int i = 0; i < 512; i++) test[i] = (unsigned char)(0xA5 ^ (i & 0xFF));
+    const char *mark = "XINU-PI4 SD WRITE TEST";
+    for (int i = 0; mark[i]; i++) test[i] = (unsigned char)mark[i];
+
+    if (sd_write_block(lba, test) != 0) { uart_puts("sdwtest: WRITE FAILED\n"); return; }
+
+    int rb = sd_read_block(lba, back);
+    int ok = (rb == 0);
+    if (ok) for (int i = 0; i < 512; i++) if (back[i] != test[i]) { ok = 0; break; }
+
+    /* Always restore the free sector to its original content. */
+    int rst = sd_write_block(lba, orig);
+
+    uart_puts(ok ? "sdwtest: WRITE+VERIFY PASS" : "sdwtest: VERIFY MISMATCH");
+    uart_puts(rst == 0 ? "  (free sector restored — FS intact)\n"
+                       : "  (RESTORE FAILED — but it was a free cluster)\n");
+}
+
+/* Persistent file creation on the microSD (the `sdfwrite` command): write a
+ * real 8.3 file into the FAT32 root directory.  Touches only a free cluster +
+ * a free root-dir slot, so existing files are preserved.  Verify after a
+ * reboot with `mount` + `cat /microsd/<NAME>`. */
+void microsd_fwrite(const char *name, const char *text)
+{
+    fat32_t fs;
+    if (fat32_mount(&fs) != 0) { uart_puts("sdfwrite: fat32_mount failed\n"); return; }
+
+    unsigned int len = 0; while (text[len]) len++;
+    int rc = fat32_create_file(&fs, name, text, len);
+    if (rc == 0) {
+        uart_puts("sdfwrite: created /microsd/"); uart_puts(name);
+        uart_puts(" — reboot + `mount` + `cat /microsd/"); uart_puts(name);
+        uart_puts("` to verify persistence\n");
+    } else {
+        uart_puts(rc == -2 ? "sdfwrite: file too big (single cluster only)\n" :
+                  rc == -3 ? "sdfwrite: no free cluster\n" :
+                  rc == -4 ? "sdfwrite: root directory full\n" :
+                             "sdfwrite: I/O error\n");
+    }
+}
+
+/* ================= /sd — USB mass-storage (thumb drive / SSD) =================
+ * Same FAT32 reader/writer as /microsd, but bound to the USB Mass Storage block
+ * device (usbmsd.c over the VL805 xHCI bulk endpoints) instead of the EMMC2.
+ * The drive must be plugged into a USB-A port and FAT32-formatted. */
+
+/* (Re)mount the USB mass-storage device's FAT32 partition under /sd, reporting
+ * the failing stage.  Output lands in the calling shell window. */
+void usbsd_remount(void)
+{
+    extern int xhci_msd_present(void);
+    extern int usbmsd_ready(void);
+    extern int usbmsd_init(void);
+    extern int usbmsd_read_block(unsigned long, void *);
+    extern int usbmsd_write_block(unsigned long, const void *);
+
+    vfs_node_t *sd = vfs_lookup("/sd");
+    if (!sd) sd = vfs_mkdir(vfs_root(), "sd");
+    if (!sd) { uart_puts("usbsd: no /sd node\n"); return; }
+    if (sd->children) { uart_puts("usbsd: already mounted (/sd non-empty)\n"); return; }
+
+    if (!xhci_msd_present()) {
+        uart_puts("usbsd: no USB mass-storage device (plug a FAT32 drive into a USB-A port + reboot)\n");
+        return;
+    }
+    if (!usbmsd_ready() && usbmsd_init() != 0) { uart_puts("usbsd: device not ready\n"); return; }
+
+    fat32_t fs;
+    if (fat32_mount_dev(&fs, usbmsd_read_block, usbmsd_write_block) != 0) {
+        uart_puts("usbsd: partition is not FAT32 (or no MBR) — /sd empty\n");
+        return;
+    }
+
+    struct sd_walk_ctx ctx = {0};
+    ctx.fs           = &fs;
+    ctx.parent[0]    = sd;
+    ctx.remaining[0] = SD_MAX_DIR_ENTRIES;
+    fat32_walk_dir(&fs, fs.root_cluster, 0, sd_visit, &ctx);
+    uart_puts("usbsd: FAT32 mounted under /sd\n");
+}
+
+/* Safe physical-write self-test for /sd (the `usbwtest` command): writes ONLY to
+ * a FREE cluster, verifies, then restores — the FAT/dir/files are untouched. */
+void usbsd_write_test(void)
+{
+    extern int usbmsd_read_block(unsigned long, void *);
+    extern int usbmsd_write_block(unsigned long, const void *);
+    extern void uart_puthex(unsigned long);
+    static unsigned char orig[512], test[512], back[512];
+
+    fat32_t fs;
+    if (fat32_mount_dev(&fs, usbmsd_read_block, usbmsd_write_block) != 0) {
+        uart_puts("usbwtest: fat32_mount failed (no FAT32 USB drive on /sd?)\n"); return;
+    }
+    unsigned long lba = 0;
+    if (fat32_find_free_lba(&fs, &lba) != 0) { uart_puts("usbwtest: no free cluster found\n"); return; }
+    uart_puts("usbwtest: using FREE sector LBA=0x"); uart_puthex(lba); uart_puts("\n");
+
+    if (usbmsd_read_block(lba, orig) != 0) { uart_puts("usbwtest: read original FAILED\n"); return; }
+
+    for (int i = 0; i < 512; i++) test[i] = (unsigned char)(0x5A ^ (i & 0xFF));
+    const char *mark = "XINU-PI4 USB WRITE TEST";
+    for (int i = 0; mark[i]; i++) test[i] = (unsigned char)mark[i];
+
+    if (usbmsd_write_block(lba, test) != 0) { uart_puts("usbwtest: WRITE FAILED\n"); return; }
+
+    int rb = usbmsd_read_block(lba, back);
+    int ok = (rb == 0);
+    if (ok) for (int i = 0; i < 512; i++) if (back[i] != test[i]) { ok = 0; break; }
+
+    int rst = usbmsd_write_block(lba, orig);
+    uart_puts(ok ? "usbwtest: WRITE+VERIFY PASS" : "usbwtest: VERIFY MISMATCH");
+    uart_puts(rst == 0 ? "  (free sector restored — FS intact)\n"
+                       : "  (RESTORE FAILED — but it was a free cluster)\n");
+}
+
+/* Persistent file creation on /sd (the `usbfwrite` command): write a real 8.3
+ * file into the FAT32 root.  Verify after a reboot with `mount` + `ls /sd`. */
+void usbsd_fwrite(const char *name, const char *text)
+{
+    extern int usbmsd_read_block(unsigned long, void *);
+    extern int usbmsd_write_block(unsigned long, const void *);
+
+    fat32_t fs;
+    if (fat32_mount_dev(&fs, usbmsd_read_block, usbmsd_write_block) != 0) {
+        uart_puts("usbfwrite: fat32_mount failed (no FAT32 USB drive on /sd?)\n"); return;
+    }
+    unsigned int len = 0; while (text[len]) len++;
+    int rc = fat32_create_file(&fs, name, text, len);
+    if (rc == 0) {
+        uart_puts("usbfwrite: created /sd/"); uart_puts(name);
+        uart_puts(" — reboot + `mount` + `ls /sd` to verify persistence\n");
+    } else {
+        uart_puts(rc == -2 ? "usbfwrite: file too big (single cluster only)\n" :
+                  rc == -3 ? "usbfwrite: no free cluster\n" :
+                  rc == -4 ? "usbfwrite: root directory full\n" :
+                             "usbfwrite: I/O error\n");
+    }
 }
 
 /* ---- VFS demo: populate a small tree at boot ------------------- */
@@ -1249,6 +1471,14 @@ void kernel_main(void)
                     extern void wm_set_tick(void (*)(void));
                     xhci_vl805_enum_full();         /* M5/M5.5/M6: enum hubs + HID setup */
                     wm_set_tick(xhci_mouse_pump);   /* drive the cursor from the wm loop */
+                    /* If a USB mass-storage device was found, probe it (INQUIRY +
+                     * READ CAPACITY) now; the background sdmount proc mounts its
+                     * FAT32 under /sd once the desktop yields. */
+                    {
+                        extern int xhci_msd_present(void);
+                        extern int usbmsd_init(void);
+                        if (xhci_msd_present()) usbmsd_init();
+                    }
                 }
             }
         } else {

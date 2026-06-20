@@ -34,4 +34,17 @@ int sd_init(void);
  * timeout / hardware error. */
 int sd_read_block(unsigned long lba, void *buf);
 
+/* Write one 512-byte block at `lba` from `buf` (CMD24).  Returns 0 on success.
+ * Caller is responsible for filesystem consistency — this is a raw block write. */
+int sd_write_block(unsigned long lba, const void *buf);
+
+/* Last init progress marker (diagnostics).  Stages: 2=reset+clock done,
+ * 40=CMD8 issue fail, 41=CMD8 bad echo, 61=ACMD41 never ready, 80=CMD2,
+ * 90=CMD3, 100=CMD7, 110=CMD16, 11=fully initialised. */
+int sd_debug_step(void);
+
+/* Snapshot CONTROL0 / CONTROL1 / STATUS / INTERRUPT(at last failure) / RESP0. */
+void sd_debug_regs(unsigned int *ctrl0, unsigned int *ctrl1, unsigned int *status,
+                   unsigned int *intr, unsigned int *resp0);
+
 #endif /* XINU_RPI4_SD_H */

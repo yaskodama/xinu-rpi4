@@ -172,6 +172,78 @@ static int cmd_clear(int argc, char **argv)
     return 0;
 }
 
+static int cmd_mount(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    /* Re-probe + (re)mount both storage volumes, reporting each failing stage:
+     *   /microsd — on-board EMMC2 SD card
+     *   /sd      — USB mass-storage device (thumb drive / SSD)
+     * Output appears in this shell window. */
+    extern void microsd_remount(void);
+    extern void usbsd_remount(void);
+    microsd_remount();
+    usbsd_remount();
+    return 0;
+}
+
+static int cmd_usbwtest(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    /* Safe physical write test on the USB drive (/sd): free cluster, restored. */
+    extern void usbsd_write_test(void);
+    usbsd_write_test();
+    return 0;
+}
+
+static int cmd_usbfwrite(int argc, char **argv)
+{
+    if (argc < 2) { uart_puts("usage: usbfwrite <NAME.EXT> [text...]\n"); return 0; }
+    static char text[512];
+    int p = 0;
+    for (int a = 2; a < argc; a++) {
+        for (int i = 0; argv[a][i] && p < (int)sizeof(text) - 1; i++) text[p++] = argv[a][i];
+        if (a + 1 < argc && p < (int)sizeof(text) - 1) text[p++] = ' ';
+    }
+    if (p == 0) {
+        const char *d = "Hello from Xinu on Pi 4 — persistent USB write works!\n";
+        for (int i = 0; d[i] && p < (int)sizeof(text) - 1; i++) text[p++] = d[i];
+    }
+    text[p] = 0;
+    extern void usbsd_fwrite(const char *, const char *);
+    usbsd_fwrite(argv[1], text);
+    return 0;
+}
+
+static int cmd_sdwtest(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    /* Safe physical SD write test: writes to a FREE cluster, verifies, restores
+     * — never touches the FAT/dir/files, so the boot card can't be corrupted. */
+    extern void microsd_write_test(void);
+    microsd_write_test();
+    return 0;
+}
+
+static int cmd_sdfwrite(int argc, char **argv)
+{
+    if (argc < 2) { uart_puts("usage: sdfwrite <NAME.EXT> [text...]\n"); return 0; }
+    /* Join argv[2..] (space-separated) into the file body; default if none. */
+    static char text[512];
+    int p = 0;
+    for (int a = 2; a < argc; a++) {
+        for (int i = 0; argv[a][i] && p < (int)sizeof(text) - 1; i++) text[p++] = argv[a][i];
+        if (a + 1 < argc && p < (int)sizeof(text) - 1) text[p++] = ' ';
+    }
+    if (p == 0) {
+        const char *d = "Hello from Xinu on Pi 4 — persistent SD write works!\n";
+        for (int i = 0; d[i] && p < (int)sizeof(text) - 1; i++) text[p++] = d[i];
+    }
+    text[p] = 0;
+    extern void microsd_fwrite(const char *, const char *);
+    microsd_fwrite(argv[1], text);
+    return 0;
+}
+
 static int cmd_mem(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -828,6 +900,11 @@ static const struct centry commandtab[] = {
     { "echo",   "echo the remaining words back",           cmd_echo   },
     { "hello",  "smoke marker — say hello",                cmd_hello  },
     { "clear",  "clear the screen",                        cmd_clear  },
+    { "mount",  "(re)mount /microsd (EMMC) + /sd (USB) + report", cmd_mount },
+    { "sdwtest","safe microSD write test (free cluster, restored)", cmd_sdwtest },
+    { "sdfwrite","sdfwrite <NAME.EXT> [text] — create a real file on /microsd", cmd_sdfwrite },
+    { "usbwtest","safe USB /sd write test (free cluster, restored)", cmd_usbwtest },
+    { "usbfwrite","usbfwrite <NAME.EXT> [text] — create a real file on /sd", cmd_usbfwrite },
     { "mem",    "show __bss_start / __bss_end / _end",     cmd_mem    },
     { "peek",   "peek <hex_addr> — read 32-bit MMIO word", cmd_peek   },
     { "uptime", "raw CNTPCT_EL0 (generic timer)",          cmd_uptime },

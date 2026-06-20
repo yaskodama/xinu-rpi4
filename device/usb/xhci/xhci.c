@@ -955,6 +955,37 @@ static unsigned xs_hub_port_status(int slot, int port)
  * Reports each downstream device's VID/PID/class.  Returns devices found. */
 static int x_next_slot = 3;     /* hub used slots 1,2; children start at 3 */
 int xhci_hid_setup(int slot, int root_port, unsigned route, int speed, int tt_hub, int tt_port);  /* M6, below */
+int xhci_msd_setup(int slot, int root_port, unsigned route, int speed, int tt_hub, int tt_port);  /* MSD, below */
+
+/* Enumeration journal — a compact, HTTP-queryable record of what each USB port
+ * enumerated to (port/slot/speed/class + driver decision), since the boot UART
+ * log scrolls off the HDMI desktop.  Surfaced by /usbdiag via xhci_enum_journal. */
+static char x_enum_j[768];
+static int  x_enum_jl = 0;
+static void x_jlog(const char *s) { while (*s && x_enum_jl < (int)sizeof x_enum_j - 1) x_enum_j[x_enum_jl++] = *s++; x_enum_j[x_enum_jl]=0; }
+static void x_jhex(unsigned v) { char b[9]; for(int i=0;i<2;i++){unsigned n=(v>>((1-i)*4))&0xF; b[i]=(char)(n<10?'0'+n:'a'+n-10);} b[2]=0; x_jlog(b); }
+int xhci_enum_journal(char *out, int max) { int i=0; for(; i<x_enum_jl && i<max-1; i++) out[i]=x_enum_j[i]; out[i]=0; return i; }
+
+/* Read the config descriptor and return the first interface's bInterfaceClass
+ * (8 = Mass Storage, 3 = HID, 9 = hub).  Used to route enumeration to the right
+ * driver.  Returns -1 if no config / interface descriptor is found. */
+static int xs_iface_class(int slot)
+{
+    int got = xs_control_in(slot, 0x80, 6, (2u<<8), 0, 9);
+    if (got < 4 || x_hbuf[1] != 2) return -1;
+    int wtot = x_hbuf[2] | (x_hbuf[3]<<8);
+    if (wtot > (int)sizeof x_hbuf) wtot = sizeof x_hbuf;
+    xs_control_in(slot, 0x80, 6, (2u<<8), 0, wtot);
+    int pos = 0;
+    while (pos + 2 <= wtot) {
+        int blen = x_hbuf[pos], btype = x_hbuf[pos+1];
+        if (blen < 2) break;
+        if (btype == 4) return x_hbuf[pos+5];       /* bInterfaceClass */
+        pos += blen;
+    }
+    return -1;
+}
+
 int xhci_hub_enumerate(int hub_slot, int root_port, int hub_speed)
 {
     uart_puts("[xhci] hub: configuring slot="); puts_hex32((unsigned)hub_slot); uart_puts("\n");
@@ -1002,8 +1033,23 @@ int xhci_hub_enumerate(int hub_slot, int root_port, int hub_speed)
             uart_puts(" PID="); puts_hex32(pid);
             uart_puts(" class="); puts_hex32(cls); uart_puts(" ***\n");
             found++;
-            /* M6: bring up its HID interrupt endpoint (route=dp, TT if LS/FS). */
-            xhci_hid_setup(cslot, root_port, (unsigned)dp, speed, tt_hub, dp);
+            /* Route by interface class: 8 = USB Mass Storage (Bulk-Only) -> /sd,
+             * everything else -> HID interrupt endpoint (mouse/keyboard). */
+            int icls = xs_iface_class(cslot);
+            x_jlog("[h"); x_jhex((unsigned)dp); x_jlog("s"); x_jhex((unsigned)cslot);
+            x_jlog("sp"); x_jhex((unsigned)speed); x_jlog("ic"); x_jhex((unsigned)(icls&0xff));
+            if (icls == 8) {
+                x_jlog("=MSD] ");
+                uart_puts("[xhci] *** Mass Storage device on hubport");
+                uart_putc((char)('0'+dp)); uart_puts(" -> /sd ***\n");
+                xhci_msd_setup(cslot, root_port, (unsigned)dp, speed, tt_hub, dp);
+            } else {
+                x_jlog("=HID] ");
+                /* M6: bring up its HID interrupt endpoint (route=dp, TT if LS/FS). */
+                xhci_hid_setup(cslot, root_port, (unsigned)dp, speed, tt_hub, dp);
+            }
+        } else {
+            x_jlog("[h"); x_jhex((unsigned)dp); x_jlog("(desc-fail)] ");
         }
     }
     uart_puts("[xhci] hub: enumerate done, found="); puts_hex32((unsigned)found); uart_puts("\n");
@@ -1016,6 +1062,7 @@ int xhci_vl805_enum_full(void)
 {
     if (!x_running) { uart_puts("[xhci] full: not running\n"); return -1; }
     int nports=(int)((XR(x_base,XCAP_HCSPARAMS1)>>24)&0xff);
+    x_enum_jl = 0; x_jlog("ports="); x_jhex((unsigned)nports); x_jlog(" ");
     x_next_slot = 1;
     for (int p=1;p<=nports && p<=5;p++) {
         unsigned long psc=x_oper+0x400+(p-1)*0x10;
@@ -1025,22 +1072,35 @@ int xhci_vl805_enum_full(void)
         unsigned v=XR(psc,0);
         if (!(v&1u)) continue;
         int speed=(int)((v>>10)&0xf);
+        x_jlog("rp"); x_jhex((unsigned)p); x_jlog("sp"); x_jhex((unsigned)speed);
         if (x_next_slot>=XMAXSLOT) break;
         x_cmd_push(0,0,0,(9u<<10));
         struct xhci_trb ev=x_event_wait(33);
-        if (((ev.status>>24)&0xff)!=1) continue;
+        if (((ev.status>>24)&0xff)!=1) { x_jlog("(en-fail) "); continue; }
         int slot=(ev.control>>24)&0xff;
         if (slot >= x_next_slot) x_next_slot = slot+1;
-        if (xs_address(slot, p, 0, speed, 0, 0)!=0) continue;
+        if (xs_address(slot, p, 0, speed, 0, 0)!=0) { x_jlog("(addr-fail) "); continue; }
         unsigned vid=0,pid=0,cls=0;
-        if (xs_dev_desc(slot,&vid,&pid,&cls)!=0) continue;
+        if (xs_dev_desc(slot,&vid,&pid,&cls)!=0) { x_jlog("(desc-fail) "); continue; }
+        x_jlog("cls"); x_jhex(cls); x_jlog(" ");
         uart_puts("[xhci] root port"); uart_putc((char)('0'+p));
         uart_puts(" slot="); puts_hex32((unsigned)slot);
         uart_puts(" VID="); puts_hex32(vid); uart_puts(" PID="); puts_hex32(pid);
         uart_puts(" class="); puts_hex32(cls); uart_puts("\n");
-        /* On the VL805 every root port is an internal hub; recurse into each
-         * (class 9 = hub, but the Genesys USB2 hub reports device class 0). */
-        if (cls == 9 || cls == 0) xhci_hub_enumerate(slot, p, speed);
+        /* A root-port device is usually a VL805 internal hub (class 9, or the
+         * Genesys USB2 hub which reports device class 0), but a USB-3.0 thumb
+         * drive in a blue port enumerates DIRECTLY on a root port at SuperSpeed
+         * (class 0, interface class 8).  Disambiguate by interface class. */
+        int icls = xs_iface_class(slot);
+        x_jlog("ic"); x_jhex((unsigned)(icls & 0xff)); x_jlog(" ");
+        if (icls == 8) {
+            x_jlog("=MSDdirect ");
+            uart_puts("[xhci] *** Mass Storage device direct on root port");
+            uart_putc((char)('0'+p)); uart_puts(" -> /sd ***\n");
+            xhci_msd_setup(slot, p, 0, speed, 0, 0);
+        } else if (cls == 9 || cls == 0) {
+            xhci_hub_enumerate(slot, p, speed);
+        }
     }
     return 0;
 }
@@ -1149,6 +1209,164 @@ int xhci_hid_setup(int slot, int root_port, unsigned route, int speed, int tt_hu
     x_hid_arm(slot, dci); x_hid_arm(slot, dci);                /* prime two transfers */
     if (proto==1){ x_kbd_slot=slot; x_kbd_dci=dci; x_kbd_iface=iface; uart_puts("[xhci] hid: keyboard armed\n"); }
     else         { x_mouse_slot=slot; x_mouse_dci=dci; x_mouse_iface=iface; uart_puts("[xhci] hid: mouse armed\n"); }
+    return 0;
+}
+
+/* ===== USB Mass Storage (Bulk-Only Transport) endpoint bring-up =============
+ * A USB flash drive / SSD presents interface class 8 (Mass Storage), protocol
+ * 0x50 (Bulk-Only Transport), with exactly one Bulk-IN and one Bulk-OUT
+ * endpoint.  We configure BOTH in a single Configure-Endpoint command, then the
+ * SCSI/BOT layer (device/usb/xhci/usbmsd.c) drives reads/writes through the
+ * xhci_msd_bulk_{in,out}() primitives below.  Only one MSD device is tracked
+ * (the first one enumerated) — plenty for a single thumb drive on /sd. */
+static struct xhci_trb x_bo_ring[XMAXSLOT][16] __attribute__((aligned(64)));   /* Bulk-OUT */
+static struct xhci_trb x_bi_ring[XMAXSLOT][16] __attribute__((aligned(64)));   /* Bulk-IN  */
+static int x_bo_idx[XMAXSLOT], x_bo_cyc[XMAXSLOT];
+static int x_bi_idx[XMAXSLOT], x_bi_cyc[XMAXSLOT];
+static int x_msd_slot = -1, x_msd_in_dci, x_msd_out_dci;
+
+int xhci_msd_present(void) { return x_msd_slot >= 0; }
+
+/* Push one Normal TRB on a bulk ring, ring the endpoint doorbell, and wait for
+ * its Transfer Event.  `buf` must be in identity-mapped RAM (static aligned
+ * buffers — same region the HID DMA buffers live in).  A single TRB can carry a
+ * multi-block transfer; the controller packetises it to the endpoint MPS.
+ * Returns bytes transferred (len - residue) on success or short packet, else -1. */
+static int x_bulk_run(int slot, int dci, struct xhci_trb *ring, int *idx, int *cyc,
+                      void *buf, int len)
+{
+    struct xhci_trb *t = &ring[*idx];
+    unsigned long ba = XDA(buf);
+    t->p0 = (unsigned)(ba & 0xffffffff);
+    t->p1 = (unsigned)(ba >> 32);
+    t->status  = (unsigned)len;                               /* TRB transfer length */
+    t->control = (1u<<10)|(1u<<5)|((unsigned)(*cyc)&1u);      /* Normal + IOC + cycle */
+    __asm__ volatile("dsb sy":::"memory");
+    (*idx)++;
+    if (*idx == 15) {
+        ring[15].control = (ring[15].control & ~1u) | ((unsigned)(*cyc)&1u);
+        __asm__ volatile("dsb sy":::"memory");
+        *idx = 0; *cyc ^= 1;
+    }
+    XR(x_db, slot*4) = (unsigned)dci;
+    __asm__ volatile("dsb sy":::"memory");
+    struct xhci_trb ev = x_event_wait(32);
+    unsigned cc = (ev.status>>24)&0xff;
+    x_last_xfer_cc = cc; x_xfer_events++;
+    if (cc != 1 && cc != 13) return -1;                       /* 1=success 13=short */
+    return len - (int)(ev.status & 0xffffff);
+}
+
+int xhci_msd_bulk_out(void *buf, int len)
+{
+    if (x_msd_slot < 0) return -1;
+    return x_bulk_run(x_msd_slot, x_msd_out_dci, x_bo_ring[x_msd_slot],
+                      &x_bo_idx[x_msd_slot], &x_bo_cyc[x_msd_slot], buf, len);
+}
+int xhci_msd_bulk_in(void *buf, int len)
+{
+    if (x_msd_slot < 0) return -1;
+    return x_bulk_run(x_msd_slot, x_msd_in_dci, x_bi_ring[x_msd_slot],
+                      &x_bi_idx[x_msd_slot], &x_bi_cyc[x_msd_slot], buf, len);
+}
+
+/* Clear a Bulk endpoint STALL (BOT phase error recovery): standard CLEAR_FEATURE
+ * (ENDPOINT_HALT=0) on EP0 to the endpoint address, then a Reset-Endpoint +
+ * Set-TR-Dequeue would be needed for a full xHCI recovery.  For bring-up we do
+ * the device-side clear, which suffices for the common "CSW stall" sticks. */
+int xhci_msd_clear_halt(int in)
+{
+    if (x_msd_slot < 0) return -1;
+    int dci  = in ? x_msd_in_dci : x_msd_out_dci;
+    int epad = in ? (((dci-1)/2) | 0x80) : (dci/2);
+    return xs_control_nodata(x_msd_slot, 0x02, 1, 0, (unsigned)epad);   /* CLEAR_FEATURE EP_HALT */
+}
+
+/* Configure the Bulk-IN/OUT endpoints of a mass-storage device on `slot` and
+ * register it as the active MSD.  Mirrors xhci_hid_setup but adds two bulk EPs.
+ * Returns 0 ok, -1 no config desc, -2 not a BOT MSD / no bulk pair, -3 cfg-ep. */
+int xhci_msd_setup(int slot, int root_port, unsigned route, int speed, int tt_hub, int tt_port)
+{
+    int got = xs_control_in(slot, 0x80, 6, (2u<<8), 0, 9);
+    if (got < 4 || x_hbuf[1] != 2) { uart_puts("[xhci] msd: no config desc\n"); return -1; }
+    int wtot = x_hbuf[2] | (x_hbuf[3]<<8);
+    if (wtot > (int)sizeof x_hbuf) wtot = sizeof x_hbuf;
+    xs_control_in(slot, 0x80, 6, (2u<<8), 0, wtot);
+
+    int pos=0, in_iface=0, iface=0, cfgval=1;
+    int in_ep=0, out_ep=0, in_mps=64, out_mps=64;
+    cfgval = (wtot >= 6) ? x_hbuf[5] : 1;                      /* bConfigurationValue */
+    while (pos + 2 <= wtot) {
+        int blen=x_hbuf[pos], btype=x_hbuf[pos+1];
+        if (blen < 2) break;
+        if (btype == 4) {                                     /* interface descriptor */
+            int icls=x_hbuf[pos+5], iproto=x_hbuf[pos+7];
+            in_iface = (icls == 8 && iproto == 0x50);         /* Mass Storage, Bulk-Only */
+            if (in_iface) iface = x_hbuf[pos+2];
+        } else if (btype == 5 && in_iface) {                  /* endpoint descriptor */
+            int ea=x_hbuf[pos+2], attr=x_hbuf[pos+3];
+            int mps=x_hbuf[pos+4]|(x_hbuf[pos+5]<<8);
+            if ((attr & 3) == 2) {                            /* Bulk */
+                if (ea & 0x80) { in_ep=ea; in_mps=mps; }
+                else           { out_ep=ea; out_mps=mps; }
+            }
+        }
+        pos += blen;
+    }
+    if (!in_ep || !out_ep) { uart_puts("[xhci] msd: no bulk EP pair (not a BOT device)\n"); return -2; }
+    int in_dci=(in_ep&0xf)*2+1, out_dci=(out_ep&0xf)*2;
+    int max_dci = in_dci > out_dci ? in_dci : out_dci;
+    uart_puts("[xhci] msd: slot="); puts_hex32((unsigned)slot);
+    uart_puts(" iface="); puts_hex32((unsigned)iface);
+    uart_puts(" in_ep="); puts_hex32((unsigned)in_ep);
+    uart_puts(" out_ep="); puts_hex32((unsigned)out_ep);
+    uart_puts(" in_mps="); puts_hex32((unsigned)in_mps);
+    uart_puts(" out_mps="); puts_hex32((unsigned)out_mps); uart_puts("\n");
+
+    if (xs_control_nodata(slot, 0x00, 9, (unsigned)cfgval, 0) != 0)
+        uart_puts("[xhci] msd: SET_CONFIG failed (continuing)\n");
+
+    /* Build both bulk transfer rings (15 usable TRBs + Link). */
+    struct xhci_trb *ro = x_bo_ring[slot];
+    struct xhci_trb *ri = x_bi_ring[slot];
+    for (int i=0;i<16;i++){ ro[i].p0=ro[i].p1=ro[i].status=ro[i].control=0;
+                            ri[i].p0=ri[i].p1=ri[i].status=ri[i].control=0; }
+    ro[15].p0=(unsigned)(XDA(ro)&0xffffffff); ro[15].p1=(unsigned)(XDA(ro)>>32); ro[15].control=(6u<<10)|(1u<<1)|1u;
+    ri[15].p0=(unsigned)(XDA(ri)&0xffffffff); ri[15].p1=(unsigned)(XDA(ri)>>32); ri[15].control=(6u<<10)|(1u<<1)|1u;
+    x_bo_idx[slot]=0; x_bo_cyc[slot]=1;
+    x_bi_idx[slot]=0; x_bi_cyc[slot]=1;
+
+    unsigned char *dctx=x_devctx_s[slot];
+    for (unsigned i=0;i<sizeof x_input_ctx;i++) x_input_ctx[i]=0;
+    unsigned int *icc=xctx(x_input_ctx,0);
+    icc[1]=(1u<<0)|(1u<<in_dci)|(1u<<out_dci);                 /* add slot + both EPs */
+    unsigned int *sc=xctx(x_input_ctx,1);
+    sc[0]=((unsigned)max_dci<<27)|((unsigned)speed<<20)|(route&0xfffff);
+    sc[1]=((unsigned)root_port&0xff)<<16;
+    if (tt_hub) sc[2]=((unsigned)tt_hub&0xff)|(((unsigned)tt_port&0xff)<<8);
+
+    unsigned int *epi=xctx(x_input_ctx,in_dci+1);
+    epi[1]=(6u<<3)|(3u<<1)|((unsigned)in_mps<<16);            /* Bulk-IN, CErr=3, MPS */
+    unsigned long tri=XDA(ri)|1u;
+    epi[2]=(unsigned)(tri&0xffffffff); epi[3]=(unsigned)(tri>>32);
+    epi[4]=(unsigned)in_mps;                                  /* avg TRB len */
+
+    unsigned int *epo=xctx(x_input_ctx,out_dci+1);
+    epo[1]=(2u<<3)|(3u<<1)|((unsigned)out_mps<<16);          /* Bulk-OUT, CErr=3, MPS */
+    unsigned long tro=XDA(ro)|1u;
+    epo[2]=(unsigned)(tro&0xffffffff); epo[3]=(unsigned)(tro>>32);
+    epo[4]=(unsigned)out_mps;
+
+    x_dcbaa[slot]=XDA(dctx); __asm__ volatile("dsb sy":::"memory");
+    unsigned long ic=XDA(x_input_ctx);
+    x_cmd_push((unsigned)(ic&0xffffffff),(unsigned)(ic>>32),0,(12u<<10)|((unsigned)slot<<24));
+    struct xhci_trb ev=x_event_wait(33);
+    unsigned cc=(ev.status>>24)&0xff;
+    uart_puts("[xhci] msd: configure-ep cc="); puts_hex32(cc); uart_puts("\n");
+    if (cc!=1) return -3;
+
+    x_msd_slot=slot; x_msd_in_dci=in_dci; x_msd_out_dci=out_dci;
+    uart_puts("[xhci] msd: bulk endpoints ready\n");
     return 0;
 }
 
