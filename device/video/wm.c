@@ -521,6 +521,64 @@ void wm_pointer(int sx, int sy, int left)
     }
 }
 
+/* Persistent WiFi status badge pinned to the screen's bottom-right corner.
+ * Drawn in screen space (viewport 0,0) so it stays put while the desktop pans.
+ * Connected: GREEN signal bars + the joined SSID + the DHCP IP address.
+ * Down: a compact dim-grey badge with "----". */
+static void draw_wifi_badge(int sw, int sh)
+{
+    extern int wifi_connected(void);
+    extern const char *wifi_ssid(void);
+    extern void wifi_ipaddr(unsigned char *o);
+
+    unsigned int bg = 0xFF101820U;                              /* dark panel   */
+    int connected = wifi_connected();
+
+    if (!connected) {
+        unsigned int fg = 0xFF777777U;                          /* grey         */
+        int bw = 58, bh = 18, bx = sw - bw - 6, by = sh - bh - 6;
+        fill_rect(bx, by, bw, bh, bg);
+        fill_rect(bx, by, bw, 1, 0xFF2A3A4AU);
+        int base_y = by + bh - 4;
+        for (int i = 0; i < 4; i++) { int barh = 3 + i * 3; fill_rect(bx + 4 + i * 4, base_y - barh, 3, barh, 0xFF555555U); }
+        video_set_text_scale(1);
+        draw_string_at(bx + 24, by + 5, "----", fg, bg);
+        return;
+    }
+
+    /* Connected — build the "a.b.c.d" IP string (no libc in freestanding). */
+    unsigned char ip[4]; wifi_ipaddr(ip);
+    char ipbuf[20]; int p = 0;
+    for (int o = 0; o < 4; o++) {
+        int v = ip[o];
+        if (v >= 100)     { ipbuf[p++] = (char)('0' + v / 100); ipbuf[p++] = (char)('0' + (v / 10) % 10); ipbuf[p++] = (char)('0' + v % 10); }
+        else if (v >= 10) { ipbuf[p++] = (char)('0' + v / 10);  ipbuf[p++] = (char)('0' + v % 10); }
+        else                ipbuf[p++] = (char)('0' + v);
+        if (o < 3) ipbuf[p++] = '.';
+    }
+    ipbuf[p] = 0;
+
+    const char *ssid = wifi_ssid();
+    int sl = 0; while (ssid[sl]) sl++;
+
+    unsigned int fg = 0xFF22DD55U;                              /* green        */
+    int barsw = 4 + 4 * 4;                                      /* bars zone    */
+    int textw = (sl > p ? sl : p) * 8;
+    int bw = barsw + textw + 12, bh = 26;
+    if (bw > sw - 8) bw = sw - 8;
+    int bx = sw - bw - 6, by = sh - bh - 6;
+
+    fill_rect(bx, by, bw, bh, bg);                              /* panel        */
+    fill_rect(bx, by, bw, 1, 0xFF2A6A3AU);                      /* green top    */
+
+    int base_y = by + bh - 5;                                  /* signal bars  */
+    for (int i = 0; i < 4; i++) { int barh = 3 + i * 3; fill_rect(bx + 4 + i * 4, base_y - barh, 3, barh, fg); }
+
+    video_set_text_scale(1);
+    draw_string_at(bx + barsw + 4, by + 3,  ssid,  fg,          bg);   /* SSID  */
+    draw_string_at(bx + barsw + 4, by + 14, ipbuf, 0xFFB8F0CCU, bg);   /* IP    */
+}
+
 void wm_run(void)
 {
     unsigned int frame = 0;
@@ -584,6 +642,13 @@ void wm_run(void)
         }
 
         if (menu_open) wm_menu_draw();     /* context menu on top of the windows */
+
+        /* WiFi status badge — screen-space (bottom-right), on top of everything
+         * but under the cursor.  Restore the panned viewport afterwards so the
+         * cursor composite below is unaffected. */
+        video_set_viewport(0, 0);
+        draw_wifi_badge(sw, sh);
+        video_set_viewport(vp_x, vp_y);
 
         /* Composite the cursor INTO the finished backbuffer *before* the flip
          * so the pointer arrives in the same atomic present as the scene.  The

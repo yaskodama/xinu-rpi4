@@ -1922,19 +1922,9 @@ void kernel_main(void)
         runtime_win.draw_content = win_runtime;
         wm_add(&runtime_win);
 
-        /* WiFi indicator: bottom-right corner of the screen, front-most. */
-        wifi_win.x = 626;
-        wifi_win.y = 90;
-        wifi_win.width  = 200;
-        wifi_win.height = 96;
-        wifi_win.font_scale = 1;
-        { const char *wt = "WiFi"; int i; for (i = 0; i < WM_TITLE_MAX && wt[i]; i++) wifi_win.title[i] = wt[i]; }
-        wifi_win.chrome_color = 0xFF60FF60U;
-        wifi_win.title_bg     = 0xFF205020U;
-        wifi_win.title_fg     = 0xFFFFFFFFU;
-        wifi_win.content_bg   = 0xFF0A140AU;
-        wifi_win.draw_content = win_wifi;
-        wm_add(&wifi_win);
+        /* The old draggable "WiFi" window is gone — wm_run() now paints a
+         * persistent WiFi status badge (signal bars + SSID + IP when connected)
+         * fixed in the screen's bottom-right corner, so no window is added. */
 
         /* Start the cursor at the centre of the *screen* (not the
          * virtual desktop) so it stays in view as the viewport
