@@ -61,6 +61,24 @@ static int sd_inited;
 static volatile int sd_dbg_step;
 int sd_debug_step(void) { return sd_dbg_step; }
 
+/* Busy-wait `us` microseconds off the architectural counter (CNTPCT_EL0).  The
+ * previous code used bare empty `for` loops for the power/clock settle, which
+ * (a) -O2 can delete entirely and (b) were sized for the Pi 3's faster identify
+ * clock.  On the Pi 4 EMMC2 the base clock is 100 MHz and the identify divider
+ * (0x200) gives SDCLK ≈ 98 kHz, so the card's mandatory 74-clock power-up window
+ * is ~755 µs — far longer than those loops delivered, so CMD0/CMD8 were issued
+ * before the card was ready and timed out.  A real, un-optimisable delay fixes it
+ * (confirmed live via /mmio-write: with adequate settle, CMD8 echoes 0x1AA and
+ * ACMD41 reaches OCR 0xC0FF8000 SDHC-ready). */
+static void sd_udelay(unsigned us)
+{
+    unsigned long freq, start, now;
+    __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
+    __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(start));
+    unsigned long target = ((unsigned long)us * freq) / 1000000UL;
+    do { __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now)); } while (now - start < target);
+}
+
 static volatile unsigned int sd_dbg_int;   /* INTERRUPT captured at the last failure */
 
 /* Snapshot the key controller registers for the `mount` diagnostic.  `intr` is
@@ -133,9 +151,14 @@ int sd_init(void)
     /* Bus power ON + 3.3V select (CONTROL0 bit8 = SD bus power, bits[11:9]=111
      * = 3.3V).  A full SRST_HC clears the firmware's power-up, so without this
      * the card gets no bus power and never answers CMD8 (observed: sd_init
-     * fails at step 40 with a command timeout).  Let the rail settle. */
+     * fails at step 40 with a command timeout). */
     EMMC_CONTROL0 = (EMMC_CONTROL0 & ~0x00000F00u) | 0x00000F00u;
-    { unsigned long d; for (d = 0; d < 20000; d++) { } }
+
+    /* Power/clock settle: hold ≥74 SDCLK cycles with the clock running and the
+     * rail stable before the first command.  At ~98 kHz that is ~755 µs; wait a
+     * generous 10 ms so a cold card is unambiguously ready (this is THE fix for
+     * the CMD8 timeout — see sd_udelay's note). */
+    sd_udelay(10000);
 
     /* Poll-mode: signal disabled, status latching enabled, clear stale status. */
     EMMC_IRPT_EN   = 0;
@@ -144,15 +167,18 @@ int sd_init(void)
     sd_dbg_step = 2;
 
     sd_cmd(CMD_GO_IDLE, 0);                            /* CMD0 (no response)  */
+    sd_udelay(1000);                                   /* let the card reach idle */
     if (sd_cmd(CMD_SEND_IF_COND, 0x1AA) != 0) { sd_dbg_step = 40; return -1; }  /* CMD8 */
     if (EMMC_RESP0 != 0x1AA)                  { sd_dbg_step = 41; return -1; }
 
-    /* ACMD41: repeat CMD55 + CMD41 (HCS=1) until the OCR busy bit (31) sets. */
-    for (t = 0; t < 100000; t++) {
+    /* ACMD41: repeat CMD55 + CMD41 (HCS=1) until the OCR busy bit (31) sets.
+     * The card needs up to ~1 s to finish its power-up ramp, polled ~1 ms apart
+     * (verified live: OCR went 0x00FF8000 -> 0xC0FF8000 SDHC-ready in 3 polls). */
+    for (t = 0; t < 1000; t++) {
         if (sd_cmd(CMD_APP_CMD, 0) != 0)               { sd_dbg_step = 50; return -1; }
         if (sd_cmd(CMD_SD_SENDOPCOND, 0x40FF8000u) != 0) { sd_dbg_step = 60; return -1; }
         if (EMMC_RESP0 & 0x80000000u) break;           /* card powered up     */
-        { unsigned long d; for (d = 0; d < 50000; d++) { } }
+        sd_udelay(1000);
     }
     if (!(EMMC_RESP0 & 0x80000000u)) { sd_dbg_step = 61; return -1; }
 
