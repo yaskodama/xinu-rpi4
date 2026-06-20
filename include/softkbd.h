@@ -15,6 +15,7 @@
 #include "wm.h"
 
 void softkbd_draw(window_t *self, unsigned int frame);
+void softkbd_on_click(window_t *self, int lx, int ly);   /* click a key -> type it */
 
 extern window_t softkbd_win;
 

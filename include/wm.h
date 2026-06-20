@@ -44,6 +44,12 @@ typedef struct window {
      * its toolbar buttons.  NULL = no click handling. */
     void        (*on_click)(struct window *self, int lx, int ly);
 
+    /* When set, clicking this window raises/highlights it but does NOT make it
+     * the keyboard target — keystrokes keep flowing to the previously focused
+     * window.  Used by the on-screen soft keyboard so its key clicks type into
+     * whatever window the user was working in. */
+    int           no_kbd_focus;
+
     struct window *next;          /* internal — set by wm_add() */
 } window_t;
 
@@ -55,6 +61,11 @@ void wm_add(window_t *w);
 /* The window the user last clicked (NULL until the first click).  Keyboard
  * input is routed to this window (e.g. the BASIC window vs. the shell). */
 window_t *wm_active(void);
+
+/* The window keystrokes should go to: the last focused window that ISN'T flagged
+ * no_kbd_focus (so clicking the soft keyboard doesn't steal the target).  Falls
+ * back to wm_active() until a real target has been focused. */
+window_t *wm_kbd_target(void);
 
 /* Runtime window geometry — driven by the AIPL screen-layout designer.
  * Windows are addressed by their add order (0-based).  move/resize take

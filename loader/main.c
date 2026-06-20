@@ -300,12 +300,12 @@ void xhci_keyboard_event(char c)
     if (basic_is_running()) return;
     /* Route the key to whichever window the user last clicked: the BASIC
      * window when it is active, otherwise the (default) shell window. */
-    extern window_t *wm_active(void);
+    extern window_t *wm_kbd_target(void);
     extern window_t  basic_win;
     extern void      basicwin_handle_key(char);
     extern int       basicwin_route_key(window_t *, char);
     extern int       shellwin_route_key(window_t *, char);
-    window_t *aw = wm_active();
+    window_t *aw = wm_kbd_target();
     if      (aw == &basic_win)            basicwin_handle_key(c);    /* BASIC 1 (default) */
     else if (basicwin_route_key(aw, c))   ;                /* on-demand BASIC 2/3/4 */
     else if (shellwin_route_key(aw, c))   ;                /* on-demand Shell 2/3 */
@@ -1887,6 +1887,8 @@ void kernel_main(void)
         softkbd_win.title_fg     = 0xFFFFFFFFU;
         softkbd_win.content_bg   = 0xFF0A0A14U;
         softkbd_win.draw_content = softkbd_draw;
+        softkbd_win.on_click     = softkbd_on_click;  /* click a key -> type it   */
+        softkbd_win.no_kbd_focus = 1;                 /* keep keys on the real win */
         wm_add(&softkbd_win);
 
         /* Actors window: visible right-bottom slot of the initial viewport,

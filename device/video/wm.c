@@ -8,7 +8,17 @@
 
 static window_t *wm_head;
 static struct window *active_win;              /* last-clicked window (highlighted border) */
+static struct window *kbd_target;              /* last-focused window that accepts keys     */
 static void    (*wm_tick)(void);
+
+/* Focus `w`: raise + highlight it, and (unless it opts out via no_kbd_focus)
+ * make it the keyboard target.  The soft keyboard sets no_kbd_focus so clicking
+ * its keys leaves the real target window receiving the characters. */
+static void wm_focus(struct window *w)
+{
+    active_win = w;
+    if (w && !w->no_kbd_focus) kbd_target = w;
+}
 
 /* Cursor overlay state — repainted on top of all windows every
  * frame so it never disappears under another redraw.  Cursor
@@ -190,6 +200,7 @@ void wm_cursor_delay_ms(int ms)
 
 /* The window the user last clicked (keyboard input is routed here). */
 window_t *wm_active(void) { return active_win; }
+window_t *wm_kbd_target(void) { return kbd_target ? kbd_target : active_win; }
 
 void wm_add(window_t *w)
 {
@@ -447,9 +458,9 @@ static void wm_menu_draw(void)
 void wm_show(window_t *w)
 {
     for (window_t *t = wm_head; t; t = t->next)
-        if (t == w) { active_win = w; wm_raise(w); return; }
+        if (t == w) { wm_focus(w); wm_raise(w); return; }
     wm_add(w);
-    active_win = w;
+    wm_focus(w);
     wm_raise(w);
 }
 
@@ -483,9 +494,9 @@ void wm_pointer(int sx, int sy, int left)
             }
             window_t *w = window_at_resize(dx, dy);     /* corner first (it's inside the window) */
             if (w) { drag_win = w; drag_mode = 2; drag_off_x = dx - (w->x + w->width);
-                     drag_off_y = dy - (w->y + w->height); active_win = w; wm_raise(w); }
+                     drag_off_y = dy - (w->y + w->height); wm_focus(w); wm_raise(w); }
             else if ((w = window_at_titlebar(dx, dy)) != 0) {
-                drag_win = w; drag_mode = 1; drag_off_x = dx - w->x; drag_off_y = dy - w->y; active_win = w; wm_raise(w);
+                drag_win = w; drag_mode = 1; drag_off_x = dx - w->x; drag_off_y = dy - w->y; wm_focus(w); wm_raise(w);
             }
             else {
                 /* Click inside a window BODY (not titlebar/resize corner):
@@ -499,7 +510,7 @@ void wm_pointer(int sx, int sy, int left)
                         dy >= t->y && dy < t->y + t->height)
                         hit = t;                       /* topmost = last in list */
                 if (hit) {
-                    active_win = hit; wm_raise(hit);
+                    wm_focus(hit); wm_raise(hit);
                     /* Fire the window's click handler once per press (e.g. the
                      * BASIC window's toolbar buttons).  Local coords. */
                     if (press_edge && hit->on_click)
