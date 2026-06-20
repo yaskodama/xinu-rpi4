@@ -1,7 +1,55 @@
 # Pi4 (xinu-rpi4) — Next-Session Handoff
 
-Last updated: **2026-06-20**.  Branch **`feat/smp-4core-and-basic-graphics`**.
-Older notes kept below for reference.
+Last updated: **2026-06-20** (post-crash recovery + WiFi badge).  Branch
+**`feat/smp-4core-and-basic-graphics`**.  Older notes kept below for reference.
+
+---
+
+## ★ 2026-06-20 session (PM) — WiFi UX: `wifi on` + persistent badge (⏳ NEEDS COLD-BOOT VERIFY)
+
+Recovered cleanly after an editor/session crash: working tree is clean, nothing
+was lost, and `make pi4` reproduces **md5 `473d70f3`** (== the WiFi-badge commit).
+
+What shipped this afternoon (both committed on `feat/smp-4core-and-basic-graphics`):
+- **`7bd3749` feat(pi4/wifi)** — shell `wifi save/aps/forget/on`; saved APs live in
+  `/microsd/WIFI.CFG` (one `SSID\tPASSWORD\n` line, <=512 B = single cluster).
+  `wifi on` tries each saved AP top-to-bottom, stops at the first WPA2+DHCP join.
+  Adds `fat32_read_file()` / `fat32_write_file()` (overwrite-in-place, no leak).
+  Build md5 `d7b582e3`.
+- **`4a5d2a5` feat(pi4/wm)** — the old draggable WiFi *window* is gone; `wm_run()`
+  now paints a **persistent status badge** bottom-right in screen space: GREEN
+  bars + SSID + DHCP IP when connected (`wifi_ssid()`/`wifi_ipaddr()`/
+  `wifi_connected()`), dim-grey "----" when down.  Build md5 `473d70f3`.
+
+### ⏳ NOT YET VERIFIED ON HARDWARE — this is the next concrete step
+The SD card currently holds the OLDER build `083a1bff` (the /sd USB-MSD kernel).
+The WiFi work (`473d70f3`) has **not been burned/cold-booted** yet.  `wifi on`'s
+SD-persistence path **requires a COLD boot** to verify (a warm chainload cannot
+re-mount the microSD once a prior kernel initialised it — known EMMC warm-restart
+limitation).
+
+### Deploy (burn) — ⚠️ DO NOT use `make install_pi4`
+`make install_pi4` overwrites `config.txt` with `sdcard/config_pi4.txt`, which is
+**missing `total_mem=2048`** (required on this board).  Burn manually instead:
+1. `cd ~/projects/xinu-rpi4 && make pi4` → confirm `md5 -q compile/kernel8.img` ==
+   `473d70f3e5846428040d0124ff201b32`.
+2. Insert the Pi4 SD card; copy **only** `compile/kernel8.img` onto the boot
+   partition, **leaving the existing `config.txt` (with `total_mem=2048`) intact**.
+   `sync`, eject.
+
+### Cold-boot verification checklist
+1. Boot the Pi4 from the freshly-burned SD (cold boot — power-cycle, not warm).
+2. **Badge**: bottom-right shows the WiFi badge.  Before joining → dim grey "----".
+3. In the on-screen shell:
+   - `wifi save <SSID> <PASS>` (or omit PASS for an open AP), then `wifi aps`
+     lists it.  Try adding 2 APs to confirm priority order = file order.
+   - `wifi on` → should scan, WPA2-join the first reachable saved AP, get a DHCP
+     lease; the **badge turns GREEN** with SSID + IP.
+4. **Persistence**: `reboot` (cold), then `wifi aps` should still list the saved
+   APs (proves `/microsd/WIFI.CFG` survived) and `wifi on` re-joins.
+5. If microSD doesn't mount on cold boot, re-check the `sd_udelay` settle fix
+   (`ff0c0f1`) is in this build (it is, at `473d70f3`).
+- Pi4 USB/WiFi enum is hit-or-miss; if a join fails, `/reboot` and retry.
 
 ---
 
