@@ -919,35 +919,72 @@ void microsd_fwrite(const char *name, const char *text)
     }
 }
 
-/* ===== WiFi saved access points — persisted on /microsd/WIFI.CFG ============
+/* ===== WiFi saved access points — persisted as WIFI.CFG =====================
  * Format: one AP per line, "SSID\tPASSWORD\n" (tab-separated so an SSID may
  * contain spaces; a line with no tab = an open network).  '#' begins a comment.
  * Line order = priority: `wifi on` tries them top-to-bottom and stops at the
  * first that joins + gets DHCP.  Kept ≤512 B (~12 APs) so the whole file fits a
  * single FAT cluster (fat32_write_file overwrites in place — no leak on re-save).
- * The on-board microSD must be mounted (it auto-mounts at boot). */
+ *
+ * Storage volume: the on-board microSD (EMMC2) is preferred, but a USB
+ * mass-storage drive (/sd) is searched too, so a kit with no microSD still
+ * persists APs.  wcfg_load() returns the first volume that actually has the
+ * file; wcfg_store() updates wherever the file already lives, else creates it on
+ * microSD (USB fallback).  Both volumes auto-mount at boot. */
 #define WIFI_CFG_NAME "WIFI.CFG"
 #define WIFI_CFG_MAX  512
 
 static int wstreq(const char *a, const char *b)
 { while (*a && *b) { if (*a != *b) return 0; a++; b++; } return *a == *b; }
 
-/* Load WIFI.CFG into `buf` (NUL-terminated).  Returns length, or -1 if absent. */
+/* Mount the USB mass-storage (/sd) FAT32 volume, if a drive is present. */
+static int wcfg_mount_usb(fat32_t *fs)
+{
+    extern int usbmsd_ready(void);
+    extern int usbmsd_read_block(unsigned long lba, void *buf);
+    extern int usbmsd_write_block(unsigned long lba, const void *buf);
+    if (!usbmsd_ready()) return -1;
+    return fat32_mount_dev(fs, usbmsd_read_block, usbmsd_write_block);
+}
+
+/* True if WIFI.CFG exists on the volume already mounted in *fs. */
+static int wcfg_has_file(fat32_t *fs)
+{
+    char probe[1];
+    return fat32_read_file(fs, WIFI_CFG_NAME, probe, sizeof probe) >= 0;
+}
+
+/* Load WIFI.CFG into `buf` (NUL-terminated).  Searches the microSD first, then
+ * the USB /sd drive.  Returns length, or -1 if absent on both. */
 static int wcfg_load(char *buf, int max)
 {
     fat32_t fs;
-    if (fat32_mount(&fs) != 0) { buf[0] = 0; return -1; }
-    int n = fat32_read_file(&fs, WIFI_CFG_NAME, buf, (unsigned)(max - 1));
-    if (n < 0) { buf[0] = 0; return -1; }
-    buf[n] = 0;
-    return n;
+    if (fat32_mount(&fs) == 0) {                       /* /microsd (EMMC2) */
+        int n = fat32_read_file(&fs, WIFI_CFG_NAME, buf, (unsigned)(max - 1));
+        if (n >= 0) { buf[n] = 0; return n; }
+    }
+    if (wcfg_mount_usb(&fs) == 0) {                    /* /sd (USB) */
+        int n = fat32_read_file(&fs, WIFI_CFG_NAME, buf, (unsigned)(max - 1));
+        if (n >= 0) { buf[n] = 0; return n; }
+    }
+    buf[0] = 0;
+    return -1;
 }
 
 static int wcfg_store(const char *buf, int len)
 {
     fat32_t fs;
-    if (fat32_mount(&fs) != 0) return -1;
-    return fat32_write_file(&fs, WIFI_CFG_NAME, buf, (unsigned)len) == 0 ? 0 : -1;
+    /* 1) update the volume that already holds WIFI.CFG (microSD first) */
+    if (fat32_mount(&fs) == 0 && wcfg_has_file(&fs))
+        return fat32_write_file(&fs, WIFI_CFG_NAME, buf, (unsigned)len) == 0 ? 0 : -1;
+    if (wcfg_mount_usb(&fs) == 0 && wcfg_has_file(&fs))
+        return fat32_write_file(&fs, WIFI_CFG_NAME, buf, (unsigned)len) == 0 ? 0 : -1;
+    /* 2) no copy yet — create on microSD, else on the USB /sd drive */
+    if (fat32_mount(&fs) == 0)
+        return fat32_write_file(&fs, WIFI_CFG_NAME, buf, (unsigned)len) == 0 ? 0 : -1;
+    if (wcfg_mount_usb(&fs) == 0)
+        return fat32_write_file(&fs, WIFI_CFG_NAME, buf, (unsigned)len) == 0 ? 0 : -1;
+    return -1;
 }
 
 /* Parse one config line at `p` into ssid/pass (NUL-terminated, bounded).  Sets
@@ -1001,9 +1038,9 @@ int wifi_cfg_save_ap(const char *ssid, const char *pass)
         if (o < max - 1) out[o++] = '\n';
     }
     out[o] = 0;
-    if (wcfg_store(out, o) != 0) { uart_puts("wifi save: /microsd write FAILED (card mounted?)\n"); return -1; }
+    if (wcfg_store(out, o) != 0) { uart_puts("wifi save: WIFI.CFG write FAILED (microSD/USB mounted?)\n"); return -1; }
     uart_puts("wifi save: stored '"); uart_puts(ssid);
-    uart_puts(replaced ? "' (updated) to /microsd/WIFI.CFG\n" : "' to /microsd/WIFI.CFG\n");
+    uart_puts(replaced ? "' (updated) to WIFI.CFG\n" : "' to WIFI.CFG\n");
     return 0;
 }
 
@@ -1024,7 +1061,7 @@ int wifi_cfg_forget(const char *ssid)
     }
     out[o] = 0;
     if (!removed) { uart_puts("wifi forget: '"); uart_puts(ssid); uart_puts("' not found\n"); return -1; }
-    if (wcfg_store(out, o) != 0) { uart_puts("wifi forget: /microsd write FAILED\n"); return -1; }
+    if (wcfg_store(out, o) != 0) { uart_puts("wifi forget: WIFI.CFG write FAILED\n"); return -1; }
     uart_puts("wifi forget: removed '"); uart_puts(ssid); uart_puts("'\n");
     return 0;
 }
