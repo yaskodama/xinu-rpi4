@@ -28,8 +28,28 @@ port** would instead come up behind the USB-2 hub and hit the hub-child MSD bran
 (`rpNNspSSclsCC icII =MSDdirect/=hub` and hub children `[hDDsSLspSSicII=MSD/HID]`).
 This is how the blue-port/SuperSpeed root-direct case was diagnosed.
 
-### ★ OPEN — microSD (/microsd, EMMC2) stalls at `sd_init` CMD8 timeout
-`mount` shows `microsd: sd_init failed at step 0x28` (CMD8 cmd-timeout),
+### ✅ RESOLVED (2026-06-20) — microSD CMD8 timeout was a settle-delay bug (`ff0c0f1`)
+Diagnosed LIVE via `POST /mmio-write` / `GET /mmio-read` on the running board (the
+same technique that built the Pi3 driver — no reflash/cold-boot needed): drove
+CMD0/CMD8/ACMD41 by hand on EMMC2 (base 0xFE340000).  Findings:
+- `CAPABILITIES_0` (0xFE340040) = `0x45EE6432` → base clock = bits[15:8] = 0x64 =
+  **100 MHz**; with the identify divider 0x200 (512), SDCLK ≈ **98 kHz** (valid).
+- With **adequate settle** between clock+power and the first command: CMD0 →
+  CMD_DONE, **CMD8 → RESP0 = 0x1AA**, ACMD41 → OCR **0xC0FF8000** (SDHC-ready) in 3
+  polls.  So the card is fine at **3.3V** — NOT a 1.8V/UHS or power problem.
+- Root cause: `sd_init`'s settle was a bare empty `for` loop (~20000 iters) that
+  -O2 can delete and that was 10× shorter than the proven Pi3 driver's, while the
+  Pi4 EMMC2 identify clock is slower (~98 kHz).  The card's 74-clock power-up
+  window (~755 µs) was never honored, so CMD0/CMD8 fired too early → CMD8 CTO
+  (INTERRUPT bit16; `sd_init failed at step 0x28`).
+- Fix: `sd_udelay()` off `CNTPCT_EL0` (un-optimisable, freq-correct) — 10 ms after
+  clock+power, 1 ms after CMD0, 1 ms between ACMD41 polls.
+- **Verified via chainload**: `/microsd` auto-mounts (`mount` → "/microsd non-empty")
+  and `sdwtest` = WRITE+VERIFY PASS.  Build **md5 `a281bc85`** (RAM-chainloaded;
+  **burn `compile/kernel8.img` to the SD `kernel8.img` for persistence** — preserve
+  config.txt `total_mem=2048`).  The earlier USB-3-interference suspicion was wrong.
+
+(historical) `mount` showed `microsd: sd_init failed at step 0x28` (CMD8 cmd-timeout),
 CONTROL0=00800F00 INTERRUPT=00018000.
 **CORRECTION (2026-06-20, post-commit):** an earlier handoff line here claimed
 `sd.c` was UNCHANGED — that was wrong.  `git diff` shows `device/sd/sd.c` was
