@@ -267,6 +267,114 @@ int fat32_create_file(fat32_t *fs, const char *name,
     return -4;   /* no free directory slot */
 }
 
+/* ---- multi-cluster WRITE: save a whole .avm actor to the card --------------
+ * Allocates as many free clusters as `len` needs, writes the data across them,
+ * chains them in every FAT copy, and adds (or, if the 8.3 name already exists,
+ * reuses after freeing its old chain) a root-dir entry.  Only free clusters and
+ * the file's own dir entry are touched.  Returns 0 ok, <0 on error. */
+static void name_to_83(const char *name, unsigned char out[11]);
+static int find_in_root(fat32_t *fs, const unsigned char name83[11],
+                        unsigned long *ent_lba, unsigned int *ent_off,
+                        unsigned int *first_cluster, unsigned int *size);
+
+static int fat_set_entry(fat32_t *fs, unsigned int c, unsigned int val)
+{
+    unsigned long fb = (unsigned long)c * 4UL, secoff = fb / SD_BLOCK_SIZE;
+    unsigned int  off = (unsigned int)(fb % SD_BLOCK_SIZE);
+    for (unsigned int f = 0; f < fs->num_fats; f++) {
+        unsigned long sec = fs->fat_lba + (unsigned long)f * fs->sectors_per_fat + secoff;
+        if (fs->rd(sec, scratch) != 0) return -1;
+        scratch[off+0]=(unsigned char)val;       scratch[off+1]=(unsigned char)(val>>8);
+        scratch[off+2]=(unsigned char)(val>>16); scratch[off+3]=(unsigned char)((val>>24)&0x0F);
+        if (fs->wr(sec, scratch) != 0) return -1;
+    }
+    return 0;
+}
+static unsigned int fat_find_free(fat32_t *fs, unsigned int from)
+{
+    unsigned int total = fs->sectors_per_fat * (SD_BLOCK_SIZE / 4);
+    for (unsigned int c = (from < 2 ? 2 : from); c < total; c++) {
+        unsigned long fb = (unsigned long)c * 4UL;
+        unsigned long sec = fs->fat_lba + fb / SD_BLOCK_SIZE;
+        unsigned int  off = (unsigned int)(fb % SD_BLOCK_SIZE);
+        if (fs->rd(sec, scratch) != 0) return 0;
+        if ((le32(&scratch[off]) & 0x0FFFFFFFu) == 0) return c;
+    }
+    return 0;
+}
+
+int fat32_write_file_full(fat32_t *fs, const char *name, const void *data, unsigned int len)
+{
+    unsigned int cbytes = (unsigned int)fs->sectors_per_cluster * SD_BLOCK_SIZE;
+    unsigned int nclus  = (len + cbytes - 1) / cbytes; if (nclus == 0) nclus = 1;
+    const unsigned char *d = (const unsigned char *)data;
+
+    /* If the name already exists, free its old cluster chain (reuse dir entry). */
+    unsigned char n83[11]; name_to_83(name, n83);
+    unsigned long ent_lba = 0; unsigned int ent_off = 0, old_first = 0, old_size = 0;
+    int exists = (find_in_root(fs, n83, &ent_lba, &ent_off, &old_first, &old_size) == 0);
+    if (exists && old_first >= 2) {
+        unsigned int c = old_first; int safety = 1 << 20;
+        while (c >= 2 && c < 0x0FFFFFF8u && safety-- > 0) {
+            unsigned int nx = fat32_next_cluster(fs, c);
+            fat_set_entry(fs, c, 0);
+            c = nx;
+        }
+    }
+
+    /* Allocate + write + chain the clusters. */
+    unsigned int first = 0, prev = 0, cursor = 2;
+    for (unsigned int k = 0; k < nclus; k++) {
+        unsigned int c = fat_find_free(fs, cursor);
+        if (c == 0) return -3;
+        if (fat_set_entry(fs, c, 0x0FFFFFFFu) != 0) return -1;   /* claim it (EOC) */
+        unsigned long base = cluster_to_lba(fs, c);
+        for (unsigned int s = 0; s < fs->sectors_per_cluster; s++) {
+            unsigned char buf[SD_BLOCK_SIZE];
+            for (int i = 0; i < SD_BLOCK_SIZE; i++) {
+                unsigned int idx = k * cbytes + s * SD_BLOCK_SIZE + (unsigned int)i;
+                buf[i] = (idx < len) ? d[idx] : 0;
+            }
+            if (fs->wr(base + s, buf) != 0) return -1;
+        }
+        if (prev) { if (fat_set_entry(fs, prev, c) != 0) return -1; }
+        else      first = c;
+        prev = c; cursor = c + 1;
+    }
+
+    /* Directory entry: update in place if it existed, else append a new one. */
+    unsigned char ent[32];
+    for (int i = 0; i < 11; i++) ent[i] = n83[i];
+    ent[11] = 0x20; for (int k = 12; k < 32; k++) ent[k] = 0;
+    ent[20]=(unsigned char)(first>>16); ent[21]=(unsigned char)(first>>24);
+    ent[26]=(unsigned char)(first);     ent[27]=(unsigned char)(first>>8);
+    ent[28]=(unsigned char)(len);       ent[29]=(unsigned char)(len>>8);
+    ent[30]=(unsigned char)(len>>16);   ent[31]=(unsigned char)(len>>24);
+    if (exists) {
+        if (fs->rd(ent_lba, scratch) != 0) return -1;
+        for (int k = 0; k < 32; k++) scratch[ent_off + k] = ent[k];
+        if (fs->wr(ent_lba, scratch) != 0) return -1;
+        return 0;
+    }
+    unsigned int cur = fs->root_cluster; int safety = 1024;
+    while (cur >= 2 && cur < 0x0FFFFFF8u && safety-- > 0) {
+        unsigned long cbase = cluster_to_lba(fs, cur);
+        for (unsigned int s = 0; s < fs->sectors_per_cluster; s++) {
+            if (fs->rd(cbase + s, scratch) != 0) return -1;
+            for (int off2 = 0; off2 + 32 <= SD_BLOCK_SIZE; off2 += 32) {
+                unsigned char c0 = scratch[off2];
+                if (c0 == 0x00 || c0 == 0xE5) {
+                    for (int k = 0; k < 32; k++) scratch[off2 + k] = ent[k];
+                    if (fs->wr(cbase + s, scratch) != 0) return -1;
+                    return 0;
+                }
+            }
+        }
+        cur = fat32_next_cluster(fs, cur);
+    }
+    return -4;
+}
+
 /* ---- read / overwrite a single-cluster file (used for small config files) -- */
 
 /* Build the raw 11-byte 8.3 name (space-padded, upper-cased) from a C string. */
@@ -342,6 +450,55 @@ int fat32_read_file(fat32_t *fs, const char *name, void *out, unsigned int max)
         for (unsigned int i = 0; i < got; i++) o[s * SD_BLOCK_SIZE + i] = buf[i];
     }
     return (int)n;
+}
+
+/* Read a WHOLE root-dir file (8.3), following the FAT cluster chain, up to `max`
+ * bytes.  Read-only — used to load a multi-cluster .avm actor off the SD card.
+ * Returns the byte count, or -1 on missing file / I/O error. */
+int fat32_read_file_full(fat32_t *fs, const char *name, void *out, unsigned int max)
+{
+    unsigned char name83[11];
+    unsigned int first = 0, size = 0;
+    name_to_83(name, name83);
+    if (find_in_root(fs, name83, 0, 0, &first, &size) != 0) return -1;
+    if (first < 2) return -1;
+
+    unsigned int want = (size < max) ? size : max;
+    unsigned char *o = (unsigned char *)out;
+    unsigned int got = 0, cur = first;
+    int safety = 1 << 20;                       /* bound the cluster walk */
+    unsigned char buf[SD_BLOCK_SIZE];
+    while (cur >= 2 && cur < 0x0FFFFFF8u && got < want && safety-- > 0) {
+        unsigned long base = cluster_to_lba(fs, cur);
+        for (unsigned int s = 0; s < fs->sectors_per_cluster && got < want; s++) {
+            if (fs->rd(base + s, buf) != 0) return -1;
+            unsigned int chunk = want - got;
+            if (chunk > SD_BLOCK_SIZE) chunk = SD_BLOCK_SIZE;
+            for (unsigned int i = 0; i < chunk; i++) o[got + i] = buf[i];
+            got += chunk;
+        }
+        cur = fat32_next_cluster(fs, cur);
+    }
+    return (int)got;
+}
+
+/* Public helpers for a RESUMABLE (chunked-across-frames) file read: look up a
+ * root-dir file's first cluster + size, walk the FAT chain, and map a cluster to
+ * its first LBA.  Used by the AVM launch load bar so the SD read can be spread
+ * over several WM frames while the bar animates. */
+int fat32_open(fat32_t *fs, const char *name, unsigned int *first, unsigned int *size)
+{
+    unsigned char name83[11];
+    name_to_83(name, name83);
+    return find_in_root(fs, name83, 0, 0, first, size);
+}
+unsigned int fat32_next_cluster_of(fat32_t *fs, unsigned int cluster)
+{
+    return fat32_next_cluster(fs, cluster);
+}
+unsigned long fat32_cluster_lba(fat32_t *fs, unsigned int cluster)
+{
+    return cluster_to_lba(fs, cluster);
 }
 
 /* Create OR overwrite a single-cluster root-dir file.  If `name` already exists

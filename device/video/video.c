@@ -300,6 +300,25 @@ void fill_rect(int x, int y, int w, int h, unsigned int color)
     }
 }
 
+/* Blit a source ARGB buffer (srcstride ints per row) to desktop (x,y), with the
+ * same viewport offset + clipping as fill_rect.  Used by the AVM "Blender"
+ * display to flip its off-screen polygon raster into a window. */
+void video_blit(int x, int y, int w, int h, const unsigned int *src, int srcstride)
+{
+    if (!fb_ready || !src) return;
+    int sx = x - view_x, sy = y - view_y, ox = 0, oy = 0;
+    if (sx < 0) { ox = -sx; w += sx; sx = 0; }
+    if (sy < 0) { oy = -sy; h += sy; sy = 0; }
+    if (sx + w > (int)fb_width)  w = (int)fb_width  - sx;
+    if (sy + h > (int)fb_height) h = (int)fb_height - sy;
+    if (w <= 0 || h <= 0) return;
+    for (int dy = 0; dy < h; dy++) {
+        unsigned int *row = (unsigned int *)(fb_draw + (sy + dy) * fb_pitch + sx * 4);
+        const unsigned int *s = src + (oy + dy) * srcstride + ox;
+        for (int dx = 0; dx < w; dx++) row[dx] = s[dx];
+    }
+}
+
 /* ===================================================================
  *  Actor graphics canvas.  AIPL actors append line/circle commands
  *  (gfx_line / gfx_circle); the Graphics window replays the whole

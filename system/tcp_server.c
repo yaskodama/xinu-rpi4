@@ -1482,6 +1482,51 @@ static int http_build(const char *req, char *out, int max)
         cc_actor_send_str(0, "say", msg, creply, sizeof creply);
         bl = s_put(body, bl, creply);
         bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "POST /actor/loadvm") || starts_with(req, "GET /actor/loadvm")) {
+        /* Upload an AIPL .avm actor module and run it in the kernel AVM VM (the
+         * "Blender" polygon display).  Checked BEFORE /actor/load (which would
+         * prefix-match "loadvm").  Chunked like /chainload (httpreq is 32KB):
+         *   POST /actor/loadvm?off=<byte>   body = a chunk of the .avm
+         *   GET  /actor/loadvm?go=1&len=<N> load + spawn + run -> VM graphics window
+         */
+        ctype = "text/plain";
+        extern void avm_stage_reset(void);
+        extern int  avm_stage_put(int, const unsigned char *, int);
+        extern void avm_load_progress(int, int);
+        extern int  avm_loadrun(int);
+        if (req[0] == 'P') {
+            int off = q_int(req, "off", -1);
+            int cl  = content_length(req);
+            int he  = find_header_end(req);
+            int tot = q_int(req, "total", 0);              /* for the on-screen bar */
+            if (off == 0) avm_stage_reset();               /* new upload */
+            if (off >= 0 && cl > 0 && he >= 0) {
+                int rc = avm_stage_put(off, (const unsigned char *)(req + he), cl);
+                avm_load_progress(off + cl, tot);          /* drive the load bar */
+                bl = s_put(body, bl, rc == 0 ? "ok off=" : "ERR off=");
+                bl = s_putdec(body, bl, off);
+                bl = s_put(body, bl, " n="); bl = s_putdec(body, bl, cl);
+                bl = s_put(body, bl, "\n");
+            } else {
+                bl = s_put(body, bl, "usage: POST /actor/loadvm?off=<byte> body=<chunk>\n");
+            }
+        } else if (q_int(req, "go", 0)) {
+            int len = q_int(req, "len", 0);
+            char savename[16];
+            int  want_save = q_param(req, "save", savename, sizeof savename);
+            int id  = avm_loadrun(len);
+            bl = s_put(body, bl, "loadvm: len="); bl = s_putdec(body, bl, len);
+            bl = s_put(body, bl, " spawned actor id="); bl = s_putdec(body, bl, id);
+            if (want_save) {                                   /* persist to microSD */
+                extern int avm_save(const char *, int);
+                int rc = avm_save(savename, len);
+                bl = s_put(body, bl, "  saved '"); bl = s_put(body, bl, savename);
+                bl = s_put(body, bl, "' rc="); bl = s_putdec(body, bl, rc);
+            }
+            bl = s_put(body, bl, "\n");
+        } else {
+            bl = s_put(body, bl, "POST chunks to ?off=, then GET /actor/loadvm?go=1&len=<N>\n");
+        }
     } else if (starts_with(req, "POST /actor/load") || starts_with(req, "GET /actor/load")) {
         /* Load an AIPL-generated C program as RESIDENT actors: the body is
          * the C source; main() spawns the actors and they stay alive for
@@ -1509,6 +1554,20 @@ static int http_build(const char *req, char *out, int max)
         static char ares[1100];
         cc_actor_load(asrc, aslen, ares, sizeof ares);
         bl = s_put(body, bl, ares);
+    } else if (starts_with(req, "GET /sdprobe")) {
+        /* Diagnostic: read one EMMC block at ?lba=N and report rc + the failure
+         * INTERRUPT bits.  Used to find where microSD reads start failing. */
+        ctype = "text/plain";
+        extern int sd_read_block(unsigned long, void *);
+        extern unsigned int sd_last_int(void);
+        int lba = q_int(req, "lba", 0);
+        static unsigned char sb[512];
+        int rc = sd_read_block((unsigned long)(unsigned)lba, sb);
+        bl = s_put(body, bl, "lba=");   bl = s_putdec(body, bl, lba);
+        bl = s_put(body, bl, " rc=");   bl = s_putdec(body, bl, rc);
+        bl = s_put(body, bl, " int=0x"); bl = s_puthex(body, bl, sd_last_int());
+        bl = s_put(body, bl, " b0=");   bl = s_putdec(body, bl, sb[0]);
+        bl = s_put(body, bl, "\n");
     } else if (path_eq(req, "/actor/send")) {
         /* Exchange a message with a resident actor.  Up to 3 int args:
          *   GET /actor/send?to=<id>&m=<method>&arg=<n>[&a1=<n>&a2=<n>]

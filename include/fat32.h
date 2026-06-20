@@ -89,4 +89,17 @@ int fat32_read_file(fat32_t *fs, const char *name, void *out, unsigned int max);
  * big (>1 cluster), -3 no free cluster, -4 dir full. */
 int fat32_write_file(fat32_t *fs, const char *name, const void *data, unsigned int len);
 
+/* Read a WHOLE file (following its FAT cluster chain) up to `max` bytes — for
+ * multi-cluster files like an .avm actor.  Read-only.  Returns bytes or -1. */
+int fat32_read_file_full(fat32_t *fs, const char *name, void *out, unsigned int max);
+
+/* Write a WHOLE file (multi-cluster), allocating + chaining free clusters.  If
+ * `name` exists its old chain is freed and the dir entry reused.  Returns 0 ok. */
+int fat32_write_file_full(fat32_t *fs, const char *name, const void *data, unsigned int len);
+
+/* Resumable-read helpers (chunk a big file across frames for a load bar). */
+int          fat32_open(fat32_t *fs, const char *name, unsigned int *first, unsigned int *size);
+unsigned int fat32_next_cluster_of(fat32_t *fs, unsigned int cluster);
+unsigned long fat32_cluster_lba(fat32_t *fs, unsigned int cluster);
+
 #endif /* XINU_RPI4_FAT32_H */

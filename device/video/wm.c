@@ -424,9 +424,15 @@ static void menu_action_basic(void)
     extern void basicwin_new(void);          /* create/raise an on-demand BASIC window */
     basicwin_new();
 }
+static void menu_action_aipl(void)
+{
+    extern void avm_open_list(void);         /* list .avm on SD/microSD, click to run */
+    avm_open_list();
+}
 static const struct { const char *label; void (*action)(void); } wm_menu_items[] = {
     { "New Shell window", menu_action_shell },
     { "New BASIC window", menu_action_basic },
+    { "Run AIPL actor",   menu_action_aipl  },
 };
 #define WM_MENU_N ((int)(sizeof(wm_menu_items) / sizeof(wm_menu_items[0])))
 
@@ -442,14 +448,29 @@ void wm_menu_open(int sx, int sy)
     menu_open = 1;
 }
 
+/* Cursor position in DESKTOP coordinates (cursor is tracked screen-space). */
+void wm_cursor_desktop(int *x, int *y) { if (x) *x = cursor_x + vp_x; if (y) *y = cursor_y + vp_y; }
+
+/* Which menu item is the pointer over right now?  -1 if none. */
+static int wm_menu_hover(void)
+{
+    int cx = cursor_x + vp_x, cy = cursor_y + vp_y;
+    if (cx < menu_x || cx >= menu_x + WM_MENU_W) return -1;
+    if (cy < menu_y + 1 || cy >= menu_y + 1 + WM_MENU_N * WM_MENU_ITEM_H) return -1;
+    return (cy - menu_y - 1) / WM_MENU_ITEM_H;
+}
 static void wm_menu_draw(void)
 {
     int h = WM_MENU_N * WM_MENU_ITEM_H + 2;
     fill_rect(menu_x, menu_y, WM_MENU_W, h, 0xFF202830U);
     draw_rect(menu_x, menu_y, WM_MENU_W, h, 0xFFFFD23CU);   /* amber border */
+    int hov = wm_menu_hover();
     for (int i = 0; i < WM_MENU_N; i++) {
         int iy = menu_y + 1 + i * WM_MENU_ITEM_H;
-        draw_string_at(menu_x + 6, iy + 5, wm_menu_items[i].label, 0xFFFFFFFFU, 0xFF202830U);
+        unsigned int bg = (i == hov) ? 0xFFFFD23CU : 0xFF202830U;   /* invert on hover */
+        unsigned int fg = (i == hov) ? 0xFF101010U : 0xFFFFFFFFU;
+        if (i == hov) fill_rect(menu_x + 1, iy, WM_MENU_W - 2, WM_MENU_ITEM_H, bg);
+        draw_string_at(menu_x + 6, iy + 5, wm_menu_items[i].label, fg, bg);
     }
 }
 
@@ -665,6 +686,7 @@ void wm_run(void)
          * cursor composite below is unaffected. */
         video_set_viewport(0, 0);
         draw_wifi_badge(sw, sh);
+        { extern void avm_draw_loadbar(int sw, int sh); avm_draw_loadbar(sw, sh); }  /* .avm upload progress */
         video_set_viewport(vp_x, vp_y);
 
         /* Composite the cursor INTO the finished backbuffer *before* the flip

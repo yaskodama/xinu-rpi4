@@ -37,6 +37,8 @@
 #define C1_CLK_STABLE      0x00000002
 #define C1_CLK_EN          0x00000004   /* SD clock enable                  */
 #define C1_SRST_HC         0x01000000   /* reset the complete host          */
+#define C1_SRST_CMD        0x02000000   /* reset the command line           */
+#define C1_SRST_DAT        0x04000000   /* reset the data line              */
 
 /* Command + transfer-mode words (index<<24 | flags). */
 #define CMD_GO_IDLE        0x00000000   /* CMD0,  no response               */
@@ -80,6 +82,7 @@ static void sd_udelay(unsigned us)
 }
 
 static volatile unsigned int sd_dbg_int;   /* INTERRUPT captured at the last failure */
+unsigned int sd_last_int(void) { return sd_dbg_int; }   /* last failure's INTERRUPT bits */
 
 /* Snapshot the key controller registers for the `mount` diagnostic.  `intr` is
  * the INTERRUPT value captured AT the failing command (wait_int clears the live
@@ -133,64 +136,76 @@ int sd_init(void)
 
     if (sd_inited) return 0;
 
-    /* Reset the whole host, wait for the reset bit to self-clear. */
-    EMMC_CONTROL1 = C1_SRST_HC;
-    for (t = 0; t < POLL_LIMIT; t++)
-        if (!(EMMC_CONTROL1 & C1_SRST_HC)) break;
-    if (EMMC_CONTROL1 & C1_SRST_HC) { sd_dbg_step = 1; return -1; }
+    /* The Pi 4 microSD CMD8 bring-up is settle-sensitive and intermittently
+     * times out (CTO) on a cold boot.  Retry the WHOLE bring-up several times,
+     * lengthening the power/clock settle each pass, so a flaky cold card still
+     * comes up reliably instead of leaving /microsd unreadable for that boot. */
+    int ok = 0;
+    for (int attempt = 0; attempt < 6 && !ok; attempt++) {
+        unsigned int settle = 10000u + (unsigned int)attempt * 15000u;  /* 10..85 ms */
 
-    /* Identify-speed clock: data-timeout field 0xE, 10-bit clock divider 0x200
-     * (SDCLK = base/1024 ≈ 98–244 kHz across the Pi 4 EMMC2 base clock),
-     * internal clock enable; wait stable; then enable the SD clock. */
-    EMMC_CONTROL1 = 0x000E0081u;
-    for (t = 0; t < POLL_LIMIT; t++)
-        if (EMMC_CONTROL1 & C1_CLK_STABLE) break;
-    if (!(EMMC_CONTROL1 & C1_CLK_STABLE)) { sd_dbg_step = 12; return -1; }
-    EMMC_CONTROL1 |= C1_CLK_EN;
+        /* Reset the whole host, wait for the reset bit to self-clear. */
+        EMMC_CONTROL1 = C1_SRST_HC;
+        for (t = 0; t < POLL_LIMIT; t++)
+            if (!(EMMC_CONTROL1 & C1_SRST_HC)) break;
+        if (EMMC_CONTROL1 & C1_SRST_HC) { sd_dbg_step = 1; continue; }
 
-    /* Bus power ON + 3.3V select (CONTROL0 bit8 = SD bus power, bits[11:9]=111
-     * = 3.3V).  A full SRST_HC clears the firmware's power-up, so without this
-     * the card gets no bus power and never answers CMD8 (observed: sd_init
-     * fails at step 40 with a command timeout). */
-    EMMC_CONTROL0 = (EMMC_CONTROL0 & ~0x00000F00u) | 0x00000F00u;
+        /* Identify-speed clock (≈98 kHz), wait stable, enable SD clock. */
+        EMMC_CONTROL1 = 0x000E0081u;
+        for (t = 0; t < POLL_LIMIT; t++)
+            if (EMMC_CONTROL1 & C1_CLK_STABLE) break;
+        if (!(EMMC_CONTROL1 & C1_CLK_STABLE)) { sd_dbg_step = 12; continue; }
+        EMMC_CONTROL1 |= C1_CLK_EN;
 
-    /* Power/clock settle: hold ≥74 SDCLK cycles with the clock running and the
-     * rail stable before the first command.  At ~98 kHz that is ~755 µs; wait a
-     * generous 10 ms so a cold card is unambiguously ready (this is THE fix for
-     * the CMD8 timeout — see sd_udelay's note). */
-    sd_udelay(10000);
+        /* Bus power ON + 3.3 V select. */
+        EMMC_CONTROL0 = (EMMC_CONTROL0 & ~0x00000F00u) | 0x00000F00u;
 
-    /* Poll-mode: signal disabled, status latching enabled, clear stale status. */
-    EMMC_IRPT_EN   = 0;
-    EMMC_IRPT_MASK = 0xFFFFFFFFu;
-    EMMC_INTERRUPT = 0xFFFFFFFFu;
-    sd_dbg_step = 2;
+        /* Power/clock settle before the first command (lengthened per retry). */
+        sd_udelay(settle);
 
-    sd_cmd(CMD_GO_IDLE, 0);                            /* CMD0 (no response)  */
-    sd_udelay(1000);                                   /* let the card reach idle */
-    if (sd_cmd(CMD_SEND_IF_COND, 0x1AA) != 0) { sd_dbg_step = 40; return -1; }  /* CMD8 */
-    if (EMMC_RESP0 != 0x1AA)                  { sd_dbg_step = 41; return -1; }
+        EMMC_IRPT_EN   = 0;
+        EMMC_IRPT_MASK = 0xFFFFFFFFu;
+        EMMC_INTERRUPT = 0xFFFFFFFFu;
+        sd_dbg_step = 2;
 
-    /* ACMD41: repeat CMD55 + CMD41 (HCS=1) until the OCR busy bit (31) sets.
-     * The card needs up to ~1 s to finish its power-up ramp, polled ~1 ms apart
-     * (verified live: OCR went 0x00FF8000 -> 0xC0FF8000 SDHC-ready in 3 polls). */
-    for (t = 0; t < 1000; t++) {
-        if (sd_cmd(CMD_APP_CMD, 0) != 0)               { sd_dbg_step = 50; return -1; }
-        if (sd_cmd(CMD_SD_SENDOPCOND, 0x40FF8000u) != 0) { sd_dbg_step = 60; return -1; }
-        if (EMMC_RESP0 & 0x80000000u) break;           /* card powered up     */
-        sd_udelay(1000);
+        sd_cmd(CMD_GO_IDLE, 0);                            /* CMD0 (no response) */
+        sd_udelay(2000);                                   /* reach idle         */
+        if (sd_cmd(CMD_SEND_IF_COND, 0x1AA) != 0) { sd_dbg_step = 40; continue; }  /* CMD8 */
+        if (EMMC_RESP0 != 0x1AA)                  { sd_dbg_step = 41; continue; }
+
+        /* ACMD41 until the OCR busy bit (31) sets. */
+        int powered = 0;
+        for (t = 0; t < 1000; t++) {
+            if (sd_cmd(CMD_APP_CMD, 0) != 0)                 { sd_dbg_step = 50; break; }
+            if (sd_cmd(CMD_SD_SENDOPCOND, 0x40FF8000u) != 0) { sd_dbg_step = 60; break; }
+            if (EMMC_RESP0 & 0x80000000u) { powered = 1; break; }
+            sd_udelay(1000);
+        }
+        if (!powered) { sd_dbg_step = 61; continue; }
+
+        if (sd_cmd(CMD_ALL_SEND_CID, 0) != 0)  { sd_dbg_step = 80;  continue; }  /* CMD2 */
+        if (sd_cmd(CMD_SEND_REL_ADDR, 0) != 0) { sd_dbg_step = 90;  continue; }  /* CMD3 */
+        rca = EMMC_RESP0 & 0xFFFF0000u;
+        if (sd_cmd(CMD_SELECT_CARD, rca) != 0) { sd_dbg_step = 100; continue; }  /* CMD7 */
+        if (sd_cmd(CMD_SET_BLOCKLEN, SD_BLOCK_SIZE) != 0) { sd_dbg_step = 110; continue; } /* CMD16 */
+
+        ok = 1;
     }
-    if (!(EMMC_RESP0 & 0x80000000u)) { sd_dbg_step = 61; return -1; }
-
-    if (sd_cmd(CMD_ALL_SEND_CID, 0) != 0)  { sd_dbg_step = 80;  return -1; }   /* CMD2  */
-    if (sd_cmd(CMD_SEND_REL_ADDR, 0) != 0) { sd_dbg_step = 90;  return -1; }   /* CMD3  */
-    rca = EMMC_RESP0 & 0xFFFF0000u;
-    if (sd_cmd(CMD_SELECT_CARD, rca) != 0) { sd_dbg_step = 100; return -1; }   /* CMD7  */
-    if (sd_cmd(CMD_SET_BLOCKLEN, SD_BLOCK_SIZE) != 0) { sd_dbg_step = 110; return -1; } /* CMD16 */
+    if (!ok) return -1;
 
     sd_dbg_step = 11;
     sd_inited = 1;
     return 0;
+}
+
+/* Reset the CMD + DAT lines after an error so the controller isn't left wedged
+ * (a CTO with no recovery makes EVERY following command time out too). */
+static void sd_reset_cmd_dat(void)
+{
+    EMMC_CONTROL1 |= (C1_SRST_CMD | C1_SRST_DAT);
+    for (unsigned long t = 0; t < POLL_LIMIT; t++)
+        if (!(EMMC_CONTROL1 & (C1_SRST_CMD | C1_SRST_DAT))) break;
+    EMMC_INTERRUPT = 0xFFFFFFFFu;
 }
 
 int sd_read_block(unsigned long lba, void *buf)
@@ -199,17 +214,22 @@ int sd_read_block(unsigned long lba, void *buf)
 
     if (!sd_inited && sd_init() != 0) return -1;
 
-    if (sd_wait_ready() != 0) return -1;
-    EMMC_INTERRUPT  = 0xFFFFFFFFu;
-    EMMC_BLKSIZECNT = (1u << 16) | SD_BLOCK_SIZE;      /* 1 block of 512 B    */
-    EMMC_ARG1       = (unsigned int)lba;               /* SDHC: block address */
-    EMMC_CMDTM      = CMD_READ_SINGLE;                 /* CMD17               */
-
-    if (wait_int(INT_CMD_DONE) != 0) return -1;
-    if (wait_int(INT_READ_RDY) != 0) return -1;
-    for (int i = 0; i < SD_BLOCK_SIZE / 4; i++) p[i] = EMMC_DATA;
-    if (wait_int(INT_DATA_DONE) != 0) return -1;
-    return 0;
+    /* Retry with a CMD/DAT-line reset between attempts: recovers transient CMD
+     * timeouts (CTO) AND, on final failure, leaves the lines reset so the next
+     * read (e.g. the directory scan) still works instead of staying wedged. */
+    for (int attempt = 0; attempt < 4; attempt++) {
+        if (sd_wait_ready() != 0)            { sd_reset_cmd_dat(); continue; }
+        EMMC_INTERRUPT  = 0xFFFFFFFFu;
+        EMMC_BLKSIZECNT = (1u << 16) | SD_BLOCK_SIZE;   /* 1 block of 512 B */
+        EMMC_ARG1       = (unsigned int)lba;            /* SDHC: block address */
+        EMMC_CMDTM      = CMD_READ_SINGLE;              /* CMD17 */
+        if (wait_int(INT_CMD_DONE) != 0)     { sd_reset_cmd_dat(); continue; }
+        if (wait_int(INT_READ_RDY) != 0)     { sd_reset_cmd_dat(); continue; }
+        for (int i = 0; i < SD_BLOCK_SIZE / 4; i++) p[i] = EMMC_DATA;
+        if (wait_int(INT_DATA_DONE) != 0)    { sd_reset_cmd_dat(); continue; }
+        return 0;
+    }
+    return -1;
 }
 
 int sd_write_block(unsigned long lba, const void *buf)
