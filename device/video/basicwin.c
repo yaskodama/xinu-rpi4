@@ -7,6 +7,14 @@
 // and the interpreter's output (bw_emit) flows from the cursor like a terminal.
 // The view auto-scrolls to keep the cursor visible; PageUp/PageDown and the
 // up/down arrows at the edges scroll the 10-screen buffer.
+//
+// MULTI-INSTANCE: up to BASICWIN_N BASIC windows, each with its OWN text grid,
+// cursor and interpreter instance (bs[i] in basic.c).  Window 0 is the primary
+// `basic_win` wired at boot; the right-click menu's "New BASIC window" builds
+// the rest via basicwin_new().  The WM is single-threaded, so before dispatching
+// a key / click / draw to window i we set bw_curi = i and basic_select(i); every
+// per-window field below resolves through ctx[bw_curi], and every bs[] macro in
+// basic.c resolves through basic_curi() — so the two stay in lock-step.
 
 #include "basicwin.h"
 #include "video.h"
@@ -23,11 +31,50 @@ extern void basic_set_circle(void (*fn)(int, int, int, int));
 extern void basic_set_plot(void (*fn)(int, int, int));
 extern void basic_set_gfx_active(int (*fn)(void));
 extern void basic_break(void);             /* request a RUN-loop break */
+extern void basic_select(int inst);        /* pick which bs[] instance is current */
 extern int  xhci_poll_ctrl_c(void);        /* polls "is Ctrl+C held?" */
 extern void wm_cursor_after_blit(void);    /* pump mouse + re-stamp cursor */
 
 #define BW_COLS   96            /* chars per row (fixed grid)              */
 #define BW_ROWS   360           /* ~10 screens of scrollback              */
+#define BW_N      BASICWIN_N    /* how many independent BASIC windows      */
+
+/* ---- per-window state ----------------------------------------------------
+ * Everything that used to be a file-scope global now lives in one struct,
+ * instanced per window in ctx[].  The function bodies below are unchanged: the
+ * macros after the array make `grid`, `cur_row`, … resolve to ctx[bw_curi]. */
+struct bw_ctx {
+    char grid[BW_ROWS][BW_COLS + 1];  /* space-padded; trailing NUL for drawing */
+    int  cur_row, cur_col;            /* cursor in buffer coords                */
+    int  view_top;                    /* first buffer row shown                 */
+    int  inited;
+    int  esc_state;                   /* ANSI escape parser: 0 none,1 ESC,2 ESC[ */
+    int  gfx_on;                      /* 1 once a program enters graphics mode   */
+};
+static struct bw_ctx ctx[BW_N];
+static int bw_curi;                   /* active instance for the macros below   */
+
+#define grid       (ctx[bw_curi].grid)
+#define cur_row    (ctx[bw_curi].cur_row)
+#define cur_col    (ctx[bw_curi].cur_col)
+#define view_top   (ctx[bw_curi].view_top)
+#define inited     (ctx[bw_curi].inited)
+#define esc_state  (ctx[bw_curi].esc_state)
+#define gfx_on     (ctx[bw_curi].gfx_on)
+
+/* Window 0 is the primary, wired at boot (others reference &basic_win); windows
+ * 1.. are built on demand by basicwin_new(). */
+window_t basic_win;
+static window_t basic_win_x[BW_N - 1];
+static int extra_count;                /* extra BASIC windows built (0..BW_N-1)  */
+
+static window_t *win_of(int i) { return i == 0 ? &basic_win : &basic_win_x[i - 1]; }
+static int inst_of(window_t *w)
+{
+    if (w == &basic_win) return 0;
+    for (int i = 0; i < BW_N - 1; i++) if (w == &basic_win_x[i]) return i + 1;
+    return -1;
+}
 
 /* ---- toolbar buttons --------------------------------------------------
  * A clickable strip just below the title bar.  Each button injects a BASIC
@@ -60,16 +107,6 @@ static void bw_btn_rect(int i, int win_w, int *bx, int *by, int *bw, int *bh)
     *bx = 2 + i * (w + BW_BTN_GAP);
     *by = WM_TITLEBAR_H + 2;
 }
-
-window_t basic_win;
-
-/* Space-padded grid: every row is BW_COLS chars + a trailing NUL for drawing. */
-static char grid[BW_ROWS][BW_COLS + 1];
-static int  cur_row, cur_col;   /* cursor in buffer coords                 */
-static int  view_top;           /* first buffer row shown                  */
-static int  inited;
-static int  esc_state;          /* ANSI escape parser: 0 none,1 ESC,2 ESC[ */
-static int  gfx_on;             /* 1 once a program enters graphics mode    */
 
 /* Graphics canvas rect = the content area below the toolbar.  BASIC's
  * LINE/CIRCLE/PLOT are drawn here via the shared gfx_* display list. */
@@ -127,9 +164,10 @@ static void bw_cls(int mode)
  * is blocked while a program RUNs). */
 static void bw_present_gfx(void)
 {
+    window_t *self = win_of(bw_curi);
     int gx, gy, gw, gh;
-    bw_gfx_rect(&basic_win, &gx, &gy, &gw, &gh);
-    fill_rect(gx, gy, gw, gh, basic_win.content_bg);
+    bw_gfx_rect(self, &gx, &gy, &gw, &gh);
+    fill_rect(gx, gy, gw, gh, self->content_bg);
     bgfx_render(gx, gy, gw, gh);
     video_present();
     wm_cursor_after_blit();   /* flip wiped the cursor — pump mouse + re-stamp */
@@ -169,23 +207,40 @@ static int  bw_gfx_active(void) { return gfx_on; }
  * then run it through the interpreter (output flows from the cursor). */
 static void bw_on_click(window_t *self, int lx, int ly)
 {
+    int i = inst_of(self);
+    if (i < 0) return;
+    bw_curi = i; basic_select(i);
     if (!inited) return;
-    for (int i = 0; i < BW_NBTN; i++) {
+    for (int b = 0; b < BW_NBTN; b++) {
         int bx, by, bw, bh;
-        bw_btn_rect(i, self->width, &bx, &by, &bw, &bh);
+        bw_btn_rect(b, self->width, &bx, &by, &bw, &bh);
         if (lx >= bx && lx < bx + bw && ly >= by && ly < by + bh) {
-            bw_emit(bw_btns[i].cmd);
+            bw_emit(bw_btns[b].cmd);
             bw_putc('\n');
-            basic_exec_line(bw_btns[i].cmd);
+            basic_exec_line(bw_btns[b].cmd);
             return;
         }
     }
 }
 
-void basicwin_init(void)
+/* Bind one instance's interpreter (program/vars cleared) — the seams are global
+ * and set once by basicwin_init(); they always act on the current bw_curi. */
+static void bw_init_inst(int i)
 {
+    bw_curi = i; basic_select(i);
     clear_all();
     esc_state = 0;
+    gfx_on = 0;
+    inited = 1;
+    basic_init();
+}
+
+void basicwin_init(void)
+{
+    bw_curi = 0; basic_select(0);
+    clear_all();
+    esc_state = 0;
+    gfx_on = 0;
     inited = 1;
     basic_init();
     basic_set_emit(bw_emit);
@@ -198,6 +253,47 @@ void basicwin_init(void)
     basic_set_gfx_active(bw_gfx_active);    /* gfx-mode flag (suppresses "Ok") */
     basic_win.on_click = bw_on_click;       /* wire the toolbar */
     /* No prompt — leave the cursor at the top-left of an empty page. */
+}
+
+/* Create (or, once all are built, raise) an on-demand BASIC window — bound to
+ * the right-click context menu's "New BASIC window".  Each window cascades down
+ * from the primary and gets its OWN interpreter instance. */
+void basicwin_new(void)
+{
+    extern void wm_show(window_t *);
+
+    if (extra_count >= BW_N - 1) {             /* all built — just raise the newest */
+        wm_show(&basic_win_x[BW_N - 2]);
+        return;
+    }
+
+    int i = extra_count;                       /* 0-based extra index */
+    int inst = i + 1;                          /* interpreter instance 1.. */
+    window_t *w = &basic_win_x[i];
+
+    /* Cascade so a new window doesn't land exactly on the primary. */
+    w->x = 40 + inst * 28;
+    w->y = 60 + inst * 26;
+    w->width  = 618;
+    w->height = 319;
+    w->font_scale = 1;
+
+    char nm[8] = "BASIC ?";                    /* "BASIC 2" / "BASIC 3" / "BASIC 4" */
+    nm[6] = (char)('2' + i);
+    int k; for (k = 0; k < WM_TITLE_MAX && nm[k]; k++) w->title[k] = nm[k];
+    w->title[k] = 0;
+
+    w->chrome_color = 0xFF40A0FFU;
+    w->title_bg     = 0xFF103060U;
+    w->title_fg     = 0xFFFFFFFFU;
+    w->content_bg   = 0xFF000810U;
+    w->draw_content = basicwin_draw;
+    w->on_click     = bw_on_click;
+
+    bw_init_inst(inst);
+
+    extra_count++;
+    wm_show(w);
 }
 
 /* ---- drawing ---- */
@@ -230,6 +326,10 @@ static void bw_draw_toolbar(window_t *self)
 void basicwin_draw(window_t *self, unsigned int frame)
 {
     (void)frame;
+    int inst = inst_of(self);
+    if (inst < 0) return;
+    bw_curi = inst; basic_select(inst);
+
     bw_draw_toolbar(self);
     int fs = self->font_scale > 0 ? self->font_scale : 1;
     int cx = self->x + 4;
@@ -318,7 +418,8 @@ static void do_enter(void)
     }
 }
 
-void basicwin_handle_key(char c)
+/* Key handler body — operates on the current bw_curi (set by the callers). */
+static void bw_key(char c)
 {
     if (!inited) return;
 
@@ -348,4 +449,20 @@ void basicwin_handle_key(char c)
     else if (c == 0x08 || c == 0x7f)      backspace();
     else if (c >= 0x20 && c < 0x7f)       insert_char(c);
     /* other control chars ignored */
+}
+
+void basicwin_handle_key(char c)            /* primary BASIC window (instance 0) */
+{
+    bw_curi = 0; basic_select(0);
+    bw_key(c);
+}
+
+/* Route a keypress to an on-demand BASIC window if `aw` is one of them. */
+int basicwin_route_key(window_t *aw, char c)
+{
+    int i = inst_of(aw);
+    if (i <= 0) return 0;                    /* not an extra BASIC window */
+    bw_curi = i; basic_select(i);
+    bw_key(c);
+    return 1;
 }

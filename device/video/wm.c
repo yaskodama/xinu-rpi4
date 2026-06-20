@@ -408,8 +408,14 @@ static void menu_action_shell(void)
     extern void shellwin_new(void);          /* create/raise an on-demand shell window */
     shellwin_new();
 }
+static void menu_action_basic(void)
+{
+    extern void basicwin_new(void);          /* create/raise an on-demand BASIC window */
+    basicwin_new();
+}
 static const struct { const char *label; void (*action)(void); } wm_menu_items[] = {
     { "New Shell window", menu_action_shell },
+    { "New BASIC window", menu_action_basic },
 };
 #define WM_MENU_N ((int)(sizeof(wm_menu_items) / sizeof(wm_menu_items[0])))
 

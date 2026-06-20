@@ -146,7 +146,7 @@ static void num_str(double v, char *out)
  * DATA/READ/RESTORE cursor: data_pc = prog[] index of the DATA line being
  * read (-1 before the first READ / after RESTORE); data_ip walks its items,
  * NULL forces a re-scan from data_pc+1. */
-#define NBASIC 1          /* Pi 4: one on-screen BASIC window */
+#define NBASIC 4          /* Pi 4: up to 4 on-screen BASIC windows (1 + 3 extra) */
 struct basic_state {
     struct { int no; char text[PLINELEN]; } prog[MAXPROG];
     int    nprog;
@@ -188,19 +188,23 @@ static int basic_tid[NBASIC] = { -1 };
 #ifdef BASIC_HOST_TEST
 int basic_host_inst = 0;               /* host test: which instance is "current" */
 #endif
+/* Active instance for the on-screen windows.  The WM is single-threaded, so the
+ * window layer (basicwin.c) calls basic_select(i) right before it dispatches a
+ * line / key / draw to BASIC window i; every bs[basic_curi()] macro then resolves
+ * to that window's private interpreter state. */
+static int basic_cur = 0;
+void basic_select(int inst) { if (inst >= 0 && inst < NBASIC) basic_cur = inst; }
 int basic_curi(void)
 {
 #ifdef BASIC_HOST_TEST
     return basic_host_inst;
 #else
-    /* Pi 4 runs a single on-screen BASIC window (basicwin.c): one instance,
-     * no per-thread mapping (no `thrcurrent`). */
     (void)basic_tid;
-    return 0;
+    return basic_cur;
 #endif
 }
 #ifndef BASIC_HOST_TEST
-void basic_bind_thread(int inst) { (void)inst; }   /* single instance — no-op */
+void basic_bind_thread(int inst) { (void)inst; }   /* selection is explicit via basic_select() */
 #endif
 
 /* Redirect every former global to the current instance's field. */

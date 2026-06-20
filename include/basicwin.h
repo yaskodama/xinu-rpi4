@@ -11,10 +11,18 @@
 
 #include "wm.h"
 
+/* Up to BASICWIN_N on-screen BASIC windows, each with a FULLY INDEPENDENT
+ * interpreter instance (program / variables / text buffer).  Window 0 is the
+ * primary `basic_win` wired at boot; the right-click menu's "New BASIC window"
+ * builds the rest on demand via basicwin_new().  Must be <= NBASIC in basic.c. */
+#define BASICWIN_N 4
+
 extern window_t basic_win;
 
 void basicwin_init(void);                                   /* set seams + greet  */
 void basicwin_draw(window_t *self, unsigned int frame);     /* wm draw_content    */
-void basicwin_handle_key(char c);                           /* keyboard -> REPL   */
+void basicwin_handle_key(char c);                           /* keyboard -> primary REPL */
+void basicwin_new(void);                                    /* spawn another BASIC window */
+int  basicwin_route_key(window_t *aw, char c);              /* key -> extra BASIC window  */
 
 #endif /* XINU_RPI4_BASICWIN_H */

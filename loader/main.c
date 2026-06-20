@@ -303,9 +303,11 @@ void xhci_keyboard_event(char c)
     extern window_t *wm_active(void);
     extern window_t  basic_win;
     extern void      basicwin_handle_key(char);
+    extern int       basicwin_route_key(window_t *, char);
     extern int       shellwin_route_key(window_t *, char);
     window_t *aw = wm_active();
-    if      (aw == &basic_win)            basicwin_handle_key(c);
+    if      (aw == &basic_win)            basicwin_handle_key(c);    /* BASIC 1 (default) */
+    else if (basicwin_route_key(aw, c))   ;                /* on-demand BASIC 2/3/4 */
     else if (shellwin_route_key(aw, c))   ;                /* on-demand Shell 2/3 */
     else                                  shellwin_handle_key(c);  /* Shell 1 (default) */
 }
