@@ -1,7 +1,105 @@
 # Pi4 (xinu-rpi4) — Next-Session Handoff
 
-Last updated: **2026-06-16**.  Branch **`main`**, HEAD **`c16321f`** (pushed to
-`github.com/yaskodama/xinu-rpi4`).  Older 2026-06-10 notes kept below for reference.
+Last updated: **2026-06-20**.  Branch **`feat/smp-4core-and-basic-graphics`**.
+Older notes kept below for reference.
+
+---
+
+## ★ 2026-06-20 session — /sd USB Mass Storage (✅ WORKING on real HW)
+
+Goal: make **/sd** (USB-A thumb drive / SSD) auto-mount + read/write, mirroring
+the working /microsd (EMMC2).  **Done — verified on real hardware**: a USB-3.0
+thumb drive (blue port) auto-mounts FAT32 under /sd, reads (INQUIRY / READ
+CAPACITY / READ(10) / FAT walk) and writes (`usbwtest` WRITE+VERIFY PASS,
+`usbfwrite` created /sd/XINUSD.TXT) all work.  Current build burned to SD:
+`compile/kernel8.img` **md5 `083a1bff`** (config.txt `total_mem=2048` preserved).
+
+### ★ Root cause that blocked first attempts (the real fix)
+A USB-3.0 drive in a **blue port** enumerates **DIRECTLY on a VL805 root port at
+SuperSpeed** (`rp02 sp04 cls00 ic08`), but the enum code assumed *every* root port
+is an internal hub and called the USB-2 `xhci_hub_enumerate` (which fails for a
+SuperSpeed device), so the drive was never set up.  Fix: in `xhci_vl805_enum_full`
+check the **interface class** of each root-port device — class 8 → `xhci_msd_setup`
+directly; else (class 9/0) → `xhci_hub_enumerate`.  A drive in a **black USB-2.0
+port** would instead come up behind the USB-2 hub and hit the hub-child MSD branch.
+
+### Diagnostics added (HTTP-queryable, since the HDMI boot log scrolls away)
+`/usbdiag` now also prints `msd_present=` and an `enum:` journal of every port
+(`rpNNspSSclsCC icII =MSDdirect/=hub` and hub children `[hDDsSLspSSicII=MSD/HID]`).
+This is how the blue-port/SuperSpeed root-direct case was diagnosed.
+
+### ★ OPEN — microSD (/microsd, EMMC2) stalls at `sd_init` CMD8 timeout
+`mount` shows `microsd: sd_init failed at step 0x28` (CMD8 cmd-timeout),
+CONTROL0=00800F00 INTERRUPT=00018000.
+**CORRECTION (2026-06-20, post-commit):** an earlier handoff line here claimed
+`sd.c` was UNCHANGED — that was wrong.  `git diff` shows `device/sd/sd.c` was
+**fully rewritten this session** from the old "assume-hot" driver (which returned
+rc=ERR on LBA0) to a **full SDHCI bring-up** (host reset → identify clock →
+CMD0/8/ACMD41/CMD2/CMD3/CMD7/CMD16).  The CMD8 timeout is from **this new
+bring-up**, not USB-3 power interference.  Both drivers fail microSD on Pi4, so
+the EMMC2 microSD path is genuinely WIP/broken — **/sd (USB) is unaffected and
+working.**  TO TRIAGE next: the new bring-up stalls before CMD8 completes
+(step 0x28); compare the EMMC2 reset/clock setup against the proven Pi3 Arasan
+sequence (`xinu-raz sd_block.c`) — likely the host-reset or clock-stable wait, or
+that the firmware left EMMC2 mid-transaction and a host reset (CONTROL1 SRST_HC)
+is needed before CMD0.  Also still worth a clean **cold boot without the USB-3
+drive** to rule out any power interaction (all microSD tests were after warm
+chainloads, which don't reset the EMMC).
+
+### Committed (2026-06-20) — both on `feat/smp-4core-and-basic-graphics`
+- **`8e7e26e` feat(pi4/storage)**: USB MSD /sd + EMMC2 microSD full bring-up
+  sharing one FAT32 (all of: sd.c, sd.h, xhci.c, usbmsd.c/.h, fat32.c/.h,
+  loader/main.c, shell.c, tcp_server.c).  Build md5 `083a1bff` (on SD).
+- **`4ed171e` feat(pi4/wm)**: window close button (X) + clip BASIC text to window.
+
+### Note: `ls /sd` (and `ls /microsd`, `help`) look EMPTY over HTTP /shell
+The capture buffer / body path drops large outputs (returns empty body, not
+truncated).  Small outputs (`ls /`, `mount`, `usbwtest`) come through fine, and
+`ls` works on the on-screen shell.  `mount` reporting `/sd non-empty` is the
+reliable confirmation that the volume mounted.  (Future: raise the `/shell`
+capture/body cap, or paginate.)
+
+### What was added (uncommitted, on `feat/smp-4core-and-basic-graphics`)
+- **`device/usb/xhci/xhci.c`** — bulk IN/OUT endpoint config + `x_bulk_run`
+  (Normal TRB + doorbell + `x_event_wait(32)`), `xhci_msd_setup` (parses config
+  desc for interface class 8 / proto 0x50 = Bulk-Only, configures both bulk EPs
+  in one Configure-Endpoint), `xhci_msd_bulk_{in,out}`, `xhci_msd_clear_halt`,
+  `xhci_msd_present`.  Enumeration hook in `xhci_hub_enumerate`: `xs_iface_class`
+  routes class 8 → `xhci_msd_setup` (→/sd), else → `xhci_hid_setup` (mouse/kbd).
+- **`device/usb/xhci/usbmsd.c`** (NEW) + **`include/usbmsd.h`** — Bulk-Only
+  Transport (CBW/CSW) + SCSI (TEST UNIT READY w/ REQUEST SENSE retries, INQUIRY,
+  READ CAPACITY(10), READ(10), WRITE(10)).  512-B block API
+  `usbmsd_read_block`/`usbmsd_write_block` (signatures match fat32 hooks).
+- **`fs/fat32.c` + `include/fat32.h`** — block-device indirection: `fat32_t.rd/wr`
+  fn-pointers; `fat32_mount_dev(fs, rd, wr)`; `fat32_mount()` now a wrapper binding
+  the EMMC.  /microsd and /sd share one FAT32 reader/writer.
+- **`loader/main.c`** — boot-time `usbmsd_init()` after `xhci_vl805_enum_full()`
+  (logs INQUIRY + capacity on HDMI); `usbsd_remount` / `usbsd_write_test` /
+  `usbsd_fwrite`; /sd auto-mount runs inside `microsd_automount_proc` (serialised
+  with /microsd so they never collide on fat32.c's shared `scratch` buffer).
+- **`shell/shell.c`** — `mount` now remounts BOTH /microsd + /sd; new `usbwtest`
+  (safe free-cluster write test on /sd) and `usbfwrite <NAME> [text]`.
+
+### How to verify on hardware (HTTP /shell was wedged → use the on-screen shell)
+1. Plug a **FAT32** USB drive into a Pi4 **USB-A** port (the black USB-2.0 port is
+   the reliable one — same as the mouse).  Cold-boot (SMP needs cold boot too).
+2. Watch the HDMI boot log for:
+   `[xhci] *** Mass Storage device on hubportN -> /sd ***`,
+   `[xhci] msd: ... bulk endpoints ready`,
+   `[usbmsd] INQUIRY: '<vendor product>'`,
+   `[usbmsd] ready: <N> blocks x 512 B = <M> MiB`,
+   `usbsd: FAT32 mounted under /sd`.
+3. In the shell: `ls /sd` (files), `mount` (re-probe both), `usbwtest` (safe),
+   `usbfwrite HELLO.TXT hi`, then reboot + `mount` + `ls /sd` to confirm persistence.
+- USB enum on Pi4 is hit-or-miss; if /sd is empty, `/reboot` (re-enumerate) or replug.
+
+### Known limitation / first place to look if /sd ops are flaky at runtime
+- `x_event_wait(32)` (shared event ring) is **not slot/dci-filtered**: a mouse
+  interrupt-IN completion is also a type-32 Transfer Event, so a bulk transfer
+  running *while the mouse is moving* could consume the mouse's event and mis-read
+  its CC.  Boot-time INQUIRY/capacity/mount run with the mouse idle (safe).  If
+  runtime `usbwtest`/`usbfwrite` are flaky, add a slot+dci-filtered event wait for
+  the bulk path.
 
 ---
 
