@@ -282,8 +282,13 @@ static void draw_chrome(window_t *w)
     /* title bar background (one pixel inside the border) */
     fill_rect(w->x + 1, w->y + 1, w->width - 2, WM_TITLEBAR_H, w->title_bg);
 
-    /* title text — left-aligned with a 4 px gutter */
-    draw_string_at(w->x + 4, w->y + 2, w->title, w->title_fg, w->title_bg);
+    /* close button (❌) at the title-bar LEFT: a small red box with a white
+     * "X".  Clicking it removes the window (see window_at_close / wm_close). */
+    fill_rect(w->x + 2, w->y + 2, 8, 8, 0xFFCC4040U);
+    draw_string_at(w->x + 2, w->y + 2, "X", 0xFFFFFFFFU, 0xFFCC4040U);
+
+    /* title text — shifted right past the close button */
+    draw_string_at(w->x + WM_TITLEBAR_H + 4, w->y + 2, w->title, w->title_fg, w->title_bg);
 
     /* separator under the title */
     fill_rect(w->x + 1, w->y + WM_TITLEBAR_H + 1,
@@ -326,6 +331,37 @@ static window_t *window_at_titlebar(int dx, int dy)
             dy >= w->y && dy < w->y + WM_TITLEBAR_H)
             hit = w;
     return hit;
+}
+
+/* Topmost window whose close-button box (a TITLEBAR_H square at the title-bar
+ * left) contains (dx,dy).  Hit area is generous (the full bar height). */
+static window_t *window_at_close(int dx, int dy)
+{
+    window_t *hit = 0;
+    for (window_t *w = wm_head; w; w = w->next)
+        if (dx >= w->x + 1 && dx < w->x + 1 + WM_TITLEBAR_H &&
+            dy >= w->y + 1 && dy < w->y + 1 + WM_TITLEBAR_H)
+            hit = w;
+    return hit;
+}
+
+/* Remove `w` from the desktop (the close-button action).  The window struct
+ * itself is caller-owned (often static) and is NOT freed — it just stops being
+ * drawn / hit-tested.  Any worker process behind it keeps running. */
+void wm_close(window_t *w)
+{
+    if (!w || !wm_head) return;
+    if (wm_head == w) {
+        wm_head = w->next;
+    } else {
+        window_t *p = wm_head;
+        while (p->next && p->next != w) p = p->next;
+        if (p->next != w) return;          /* not in the list */
+        p->next = w->next;
+    }
+    w->next = 0;
+    if (drag_win == w)  { drag_win = 0; drag_mode = 0; }
+    if (active_win == w) active_win = wm_head;   /* focus whatever's left */
 }
 
 /* Topmost window whose bottom-right corner grab square contains (dx,dy). */
@@ -433,6 +469,12 @@ void wm_pointer(int sx, int sy, int left)
     }
     if (left) {
         if (!drag_win) {
+            /* Close button (❌) at the title-bar left takes priority over drag /
+             * raise: a press there removes the window. */
+            if (press_edge) {
+                window_t *cb = window_at_close(dx, dy);
+                if (cb) { wm_close(cb); return; }
+            }
             window_t *w = window_at_resize(dx, dy);     /* corner first (it's inside the window) */
             if (w) { drag_win = w; drag_mode = 2; drag_off_x = dx - (w->x + w->width);
                      drag_off_y = dy - (w->y + w->height); active_win = w; wm_raise(w); }

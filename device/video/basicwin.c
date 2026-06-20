@@ -242,15 +242,27 @@ void basicwin_draw(window_t *self, unsigned int frame)
     if (cur_row >= view_top + vr) view_top = cur_row - vr + 1;
     if (view_top < 0) view_top = 0;
 
+    /* Only draw as many columns as fit in the window: each glyph (incl. the
+     * trailing space padding) paints content_bg, so drawing the full BW_COLS
+     * grid would spill the black background past the window's right edge
+     * (BW_COLS*8 = 768 px ≫ the ~618 px window). */
+    int maxcols = (self->width - 6) / (FONT_WIDTH * fs);
+    if (maxcols < 1) maxcols = 1;
+    if (maxcols > BW_COLS) maxcols = BW_COLS;
+
+    char line[BW_COLS + 1];
     for (int i = 0; i < vr; i++) {
         int r = view_top + i;
         if (r >= BW_ROWS) break;
-        draw_string_scaled(cx, cy + i * line_h, grid[r], 0xFFB6FFB6U, self->content_bg, fs);
+        int n = 0;
+        for (; n < maxcols && grid[r][n]; n++) line[n] = grid[r][n];
+        line[n] = 0;
+        draw_string_scaled(cx, cy + i * line_h, line, 0xFFB6FFB6U, self->content_bg, fs);
     }
 
     /* block cursor at (cur_row,cur_col) if on screen */
     int crow = cur_row - view_top;
-    if (crow >= 0 && crow < vr && cur_col < BW_COLS) {
+    if (crow >= 0 && crow < vr && cur_col < maxcols) {
         int px = cx + cur_col * FONT_WIDTH * fs;
         int py = cy + crow * line_h;
         fill_rect(px, py + (FONT_HEIGHT - 2) * fs, FONT_WIDTH * fs, 2 * fs, 0xFFFFFFFFU);
