@@ -30,6 +30,9 @@ extern void basic_set_line(void (*fn)(int, int, int, int, int));
 extern void basic_set_circle(void (*fn)(int, int, int, int));
 extern void basic_set_plot(void (*fn)(int, int, int));
 extern void basic_set_gfx_active(int (*fn)(void));
+extern void basic_set_button(void (*fn)(int, const char *));
+extern void basic_set_btn(int (*fn)(int));
+extern void basic_set_buttons_reset(void (*fn)(void));
 extern void basic_break(void);             /* request a RUN-loop break */
 extern void basic_select(int inst);        /* pick which bs[] instance is current */
 extern int  xhci_poll_ctrl_c(void);        /* polls "is Ctrl+C held?" */
@@ -50,6 +53,7 @@ struct bw_ctx {
     int  inited;
     int  esc_state;                   /* ANSI escape parser: 0 none,1 ESC,2 ESC[ */
     int  gfx_on;                      /* 1 once a program enters graphics mode   */
+    int  gfx_dirty;                   /* 1 if the gfx list changed since last flip */
 };
 static struct bw_ctx ctx[BW_N];
 static int bw_curi;                   /* active instance for the macros below   */
@@ -61,6 +65,7 @@ static int bw_curi;                   /* active instance for the macros below   
 #define inited     (ctx[bw_curi].inited)
 #define esc_state  (ctx[bw_curi].esc_state)
 #define gfx_on     (ctx[bw_curi].gfx_on)
+#define gfx_dirty  (ctx[bw_curi].gfx_dirty)
 
 /* Window 0 is the primary, wired at boot (others reference &basic_win); windows
  * 1.. are built on demand by basicwin_new(). */
@@ -106,6 +111,57 @@ static void bw_btn_rect(int i, int win_w, int *bx, int *by, int *bw, int *bh)
     *bw = w; *bh = BW_BTN_H;
     *bx = 2 + i * (w + BW_BTN_GAP);
     *by = WM_TITLEBAR_H + 2;
+}
+
+/* ---- program buttons: BASIC `BUTTON n,"label"[,line]` -------------------
+ * Drawn as a small strip OVERLAID on the top edge of the graphics area (so it
+ * never steals canvas space from a program like koch).  A click bumps the per-
+ * button counter that BTN(n) / the event dispatcher drains. */
+#define PBTN_MAX 8
+#define BW_PBTN_H 15
+static char pbtn_label[PBTN_MAX][24];
+static int  pbtn_present[PBTN_MAX];
+static int  pbtn_clicks[PBTN_MAX];
+
+static int pbtn_count(void) { int c = 0; for (int i = 0; i < PBTN_MAX; i++) if (pbtn_present[i]) c++; return c; }
+
+/* Window-local rect of present program button n; returns 0 if not present. */
+static int pbtn_rect(int win_w, int n, int *bx, int *by, int *bw, int *bh)
+{
+    if (n < 0 || n >= PBTN_MAX || !pbtn_present[n]) return 0;
+    int cnt = pbtn_count(); if (cnt < 1) return 0;
+    int idx = 0; for (int i = 0; i < n; i++) if (pbtn_present[i]) idx++;
+    int avail = win_w - 4 - BW_BTN_GAP * (cnt - 1);
+    int w = avail / cnt; if (w < 1) w = 1;
+    *bw = w; *bh = BW_PBTN_H;
+    *bx = 2 + idx * (w + BW_BTN_GAP);
+    *by = WM_TITLEBAR_H + BW_TOOLBAR_H + 1;
+    return 1;
+}
+/* interpreter seams (wired in basicwin_init). */
+static void bw_button(int n, const char *label)
+{
+    if (n < 0 || n >= PBTN_MAX) return;
+    int i = 0; for (; label[i] && i < 23; i++) pbtn_label[n][i] = label[i];
+    pbtn_label[n][i] = 0; pbtn_present[n] = 1;
+}
+static int  bw_btn(int n) { if (n < 0 || n >= PBTN_MAX) return 0; int c = pbtn_clicks[n]; pbtn_clicks[n] = 0; return c; }
+static void bw_buttons_reset(void) { for (int i = 0; i < PBTN_MAX; i++) { pbtn_present[i] = 0; pbtn_clicks[i] = 0; pbtn_label[i][0] = 0; } }
+
+static void bw_draw_pbtns(window_t *self)
+{
+    for (int n = 0; n < PBTN_MAX; n++) {
+        int bx, by, bw, bh;
+        if (!pbtn_rect(self->width, n, &bx, &by, &bw, &bh)) continue;
+        int ax = self->x + bx, ay = self->y + by;
+        unsigned int bg = 0xFF9A5A12U;                    /* amber program button */
+        fill_rect(ax, ay, bw, bh, bg);
+        draw_rect(ax, ay, bw, bh, 0xFFFFC766U);
+        int lw = bw_strlen(pbtn_label[n]) * FONT_WIDTH;
+        int tx = ax + (bw - lw) / 2; if (tx < ax + 1) tx = ax + 1;
+        int ty = ay + (bh - FONT_HEIGHT) / 2;
+        draw_string_scaled(tx, ty, pbtn_label[n], 0xFFFFFFFFU, bg, 1);
+    }
 }
 
 /* Graphics canvas rect = the content area below the toolbar.  BASIC's
@@ -155,7 +211,7 @@ static void bw_emit(const char *s) { while (*s) bw_putc(*s++); }
 static void bw_cls(int mode)
 {
     if (mode & 1) clear_all();
-    if (mode & 2) { bgfx_clear(); gfx_on = 1; }
+    if (mode & 2) { bgfx_clear(); gfx_on = 1; gfx_dirty = 1; }
     if (mode == 0) clear_all();          /* bare CLS == text clear */
 }
 
@@ -169,6 +225,7 @@ static void bw_present_gfx(void)
     bw_gfx_rect(self, &gx, &gy, &gw, &gh);
     fill_rect(gx, gy, gw, gh, self->content_bg);
     bgfx_render(gx, gy, gw, gh);
+    bw_draw_pbtns(self);      /* keep program buttons painted during a RUN */
     video_present();
     wm_cursor_after_blit();   /* flip wiped the cursor — pump mouse + re-stamp */
 }
@@ -176,7 +233,10 @@ static void bw_present_gfx(void)
 static void bw_pause(int ms)
 {
     extern void wm_cursor_delay_ms(int);
-    if (gfx_on) bw_present_gfx();
+    /* Only flip the gfx when it actually changed since the last flip — an idle
+     * WAIT loop (e.g. koch waiting for a button) must NOT keep repainting, which
+     * looked like the screen "kept moving" / flickering. */
+    if (gfx_on && gfx_dirty) { bw_present_gfx(); gfx_dirty = 0; }
     /* PAUSE/WAIT is the natural place to notice a Ctrl-C in a tight graphics
      * loop (guard-based polling is too coarse for WAIT loops). */
     if (xhci_poll_ctrl_c()) basic_break();
@@ -192,15 +252,15 @@ static void bw_line(int x1, int y1, int x2, int y2, int color)
 {
     extern void wm_cursor_tick(void);
     static int seg;
-    gfx_on = 1; bgfx_line(x1, y1, x2, y2, color);
+    gfx_on = 1; gfx_dirty = 1; bgfx_line(x1, y1, x2, y2, color);
     /* A deep redraw (e.g. koch level 10 ~ 4^10 segments) runs with no WAIT, so
      * pump the cursor every N segments to keep the pointer alive there too. */
     if ((++seg & 63) == 0) wm_cursor_tick();
 }
 static void bw_circle(int cx, int cy, int r, int color)
-{ gfx_on = 1; bgfx_circle(cx, cy, r, color); }
+{ gfx_on = 1; gfx_dirty = 1; bgfx_circle(cx, cy, r, color); }
 static void bw_plot(int x, int y, int ch)
-{ (void)ch; gfx_on = 1; bgfx_line(x, y, x, y, 7); }   /* 1px dot */
+{ (void)ch; gfx_on = 1; gfx_dirty = 1; bgfx_line(x, y, x, y, 7); }   /* 1px dot */
 static int  bw_gfx_active(void) { return gfx_on; }
 
 /* Toolbar click: find the button under the local cursor, echo its command,
@@ -211,6 +271,17 @@ static void bw_on_click(window_t *self, int lx, int ly)
     if (i < 0) return;
     bw_curi = i; basic_select(i);
     if (!inited) return;
+    /* program BUTTONs first: a click registers an event (and consumes any
+     * pending Ctrl-C so it doesn't break the running program). */
+    for (int n = 0; n < PBTN_MAX; n++) {
+        int bx, by, bw, bh;
+        if (!pbtn_rect(self->width, n, &bx, &by, &bw, &bh)) continue;
+        if (lx >= bx && lx < bx + bw && ly >= by && ly < by + bh) {
+            pbtn_clicks[n]++;
+            xhci_poll_ctrl_c();          /* swallow any break this press queued */
+            return;
+        }
+    }
     for (int b = 0; b < BW_NBTN; b++) {
         int bx, by, bw, bh;
         bw_btn_rect(b, self->width, &bx, &by, &bw, &bh);
@@ -251,6 +322,9 @@ void basicwin_init(void)
     basic_set_circle(bw_circle);            /* CIRCLE -> gfx canvas */
     basic_set_plot(bw_plot);                /* PLOT   -> gfx canvas */
     basic_set_gfx_active(bw_gfx_active);    /* gfx-mode flag (suppresses "Ok") */
+    basic_set_button(bw_button);            /* BUTTON n,"label" -> on-screen button */
+    basic_set_btn(bw_btn);                  /* BTN(n) -> clicks since last read */
+    basic_set_buttons_reset(bw_buttons_reset); /* clear program buttons on RUN */
     basic_win.on_click = bw_on_click;       /* wire the toolbar */
     /* No prompt — leave the cursor at the top-left of an empty page. */
 }
@@ -331,6 +405,7 @@ void basicwin_draw(window_t *self, unsigned int frame)
     bw_curi = inst; basic_select(inst);
 
     bw_draw_toolbar(self);
+    bw_draw_pbtns(self);                     /* program BUTTONs (overlay strip) */
     int fs = self->font_scale > 0 ? self->font_scale : 1;
     int cx = self->x + 4;
     int cy = self->y + WM_TITLEBAR_H + BW_TOOLBAR_H + 4;

@@ -334,10 +334,15 @@ void xhci_mouse_event(unsigned nButtons, int dx, int dy)
      * would re-enter the interpreter via a toolbar on_click.  (The run loop
      * pumps the mouse only to keep the pointer from freezing.) */
     extern int basic_is_running(void);
-    if (!basic_is_running()) {
-        extern void wm_pointer(int, int, int);        /* left-drag a title bar -> move window */
-        extern void wm_menu_open(int, int);           /* right-click context menu */
+    extern int basic_has_buttons(void);
+    extern void wm_pointer(int, int, int);        /* left-drag a title bar -> move window */
+    extern void wm_menu_open(int, int);           /* right-click context menu */
+    /* Deliver left clicks to windows when idle OR when a running BASIC program
+     * has on-screen BUTTONs (so its buttons are clickable mid-run, e.g. koch's
+     * Level -/+).  The context menu stays disabled while a program runs. */
+    if (!basic_is_running() || basic_has_buttons())
         wm_pointer(g_cursor_x, g_cursor_y, (int)(nButtons & 1));
+    if (!basic_is_running()) {
         /* Right-button press edge pops up the context menu at the cursor. */
         static int prev_right;
         int right = (int)(nButtons & 2);
@@ -1044,8 +1049,27 @@ int wifi_cfg_save_ap(const char *ssid, const char *pass)
     }
     out[o] = 0;
     if (wcfg_store(out, o) != 0) { uart_puts("wifi save: WIFI.CFG write FAILED (microSD/USB mounted?)\n"); return -1; }
+    /* Verify it actually PERSISTED: this Pi4's SD writes can report success yet
+     * not stick, which made `wifi save` say "stored" while `wifi aps` showed none.
+     * Read WIFI.CFG back and confirm the SSID is really there before claiming OK. */
+    {
+        static char vbuf[WIFI_CFG_MAX]; char ves[33], vep[64]; int vskip, vok = 0;
+        if (wcfg_load(vbuf, sizeof vbuf) > 0) {
+            const char *vp = vbuf;
+            while (*vp) {
+                const char *vn = wcfg_line(vp, ves, sizeof ves, vep, sizeof vep, &vskip);
+                if (!vskip && wstreq(ves, ssid)) { vok = 1; break; }
+                vp = vn;
+            }
+        }
+        if (!vok) {
+            uart_puts("wifi save: WROTE BUT READ-BACK FAILED -- the SD write did not "
+                      "persist (this board's SD write is unreliable; edit WIFI.CFG on a PC).\n");
+            return -1;
+        }
+    }
     uart_puts("wifi save: stored '"); uart_puts(ssid);
-    uart_puts(replaced ? "' (updated) to WIFI.CFG\n" : "' to WIFI.CFG\n");
+    uart_puts(replaced ? "' (updated, verified) to WIFI.CFG\n" : "' (verified) to WIFI.CFG\n");
     return 0;
 }
 

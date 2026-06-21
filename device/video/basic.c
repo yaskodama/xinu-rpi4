@@ -80,6 +80,10 @@ static int bas_next_btn_event(void)          /* handler line of one pending even
     }
     return 0;
 }
+/* True while a running program has clickable BUTTON handlers — the input layer
+ * uses this so a mouse click goes to the program's buttons instead of being
+ * treated as a Ctrl-C break. */
+int basic_has_buttons(void) { return g_has_btn_handlers; }
 void basic_set_emit(void (*fn)(const char *))        { g_emit = fn; }
 void basic_set_input(int (*fn)(char *, int))         { g_input = fn; }
 void basic_set_cls(void (*fn)(int))                  { g_cls = fn; }
@@ -1111,15 +1115,15 @@ static const char *S_koch[] = {
     "50 GOSUB *SHOW",
     "60 GOSUB *REDRAW",
     "70 *LOOP",
-    "80 WAIT 0.1",
+    "80 WAIT 0.02",
     "90 GOTO *LOOP",
     "300 D = D - 1",
-    "310 IF D < 1 THEN D = 1",
+    "310 IF D < 0 THEN D = 0",
     "320 GOSUB *SHOW",
     "330 GOSUB *REDRAW",
     "340 RETURN",
     "350 D = D + 1",
-    "360 IF D > 10 THEN D = 10",
+    "360 IF D > 7 THEN D = 7",
     "370 GOSUB *SHOW",
     "380 GOSUB *REDRAW",
     "390 RETURN",

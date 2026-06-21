@@ -79,11 +79,11 @@ static unsigned long cluster_to_lba(const fat32_t *fs, unsigned int cluster)
  * found within the scanned range. */
 int fat32_find_free_lba(fat32_t *fs, unsigned long *lba)
 {
-    unsigned int cluster = 2;
+    unsigned int cluster = 0;                          /* FAT index == cluster #; 0/1 reserved */
     for (unsigned int s = 0; s < 2048; s++) {          /* scan up to 2048 FAT sectors */
         if (fs->rd(fs->fat_lba + s, scratch) != 0) return -1;
         for (int e = 0; e < SD_BLOCK_SIZE / 4; e++, cluster++) {
-            if ((le32(&scratch[e * 4]) & 0x0FFFFFFFu) == 0) {
+            if (cluster >= 2 && (le32(&scratch[e * 4]) & 0x0FFFFFFFu) == 0) {
                 *lba = cluster_to_lba(fs, cluster);
                 return 0;
             }
@@ -188,13 +188,17 @@ int fat32_create_file(fat32_t *fs, const char *name,
     unsigned int cluster_bytes = (unsigned int)fs->sectors_per_cluster * SD_BLOCK_SIZE;
     if (len > cluster_bytes) return -2;
 
-    /* 1. find a free cluster (FAT entry == 0). */
-    unsigned int fc = 0, cluster = 2;
+    /* 1. find a free cluster (FAT entry == 0).  NB: FAT entry index == cluster
+     * number, so `cluster` must start at 0 (clusters 0/1 are reserved and never
+     * counted free).  (Was 2 -> every allocation was off by +2: it claimed a
+     * different cluster than the free FAT slot, marking an in-use cluster EOC =>
+     * filesystem corruption and lost writes.) */
+    unsigned int fc = 0, cluster = 0;
     int found = 0;
     for (unsigned int s = 0; s < 2048 && !found; s++) {
         if (fs->rd(fs->fat_lba + s, scratch) != 0) return -1;
         for (int e = 0; e < SD_BLOCK_SIZE / 4; e++, cluster++)
-            if ((le32(&scratch[e * 4]) & 0x0FFFFFFFu) == 0) { fc = cluster; found = 1; break; }
+            if (cluster >= 2 && (le32(&scratch[e * 4]) & 0x0FFFFFFFu) == 0) { fc = cluster; found = 1; break; }
     }
     if (!found) return -3;
 

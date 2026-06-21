@@ -1491,8 +1491,8 @@ void xhci_mouse_pump(void)
                 for (int i=0;i<4 && i<8;i++) x_hid_buf[x_mouse_slot][i]=b[i];
                 x_mouse_reports++;
                 int chg=((int)btn!=(int)x_mouse_prev_btn);
-                { extern int basic_is_running(void);
-                  if ((btn&7) && !(x_mouse_prev_btn&7) && basic_is_running()) x_ctrl_c_pending=1; }
+                { extern int basic_is_running(void); extern int basic_has_buttons(void);
+                  if ((btn&7) && !(x_mouse_prev_btn&7) && basic_is_running() && !basic_has_buttons()) x_ctrl_c_pending=1; }
                 x_mouse_prev_btn = btn;
                 /* Deliver on motion, any button held, OR a button-state CHANGE —
                  * so a button RELEASE (btn 0, no motion) reaches xhci_mouse_event
@@ -1544,8 +1544,8 @@ void xhci_mouse_pump(void)
              * Break on a button-press EDGE while a program runs — never on the
              * level — so the click that LAUNCHED it (still held as the program
              * starts) doesn't immediately break it (e.g. qsort's first WAIT). */
-            { extern int basic_is_running(void);
-              if ((btn&7) && !(x_mouse_prev_btn&7) && basic_is_running()) x_ctrl_c_pending=1; }
+            { extern int basic_is_running(void); extern int basic_has_buttons(void);
+              if ((btn&7) && !(x_mouse_prev_btn&7) && basic_is_running() && !basic_has_buttons()) x_ctrl_c_pending=1; }
             x_mouse_prev_btn = btn;
             /* Deliver on motion, any button held, OR a button-state CHANGE so a
              * release (btn 0, no motion) reaches main.c and the right/left click
