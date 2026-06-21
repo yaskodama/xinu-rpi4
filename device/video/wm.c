@@ -429,10 +429,16 @@ static void menu_action_aipl(void)
     extern void avm_open_list(void);         /* list .avm on SD/microSD, click to run */
     avm_open_list();
 }
+static void menu_action_makina(void)
+{
+    extern void avm_run_makina(void);        /* open + run SOLID.AVM off USB /sd */
+    avm_run_makina();
+}
 static const struct { const char *label; void (*action)(void); } wm_menu_items[] = {
     { "New Shell window", menu_action_shell },
     { "New BASIC window", menu_action_basic },
     { "Run AIPL actor",   menu_action_aipl  },
+    { "MAKINA",           menu_action_makina },
 };
 #define WM_MENU_N ((int)(sizeof(wm_menu_items) / sizeof(wm_menu_items[0])))
 

@@ -629,6 +629,20 @@ static void avm_run_listed(int idx)
     pend_active = 1; avm_dg_on = 0;                 /* clear old diagnostic */
     avm_ld_active = 1; avm_ld_cur = 0; avm_ld_total = (int)pend_want;
 }
+
+/* Right-click menu "MAKINA": run SOLID.AVM straight from a copy EMBEDDED in the
+ * kernel image — no SD/USB read at all, so it's 100% reliable regardless of the
+ * flaky EMMC / storage reads. */
+extern unsigned char makina_solid_avm[];
+extern unsigned int  makina_solid_avm_len;
+void avm_run_makina(void)
+{
+    pend_active = 0; avm_dg_on = 0;                 /* no streaming read needed */
+    unsigned int n = makina_solid_avm_len;
+    if (n == 0 || n > AVM_STAGE_MAX) return;
+    for (unsigned int i = 0; i < n; i++) avm_stage[i] = makina_solid_avm[i];
+    avm_loadrun((int)n);                            /* parse + spawn from RAM */
+}
 static void avm_listwin_draw(window_t *self, unsigned int frame)
 {
     (void)frame;
@@ -661,12 +675,17 @@ static void avm_listwin_click(window_t *self, int lx, int ly)
 }
 /* Save the just-staged .avm to the microSD as `name` (8.3).  Called from the
  * loadvm handler when ?save=NAME is given.  Returns 0 ok, <0 on error. */
+static int avm_mount_vol(char vol, fat32_t *fs);   /* fwd decl (defined below) */
 int avm_save(const char *name, int len)
 {
-    fat32_t fs;
-    if (fat32_mount(&fs) != 0) return -1;          /* microSD (EMMC2) */
     if (len <= 0 || len > AVM_STAGE_MAX) return -1;
-    return fat32_write_file_full(&fs, name, avm_stage, (unsigned int)len);
+    fat32_t fs;
+    /* Prefer the reliable USB drive (/sd); fall back to microSD (EMMC2). */
+    if (avm_mount_vol('S', &fs) == 0)
+        return fat32_write_file_full(&fs, name, avm_stage, (unsigned int)len);
+    if (fat32_mount(&fs) == 0)
+        return fat32_write_file_full(&fs, name, avm_stage, (unsigned int)len);
+    return -1;
 }
 
 void avm_open_list(void)            /* called from the right-click menu */
