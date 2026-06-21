@@ -1568,6 +1568,43 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, " int=0x"); bl = s_puthex(body, bl, sd_last_int());
         bl = s_put(body, bl, " b0=");   bl = s_putdec(body, bl, sb[0]);
         bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "GET /usbprobe")) {
+        /* Diagnostic: read one USB MSD block at ?lba=N and report rc + bytes. */
+        ctype = "text/plain";
+        extern int usbmsd_ready(void);
+        extern int usbmsd_read_block(unsigned long, void *);
+        extern unsigned long usbmsd_block_count(void);
+        int lba = q_int(req, "lba", 0);
+        static unsigned char ub[512];
+        int rc = usbmsd_read_block((unsigned long)(unsigned)lba, ub);
+        bl = s_put(body, bl, "usb ready=");  bl = s_putdec(body, bl, usbmsd_ready());
+        bl = s_put(body, bl, " blocks=");    bl = s_putdec(body, bl, (int)usbmsd_block_count());
+        bl = s_put(body, bl, " lba=");       bl = s_putdec(body, bl, lba);
+        bl = s_put(body, bl, " rc=");        bl = s_putdec(body, bl, rc);
+        bl = s_put(body, bl, " b0=");        bl = s_putdec(body, bl, ub[0]);
+        bl = s_put(body, bl, " b1=");        bl = s_putdec(body, bl, ub[1]);
+        bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "GET /usbreadtest")) {
+        /* Diagnostic: read N consecutive USB blocks from ?lba=, report how many
+         * succeeded and the LBA of the first failure (characterise streaming). */
+        ctype = "text/plain";
+        extern int usbmsd_read_block(unsigned long, void *);
+        int lba = q_int(req, "lba", 0);
+        int n   = q_int(req, "n", 64);
+        if (n < 1) n = 1; if (n > 4096) n = 4096;
+        static unsigned char ub[512];
+        int okc = 0, failc = 0, firstfail = -1;
+        for (int i = 0; i < n; i++) {
+            int rc = usbmsd_read_block((unsigned long)(unsigned)(lba + i), ub);
+            if (rc == 0) okc++;
+            else { failc++; if (firstfail < 0) firstfail = lba + i; }
+        }
+        bl = s_put(body, bl, "lba=");       bl = s_putdec(body, bl, lba);
+        bl = s_put(body, bl, " n=");        bl = s_putdec(body, bl, n);
+        bl = s_put(body, bl, " ok=");       bl = s_putdec(body, bl, okc);
+        bl = s_put(body, bl, " fail=");     bl = s_putdec(body, bl, failc);
+        bl = s_put(body, bl, " firstfail="); bl = s_putdec(body, bl, firstfail);
+        bl = s_put(body, bl, "\n");
     } else if (path_eq(req, "/actor/send")) {
         /* Exchange a message with a resident actor.  Up to 3 int args:
          *   GET /actor/send?to=<id>&m=<method>&arg=<n>[&a1=<n>&a2=<n>]

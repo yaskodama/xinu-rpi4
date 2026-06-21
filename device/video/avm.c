@@ -579,10 +579,28 @@ int avm_loadrun(int len)
  * microSD (M:) and USB /sd (S:); clicking a row reads that whole file off the
  * card (multi-cluster) into the stage and runs it. */
 #define AVM_LIST_MAX 40
-static struct { char name[16]; char vol; } avm_list[AVM_LIST_MAX];
+static struct { char name[16]; char vol; int size; } avm_list[AVM_LIST_MAX];
 static int      avm_list_n;
 static window_t avm_listwin;
 static int      avm_listwin_added;
+
+/* ===== RAM-resident app library =========================================
+ * Apps uploaded via /actor/loadvm?...&save=NAME are kept in RAM here so the
+ * right-click "Run AIPL actor" menu lists + runs them with ZERO storage I/O.
+ * This is NOT compile-time embedding: ANY actor sent at runtime (BASIC, drone
+ * apps, ...) shows up in the menu.  Trade-off: lost on reboot (just re-send).
+ * Chosen because this Pi4's USB/EMMC reads are unreliable (all-LBA failures). */
+#define AVM_RAM_SLOTS    4
+#define AVM_RAM_SLOT_SZ  (2 * 1024 * 1024)          /* 2 MB per app */
+static unsigned char avm_ram[AVM_RAM_SLOTS][AVM_RAM_SLOT_SZ];
+static struct { char name[16]; int len; int used; } avm_ram_meta[AVM_RAM_SLOTS];
+static int avm_ram_rr;                                /* round-robin victim */
+
+static int avm_streq(const char *a, const char *b)
+{
+    int i = 0; for (; a[i] && b[i]; i++) if (a[i] != b[i]) return 0;
+    return a[i] == b[i];
+}
 
 static int avm_mount_vol(char vol, fat32_t *fs)
 {
@@ -606,21 +624,57 @@ static void avm_list_visit(const char *name, int is_dir, unsigned long size,
         int i = 0; for (; name[i] && i < 15; i++) avm_list[avm_list_n].name[i] = name[i];
         avm_list[avm_list_n].name[i] = 0;
         avm_list[avm_list_n].vol = *(char *)ctx;
+        avm_list[avm_list_n].size = (int)size;
         avm_list_n++;
     }
 }
 static void avm_scan(void)
 {
     avm_list_n = 0;
+    /* RAM-resident apps first — always reliable, listed even if storage is dead. */
+    for (int s = 0; s < AVM_RAM_SLOTS && avm_list_n < AVM_LIST_MAX; s++) {
+        if (!avm_ram_meta[s].used) continue;
+        int i = 0; for (; avm_ram_meta[s].name[i] && i < 15; i++)
+            avm_list[avm_list_n].name[i] = avm_ram_meta[s].name[i];
+        avm_list[avm_list_n].name[i] = 0;
+        avm_list[avm_list_n].vol = 'R';
+        avm_list[avm_list_n].size = avm_ram_meta[s].len;
+        avm_list_n++;
+    }
+    /* Storage (best-effort): only scan a device whose block 0 reads OK, so a dead
+     * or flaky card can't hang the menu open (this Pi4 fails all USB/EMMC reads). */
     fat32_t fs; char v;
-    v = 'M'; if (avm_mount_vol('M', &fs) == 0) fat32_walk_dir(&fs, fs.root_cluster, 0, avm_list_visit, &v);
-    v = 'S'; if (avm_mount_vol('S', &fs) == 0) fat32_walk_dir(&fs, fs.root_cluster, 0, avm_list_visit, &v);
+    extern int usbmsd_ready(void);
+    extern int usbmsd_read_block(unsigned long, void *);
+    extern int sd_read_block(unsigned long, void *);
+    static unsigned char probe[512];
+    if (usbmsd_ready() && usbmsd_read_block(0, probe) == 0) {
+        v = 'S'; if (avm_mount_vol('S', &fs) == 0)
+            fat32_walk_dir(&fs, fs.root_cluster, 0, avm_list_visit, &v);
+    }
+    if (sd_read_block(0, probe) == 0) {
+        v = 'M'; if (avm_mount_vol('M', &fs) == 0)
+            fat32_walk_dir(&fs, fs.root_cluster, 0, avm_list_visit, &v);
+    }
 }
 /* Resumable launch read: avm_draw_loadbar() streams the file off the card a few
  * clusters per frame (animating the load bar), then runs it. */
 static void avm_run_listed(int idx)
 {
     if (idx < 0 || idx >= avm_list_n) return;
+    if (avm_list[idx].vol == 'R') {                 /* RAM-resident app: run from RAM */
+        for (int s = 0; s < AVM_RAM_SLOTS; s++) {
+            if (!avm_ram_meta[s].used || !avm_streq(avm_ram_meta[s].name, avm_list[idx].name))
+                continue;
+            int n = avm_ram_meta[s].len;
+            if (n <= 0 || n > AVM_STAGE_MAX) return;
+            pend_active = 0; avm_dg_on = 0;
+            for (int b = 0; b < n; b++) avm_stage[b] = avm_ram[s][b];
+            avm_loadrun(n);
+            return;
+        }
+        return;
+    }
     if (avm_mount_vol(avm_list[idx].vol, &pend_fs) != 0) return;
     unsigned int first = 0, size = 0;
     if (fat32_open(&pend_fs, avm_list[idx].name, &first, &size) != 0 || first < 2) return;
@@ -630,62 +684,137 @@ static void avm_run_listed(int idx)
     avm_ld_active = 1; avm_ld_cur = 0; avm_ld_total = (int)pend_want;
 }
 
-/* Right-click menu "MAKINA": run SOLID.AVM straight from a copy EMBEDDED in the
- * kernel image — no SD/USB read at all, so it's 100% reliable regardless of the
- * flaky EMMC / storage reads. */
-extern unsigned char makina_solid_avm[];
-extern unsigned int  makina_solid_avm_len;
+/* Right-click menu "MAKINA": run SOLID.AVM through the GENERIC SD/USB streaming
+ * path — same code as picking it from the "Run AIPL actor" list.  No kernel
+ * embedding: the .avm lives on the card like every other app, so this scales to
+ * any uploaded actor (BASIC, drone apps, ...). */
 void avm_run_makina(void)
 {
-    pend_active = 0; avm_dg_on = 0;                 /* no streaming read needed */
-    unsigned int n = makina_solid_avm_len;
-    if (n == 0 || n > AVM_STAGE_MAX) return;
-    for (unsigned int i = 0; i < n; i++) avm_stage[i] = makina_solid_avm[i];
-    avm_loadrun((int)n);                            /* parse + spawn from RAM */
+    avm_scan();
+    for (int i = 0; i < avm_list_n; i++) {
+        const char *nm = avm_list[i].name;
+        /* case-insensitive match against "SOLID.AVM" */
+        const char *want = "SOLID.AVM"; int j = 0, ok = 1;
+        for (; want[j]; j++) {
+            char a = nm[j], b = want[j];
+            if (a >= 'a' && a <= 'z') a = (char)(a - 32);
+            if (a != b) { ok = 0; break; }
+        }
+        if (ok && nm[j] == 0) { avm_run_listed(i); return; }
+    }
 }
+/* Delete-button + confirm-dialog geometry (window-relative, so click and draw
+ * agree).  The trash button is a small red [x] box at the right of each row. */
+#define AVM_DEL_W   18
+#define AVM_DEL_REL (320 - 6 - AVM_DEL_W)               /* x within the window  */
+#define AVM_ROW_TOP (WM_TITLEBAR_H + 6 + 16)
+static int avm_confirm_del = -1;                        /* row pending deletion */
+
 static void avm_listwin_draw(window_t *self, unsigned int frame)
 {
     (void)frame;
     extern void wm_cursor_desktop(int *, int *);
     int cx = 0, cy = 0; wm_cursor_desktop(&cx, &cy);
     int x = self->x + 6, y = self->y + WM_TITLEBAR_H + 6;
-    draw_string_at(x, y, "AIPL actors - click to run:", 0xFFFFE0A0U, self->content_bg);
+    draw_string_at(x, y, "AIPL actors - click name=run, [x]=delete:", 0xFFFFE0A0U, self->content_bg);
     y += 16;
     int hov = -1;
     if (cx >= self->x && cx < self->x + self->width) hov = (cy - y) / 12;
     for (int i = 0; i < avm_list_n; i++) {
-        char line[24]; int p = 0;
+        char line[40]; int p = 0;
         line[p++] = avm_list[i].vol; line[p++] = ':'; line[p++] = ' ';
-        for (int k = 0; avm_list[i].name[k] && p < 22; k++) line[p++] = avm_list[i].name[k];
+        for (int k = 0; avm_list[i].name[k] && p < 18; k++) line[p++] = avm_list[i].name[k];
+        while (p < 19) line[p++] = ' ';                 /* pad name column */
+        /* size: KB if >=1024 else bytes, with unit suffix */
+        unsigned int sz = (unsigned int)avm_list[i].size; char suf = 'B'; unsigned int val = sz;
+        if (sz >= 1024) { val = (sz + 512) / 1024; suf = 'K'; }
+        char tmp[12]; int tn = 0;
+        if (!val) tmp[tn++] = '0';
+        while (val) { tmp[tn++] = (char)('0' + val % 10); val /= 10; }
+        while (tn) line[p++] = tmp[--tn];
+        line[p++] = suf;
         line[p] = 0;
+        int ry = y + i * 12;
         unsigned int bg = (i == hov) ? 0xFFFFE0A0U : self->content_bg;   /* invert on hover */
         unsigned int fg = (i == hov) ? 0xFF101010U : 0xFFCFE8FFU;
-        if (i == hov) fill_rect(x - 2, y + i * 12 - 1, self->width - 8, 12, bg);
-        draw_string_at(x, y + i * 12, line, fg, bg);
+        if (i == hov) fill_rect(x - 2, ry - 1, self->width - 8, 12, bg);
+        draw_string_at(x, ry, line, fg, bg);
+        /* trash/delete button (RAM apps only) */
+        if (avm_list[i].vol == 'R') {
+            int dbx = self->x + AVM_DEL_REL;
+            fill_rect(dbx, ry - 1, AVM_DEL_W, 11, 0xFF802020U);
+            draw_rect(dbx, ry - 1, AVM_DEL_W, 11, 0xFFFF7070U);
+            draw_string_at(dbx + 6, ry, "x", 0xFFFFE0E0U, 0xFF802020U);
+        }
     }
     if (avm_list_n == 0)
-        draw_string_at(x, y, "(no .avm on microSD / sd)", 0xFF888888U, self->content_bg);
+        draw_string_at(x, y, "(none yet - send an app with ?save=NAME)", 0xFF888888U, self->content_bg);
+
+    /* confirmation dialog (drawn on top) */
+    if (avm_confirm_del >= 0 && avm_confirm_del < avm_list_n) {
+        int dh = 56, dy = self->y + self->height - dh - 8, dx = self->x + 8, dw = self->width - 16;
+        fill_rect(dx, dy, dw, dh, 0xFF202830U);
+        draw_rect(dx, dy, dw, dh, 0xFFFFC060U);
+        char q[40]; int p = 0; const char *t = "Delete ";
+        for (int i = 0; t[i]; i++) q[p++] = t[i];
+        for (int k = 0; avm_list[avm_confirm_del].name[k] && p < 30; k++) q[p++] = avm_list[avm_confirm_del].name[k];
+        q[p++] = '?'; q[p] = 0;
+        draw_string_at(dx + 8, dy + 8, q, 0xFFFFFFFFU, 0xFF202830U);
+        /* Yes / No buttons */
+        fill_rect(dx + 8,  dy + 28, 60, 18, 0xFF40A040U);
+        draw_string_at(dx + 22, dy + 33, "Yes", 0xFFFFFFFFU, 0xFF40A040U);
+        fill_rect(dx + 90, dy + 28, 60, 18, 0xFF606060U);
+        draw_string_at(dx + 106, dy + 33, "No", 0xFFFFFFFFU, 0xFF606060U);
+    }
 }
 static void avm_listwin_click(window_t *self, int lx, int ly)
 {
-    (void)self; (void)lx;
-    int top = WM_TITLEBAR_H + 6 + 16;
-    int row = (ly - top) / 12;
-    if (row >= 0 && row < avm_list_n) avm_run_listed(row);
+    /* confirmation dialog takes priority while open */
+    if (avm_confirm_del >= 0) {
+        int dh = 56, dyr = self->height - dh - 8;
+        int by = dyr + 28;
+        if (ly >= by && ly <= by + 18) {
+            if (lx >= 8 && lx <= 68) {                  /* Yes -> delete from RAM */
+                if (avm_confirm_del < avm_list_n && avm_list[avm_confirm_del].vol == 'R') {
+                    for (int s = 0; s < AVM_RAM_SLOTS; s++)
+                        if (avm_ram_meta[s].used &&
+                            avm_streq(avm_ram_meta[s].name, avm_list[avm_confirm_del].name))
+                            avm_ram_meta[s].used = 0;
+                }
+                avm_confirm_del = -1; avm_scan();
+            } else if (lx >= 90 && lx <= 150) {         /* No -> cancel */
+                avm_confirm_del = -1;
+            }
+        } else {
+            avm_confirm_del = -1;                        /* click elsewhere cancels */
+        }
+        return;
+    }
+    int row = (ly - AVM_ROW_TOP) / 12;
+    if (row < 0 || row >= avm_list_n) return;
+    /* trash button column -> ask to confirm (RAM apps only) */
+    if (avm_list[row].vol == 'R' && lx >= AVM_DEL_REL && lx <= AVM_DEL_REL + AVM_DEL_W) {
+        avm_confirm_del = row; return;
+    }
+    avm_run_listed(row);
 }
-/* Save the just-staged .avm to the microSD as `name` (8.3).  Called from the
- * loadvm handler when ?save=NAME is given.  Returns 0 ok, <0 on error. */
-static int avm_mount_vol(char vol, fat32_t *fs);   /* fwd decl (defined below) */
+/* Keep the just-staged .avm in a RAM slot as `name`.  Called from the loadvm
+ * handler when ?save=NAME is given.  The right-click "Run AIPL actor" menu then
+ * lists + runs it (vol 'R') with zero storage I/O — reliable on this Pi4 whose
+ * USB/EMMC reads+writes are not dependable.  Returns 0 ok, <0 on error.
+ * (Lost on reboot: re-send the app after each boot.) */
 int avm_save(const char *name, int len)
 {
-    if (len <= 0 || len > AVM_STAGE_MAX) return -1;
-    fat32_t fs;
-    /* Prefer the reliable USB drive (/sd); fall back to microSD (EMMC2). */
-    if (avm_mount_vol('S', &fs) == 0)
-        return fat32_write_file_full(&fs, name, avm_stage, (unsigned int)len);
-    if (fat32_mount(&fs) == 0)
-        return fat32_write_file_full(&fs, name, avm_stage, (unsigned int)len);
-    return -1;
+    if (len <= 0 || len > AVM_RAM_SLOT_SZ) return -1;
+    int slot = -1;                                   /* reuse same-named slot... */
+    for (int s = 0; s < AVM_RAM_SLOTS; s++)
+        if (avm_ram_meta[s].used && avm_streq(avm_ram_meta[s].name, name)) { slot = s; break; }
+    if (slot < 0) { slot = avm_ram_rr % AVM_RAM_SLOTS; avm_ram_rr++; }  /* ...else round-robin */
+    int i = 0; for (; name[i] && i < 15; i++) avm_ram_meta[slot].name[i] = name[i];
+    avm_ram_meta[slot].name[i] = 0;
+    avm_ram_meta[slot].len = len; avm_ram_meta[slot].used = 1;
+    for (int b = 0; b < len; b++) avm_ram[slot][b] = avm_stage[b];
+    return 0;
 }
 
 void avm_open_list(void)            /* called from the right-click menu */

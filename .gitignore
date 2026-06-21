@@ -22,3 +22,4 @@ qemu-smoke.log
 compile/obj/
 references/
 wifi-fw/
+device/video/*.bak
