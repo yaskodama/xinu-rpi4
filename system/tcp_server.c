@@ -1584,6 +1584,24 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, " b0=");        bl = s_putdec(body, bl, ub[0]);
         bl = s_put(body, bl, " b1=");        bl = s_putdec(body, bl, ub[1]);
         bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "GET /sdread")) {
+        /* Diagnostic: full launch-from-SD read of ?name= (default ROBOT.AVM) into
+         * the VM stage; report first/size/got/faillba + the 4 magic bytes. */
+        ctype = "text/plain";
+        extern int avm_sdread_diag(const char *, int *, int *, int *, int *, int *);
+        char nm[16]; if (!q_param(req, "name", nm, sizeof nm)) { nm[0]=0; }
+        const char *name = nm[0] ? nm : "ROBOT.AVM";
+        int first=0, size=0, got=0, faillba=-1, magic[4];
+        int rc = avm_sdread_diag(name, &first, &size, &got, &faillba, magic);
+        bl = s_put(body, bl, "sdread '"); bl = s_put(body, bl, name);
+        bl = s_put(body, bl, "' rc="); bl = s_putdec(body, bl, rc);
+        bl = s_put(body, bl, " first="); bl = s_putdec(body, bl, first);
+        bl = s_put(body, bl, " size="); bl = s_putdec(body, bl, size);
+        bl = s_put(body, bl, " got="); bl = s_putdec(body, bl, got);
+        bl = s_put(body, bl, " faillba="); bl = s_putdec(body, bl, faillba);
+        bl = s_put(body, bl, " magic=");
+        for (int i=0;i<4;i++){ bl = s_putdec(body, bl, magic[i]); bl = s_put(body, bl, ","); }
+        bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "GET /usbreadtest")) {
         /* Diagnostic: read N consecutive USB blocks from ?lba=, report how many
          * succeeded and the LBA of the first failure (characterise streaming). */

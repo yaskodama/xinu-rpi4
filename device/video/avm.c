@@ -49,6 +49,8 @@ static volatile int  avm_ld_total;     /* expected total (from ?total=) */
 static int          pend_active;
 static fat32_t      pend_fs;
 static unsigned int pend_cur, pend_got, pend_want;
+static unsigned int pend_sec;          /* sector index within the current cluster */
+static unsigned int pend_fail;         /* consecutive frames a read has failed     */
 int                 avm_loadrun(int len);   /* forward decl */
 /* SD-read diagnostic (shown on screen when a launch read fails). */
 static int          avm_dg_on;
@@ -298,33 +300,46 @@ void avm_draw_loadbar(int sw, int sh)
      * whatever we have (or abort) so a bad sector can never freeze the bar. */
     if (pend_active) {
         unsigned int spc = pend_fs.sectors_per_cluster ? pend_fs.sectors_per_cluster : 1;
-        int budget = 16;                         /* clusters this frame */
+        int budget = 32;                         /* sectors this frame */
         unsigned char sec[512];
         while (pend_active && budget-- > 0) {
-            if (pend_got >= pend_want || !(pend_cur >= 2 && pend_cur < 0x0FFFFFF8u)) {
+            if (pend_got >= pend_want) {         /* whole file read -> run it */
                 int n = (int)pend_got; pend_active = 0;
-                avm_loadrun(n);                  /* done: clears avm_ld_active, spawns */
+                avm_loadrun(n);                  /* clears avm_ld_active, spawns */
+                break;
+            }
+            if (!(pend_cur >= 2 && pend_cur < 0x0FFFFFF8u)) {  /* chain ended early */
+                pend_active = 0;
+                if (pend_got > 0) avm_loadrun((int)pend_got);  /* run what we have */
+                else avm_ld_active = 0;
                 break;
             }
             unsigned long base = fat32_cluster_lba(&pend_fs, pend_cur);
-            int err = 0;
-            for (unsigned int s = 0; s < spc && pend_got < pend_want; s++) {
-                int rok = 0;
-                for (int t = 0; t < 4 && !rok; t++) if (pend_fs.rd(base + s, sec) == 0) rok = 1;
-                if (!rok) { avm_dg_on = 1; avm_dg_clu = pend_cur; avm_dg_lba = (unsigned int)(base + s);
-                            avm_dg_got = pend_got; err = 1; break; }   /* read error: record it */
-                unsigned int chunk = pend_want - pend_got;
-                if (chunk > 512) chunk = 512;
-                for (unsigned int i = 0; i < chunk; i++) avm_stage[pend_got + i] = sec[i];
-                pend_got += chunk;
+            int rok = 0;
+            for (int t = 0; t < 4 && !rok; t++)
+                if (pend_fs.rd(base + pend_sec, sec) == 0) rok = 1;
+            if (!rok) {
+                /* Transient USB read miss: DON'T abort — record it and retry the
+                 * SAME sector next frame (single reads succeed when spaced, so a
+                 * burst miss recovers).  Give up only after many failed frames. */
+                avm_dg_on = 1; avm_dg_clu = pend_cur;
+                avm_dg_lba = (unsigned int)(base + pend_sec); avm_dg_got = pend_got;
+                if (++pend_fail > 400) {          /* ~seconds of retries: give up */
+                    pend_active = 0;
+                    if (pend_got > 0) avm_loadrun((int)pend_got);
+                    else avm_ld_active = 0;
+                }
+                break;                            /* yield this frame, retry later */
             }
-            if (err) {                           /* read failed: don't freeze */
-                pend_active = 0;
-                if (pend_got >= pend_want) avm_loadrun((int)pend_got);
-                else avm_ld_active = 0;          /* abort: hide the bar */
-                break;
+            pend_fail = 0; avm_dg_on = 0;         /* read ok -> clear any prior miss */
+            unsigned int chunk = pend_want - pend_got;
+            if (chunk > 512) chunk = 512;
+            for (unsigned int i = 0; i < chunk; i++) avm_stage[pend_got + i] = sec[i];
+            pend_got += chunk;
+            if (++pend_sec >= spc) {              /* advance to next cluster */
+                pend_sec = 0;
+                pend_cur = fat32_next_cluster_of(&pend_fs, pend_cur);
             }
-            pend_cur = fat32_next_cluster_of(&pend_fs, pend_cur);
             avm_ld_cur = (int)pend_got;
         }
     }
@@ -678,7 +693,7 @@ static void avm_run_listed(int idx)
     if (avm_mount_vol(avm_list[idx].vol, &pend_fs) != 0) return;
     unsigned int first = 0, size = 0;
     if (fat32_open(&pend_fs, avm_list[idx].name, &first, &size) != 0 || first < 2) return;
-    pend_cur = first; pend_got = 0;
+    pend_cur = first; pend_got = 0; pend_sec = 0; pend_fail = 0;
     pend_want = (size < AVM_STAGE_MAX) ? size : AVM_STAGE_MAX;
     pend_active = 1; avm_dg_on = 0;                 /* clear old diagnostic */
     avm_ld_active = 1; avm_ld_cur = 0; avm_ld_total = (int)pend_want;
@@ -814,6 +829,39 @@ int avm_save(const char *name, int len)
     avm_ram_meta[slot].name[i] = 0;
     avm_ram_meta[slot].len = len; avm_ram_meta[slot].used = 1;
     for (int b = 0; b < len; b++) avm_ram[slot][b] = avm_stage[b];
+    return 0;
+}
+
+/* Diagnostic: mount the USB /sd, open `name`, follow its cluster chain reading
+ * the whole file into avm_stage.  Reports first cluster, size, bytes read, the
+ * LBA of the first read failure (-1 if none) and the first 4 magic bytes.  Used
+ * by GET /sdread to characterise the launch-from-SD read remotely. */
+int avm_sdread_diag(const char *name, int *first, int *size, int *got,
+                    int *faillba, int *magic)
+{
+    *first = *size = *got = 0; *faillba = -1; magic[0]=magic[1]=magic[2]=magic[3]=0;
+    fat32_t fs;
+    if (avm_mount_vol('S', &fs) != 0) return -1;          /* mount failed */
+    unsigned int fc = 0, sz = 0;
+    if (fat32_open(&fs, name, &fc, &sz) != 0 || fc < 2) return -2;  /* not found */
+    *first = (int)fc; *size = (int)sz;
+    unsigned int spc = fs.sectors_per_cluster ? fs.sectors_per_cluster : 1;
+    unsigned int g = 0, cur = fc; int safety = 1 << 20;
+    unsigned char sec[512];
+    while (g < sz && cur >= 2 && cur < 0x0FFFFFF8u && safety-- > 0) {
+        unsigned long base = fat32_cluster_lba(&fs, cur);
+        for (unsigned int s = 0; s < spc && g < sz; s++) {
+            int rok = 0;
+            for (int t = 0; t < 8 && !rok; t++) if (fs.rd(base + s, sec) == 0) rok = 1;
+            if (!rok) { *faillba = (int)(base + s); *got = (int)g; return -3; }
+            unsigned int chunk = sz - g; if (chunk > 512) chunk = 512;
+            for (unsigned int i = 0; i < chunk; i++) avm_stage[g + i] = sec[i];
+            g += chunk;
+        }
+        cur = fat32_next_cluster_of(&fs, cur);
+    }
+    *got = (int)g;
+    for (int i = 0; i < 4; i++) magic[i] = avm_stage[i];
     return 0;
 }
 
