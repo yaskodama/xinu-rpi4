@@ -1519,6 +1519,33 @@ static void win_gfx(window_t *self, unsigned int frame)
     gfx_render(self->x + 1, self->y + WM_TITLEBAR_H + 2,
                self->width - 2, self->height - WM_TITLEBAR_H - 3);
 }
+
+/* Content-rect size of the Graphics window (window-local; gfx_render adds the
+ * screen offset).  Used by the `wine` command to centre + scale its glass. */
+void gfxwin_rect(int *x, int *y, int *w, int *h)
+{
+    if (x) *x = 0;
+    if (y) *y = 0;
+    if (w) *w = gfx_win.width  - 2;
+    if (h) *h = gfx_win.height - WM_TITLEBAR_H - 3;
+}
+
+/* Raise the Graphics window and flip its current gfx_* list to the screen — for
+ * a blocking caller (the `wine` shell command) since the wm redraw loop is
+ * stalled while a command runs. */
+void gfxwin_present(void)
+{
+    extern void wm_show(window_t *);
+    extern void wm_cursor_after_blit(void);
+    static int raised;
+    if (!raised) { wm_show(&gfx_win); raised = 1; }
+    int cx = gfx_win.x + 1, cy = gfx_win.y + WM_TITLEBAR_H + 2;
+    int cw = gfx_win.width - 2, ch = gfx_win.height - WM_TITLEBAR_H - 3;
+    fill_rect(cx, cy, cw, ch, gfx_win.content_bg);
+    gfx_render(cx, cy, cw, ch);
+    video_present();
+    wm_cursor_after_blit();
+}
 static window_t anim_win;
 static window_t ftree_win;
 static window_t mem_win;

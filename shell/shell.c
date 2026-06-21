@@ -161,6 +161,16 @@ static int cmd_hello(int argc, char **argv)
     return 0;
 }
 
+static int cmd_wine(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    extern void basicwin_wine(void);
+    uart_puts("wine: spinning a 3-D wireframe wine glass in the BASIC window...\n");
+    basicwin_wine();                 /* 20 small X/Y/Z rotations, then returns */
+    uart_puts("wine: done\n");
+    return 0;
+}
+
 static int cmd_clear(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -887,6 +897,7 @@ static int cmd_wifi(int argc, char **argv)
 
 static const struct centry commandtab[] = {
     { "wifi",   "wifi on|aps|save <ssid> <pass>|forget <ssid>|scan|up|off", cmd_wifi },
+    { "wine",   "spin a 3-D wireframe wine glass in the BASIC window",      cmd_wine   },
     { "help",   "list the commands",                       cmd_help   },
     { "pwd",    "print the current directory",             cmd_pwd    },
     { "ls",     "ls [path] — list a directory",            cmd_ls     },

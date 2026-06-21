@@ -94,6 +94,10 @@ static const bw_button_t bw_btns[] = {
     { "fizz",  "RUN \"fizz\""   },
     { "qsort", "RUN \"qsort\""  },
     { "koch",  "RUN \"koch\""   },
+    { "maze",  "RUN \"maze\""   },
+    { "glass", "RUN \"glass\""  },
+    { "flight","RUN \"flight\"" },
+    { "rescue","RUN \"rescue\"" },
 };
 #define BW_NBTN      ((int)(sizeof(bw_btns) / sizeof(bw_btns[0])))
 #define BW_BTN_H     16
@@ -228,6 +232,74 @@ static void bw_present_gfx(void)
     bw_draw_pbtns(self);      /* keep program buttons painted during a RUN */
     video_present();
     wm_cursor_after_blit();   /* flip wiped the cursor — pump mouse + re-stamp */
+}
+
+/* ===== `wine` shell command: 3-D wireframe wine-glass in the GRAPHICS window
+ * (gfx_* list / gfx_win in main.c) — the SAME revolved profile as the BASIC
+ * `glass` sample, spun a little about X/Y/Z for 100 frames, then it stops.
+ * Driven from shell/shell.c. ===================================== */
+static double w_sin(double x)
+{
+    while (x >  3.14159265358979) x -= 6.28318530717959;
+    while (x < -3.14159265358979) x += 6.28318530717959;
+    double x2 = x * x, t = x, s = x;
+    for (int n = 1; n < 8; n++) { t *= -x2 / (double)((2*n) * (2*n + 1)); s += t; }
+    return s;
+}
+static double w_cos(double x) { return w_sin(x + 1.57079632679490); }
+
+void basicwin_wine(void)
+{
+    extern void wm_cursor_delay_ms(int);
+    extern void gfxwin_present(void);                /* raise + flip the Graphics window */
+    extern void gfxwin_rect(int *, int *, int *, int *);
+
+    int gx, gy, gw, gh; gfxwin_rect(&gx, &gy, &gw, &gh);  /* window-local content size */
+    int cx = gw / 2, cy = gh / 2;
+    double scl = (double)gh * 0.9;                   /* fit the glass to the window */
+
+    /* revolved wine-glass profile (8 rings) — identical to BASIC `glass`. */
+    static const double YP[8] = { 0, 0.1, 0.15, 1.1, 1.2, 1.5, 1.9, 2.2 };
+    static const double RP[8] = { 0.6, 0.6, 0.08, 0.08, 0.3, 0.5, 0.55, 0.45 };
+    const int NP = 8, NA = 12;
+    double CT[12], ST[12];
+    for (int j = 0; j < NA; j++) {
+        double a = (double)j * 2.0 * 3.14159265358979 / NA;
+        CT[j] = w_cos(a); ST[j] = w_sin(a);
+    }
+    for (int f = 0; f < 100; f++) {                 /* 100 small rotations, then stop */
+        double rx = f * 0.08, ry = f * 0.11, rz = f * 0.05;
+        double cxa = w_cos(rx), sxa = w_sin(rx);
+        double cya = w_cos(ry), sya = w_sin(ry);
+        double cza = w_cos(rz), sza = w_sin(rz);
+        int VX[96], VY[96], VK[96];
+        for (int i = 0; i < NP; i++) {
+            double ri = RP[i], by = YP[i] - 1.1;
+            for (int j = 0; j < NA; j++) {
+                double bx = ri * CT[j], bz = ri * ST[j];
+                double y1 = by * cxa - bz * sxa, z1 = by * sxa + bz * cxa;
+                double x2 = bx * cya + z1 * sya, z2 = -bx * sya + z1 * cya;
+                double wx = x2 * cza - y1 * sza, wy = x2 * sza + y1 * cza, wz = z2 + 3.0;
+                int idx = i * NA + j, ok = (wz > 0.5);
+                VK[idx] = ok;
+                if (ok) { VX[idx] = cx + (int)(scl * wx / wz); VY[idx] = cy - (int)(scl * wy / wz); }
+                else    { VX[idx] = 0; VY[idx] = 0; }
+            }
+        }
+        gfx_clear();
+        for (int i = 0; i < NP; i++)            /* angular rings (magenta) */
+            for (int j = 0; j < NA; j++) {
+                int j2 = (j + 1) % NA, k1 = i * NA + j, k2 = i * NA + j2;
+                if (VK[k1] && VK[k2]) gfx_line(VX[k1], VY[k1], VX[k2], VY[k2], 5);
+            }
+        for (int i = 0; i < NP - 1; i++)        /* verticals (cyan) */
+            for (int j = 0; j < NA; j++) {
+                int k1 = i * NA + j, k2 = (i + 1) * NA + j;
+                if (VK[k1] && VK[k2]) gfx_line(VX[k1], VY[k1], VX[k2], VY[k2], 3);
+            }
+        gfxwin_present();
+        wm_cursor_delay_ms(120);
+    }
 }
 
 static void bw_pause(int ms)

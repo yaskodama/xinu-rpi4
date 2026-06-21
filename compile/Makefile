@@ -124,6 +124,10 @@ obj/qemu/llm.o: llm.c | obj/qemu ; $(CC) $(QEMU_FP_CFLAGS) -c $< -o $@
 obj/pi4/basic.o:  basic.c | obj/pi4  ; $(CC) $(PI4_FP_CFLAGS)  -c $< -o $@
 obj/qemu/basic.o: basic.c | obj/qemu ; $(CC) $(QEMU_FP_CFLAGS) -c $< -o $@
 
+# basicwin.c — the `wine` command's 3-D wire-glass uses double rotation math.
+obj/pi4/basicwin.o:  basicwin.c | obj/pi4  ; $(CC) $(PI4_FP_CFLAGS)  -c $< -o $@
+obj/qemu/basicwin.o: basicwin.c | obj/qemu ; $(CC) $(QEMU_FP_CFLAGS) -c $< -o $@
+
 obj/pi4/%.o: %.c  | obj/pi4  ; $(CC) $(PI4_CFLAGS)  -c $< -o $@
 obj/pi4/%.o: %.S  | obj/pi4  ; $(CC) $(PI4_CFLAGS)  -c $< -o $@
 obj/qemu/%.o: %.c | obj/qemu ; $(CC) $(QEMU_CFLAGS) -c $< -o $@
