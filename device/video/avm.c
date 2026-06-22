@@ -35,6 +35,66 @@ static int  a_streq(const char *x, const char *y)
 static unsigned vm_u16(const unsigned char *p) { return p[0] | (p[1] << 8); }
 static int      vm_i32(const unsigned char *p)
 { return (int)(p[0] | (p[1]<<8) | (p[2]<<16) | ((unsigned)p[3]<<24)); }
+static unsigned vm_u32(const unsigned char *p)
+{ return p[0] | (p[1]<<8) | (p[2]<<16) | ((unsigned)p[3]<<24); }
+static int vm_i16(const unsigned char *p)
+{ int v = p[0] | (p[1]<<8); return (v & 0x8000) ? v - 0x10000 : v; }
+
+/* ===== AVM2: fixed-point 3-D math for the binary-mesh display ============= *
+ * No FPU use in the kernel VM thread: angles are milliradians, trig is Q15
+ * (value/32768), so the embedded mesh can be projected/shaded with longs. */
+#define FX_PI 3142                                 /* pi in millirad (Q0) */
+static int isin_q15(int mrad)                      /* sin(mrad/1000) in Q15 */
+{
+    int m = mrad % (2*FX_PI);
+    if (m < -FX_PI) m += 2*FX_PI; else if (m > FX_PI) m -= 2*FX_PI;
+    long xn = (long)m * 32768 / FX_PI;             /* x/pi in Q15, [-1,1]   */
+    long axn = xn < 0 ? -xn : xn;
+    long y = 4*xn - ((4*xn*axn) >> 15);            /* parabola approx       */
+    long ay = y < 0 ? -y : y;
+    y = y + (225 * (((y*ay) >> 15) - y)) / 1000;   /* precision refinement  */
+    return (int)y;
+}
+static int icos_q15(int mrad) { return isin_q15(mrad + FX_PI/2); }
+static unsigned long a_isqrt(unsigned long v)
+{
+    unsigned long r = 0, b = 1UL << 62;
+    while (b > v) b >>= 2;
+    while (b) { if (v >= r + b) { v -= r + b; r = (r >> 1) + b; } else r >>= 1; b >>= 2; }
+    return r;
+}
+
+/* ===== AVM2 embedded mesh (binary vertex-buffer region) ================== */
+#define MESH_MAXV 32768
+#define MESH_MAXT 49152
+static int   mesh_has, mesh_mode;                  /* loaded / a mesh frame is up */
+static int   mesh_nv, mesh_nt, mesh_scale;
+static short mesh_px[MESH_MAXV], mesh_py[MESH_MAXV], mesh_pz[MESH_MAXV];
+static unsigned char mesh_cr[MESH_MAXV], mesh_cg[MESH_MAXV], mesh_cb[MESH_MAXV];
+static short mesh_nx[MESH_MAXV], mesh_ny[MESH_MAXV], mesh_nz[MESH_MAXV];
+static int   mesh_idx[MESH_MAXT*3];
+static int   macc_x[MESH_MAXV], macc_y[MESH_MAXV], macc_z[MESH_MAXV];   /* load-time */
+/* smooth (area-weighted) per-vertex normals in object space, Q15 */
+static void avm_mesh_normals(void)
+{
+    for (int i = 0; i < mesh_nv; i++) { macc_x[i] = macc_y[i] = macc_z[i] = 0; }
+    for (int t = 0; t < mesh_nt; t++) {
+        int a = mesh_idx[t*3], b = mesh_idx[t*3+1], c = mesh_idx[t*3+2];
+        long ux = mesh_px[b]-mesh_px[a], uy = mesh_py[b]-mesh_py[a], uz = mesh_pz[b]-mesh_pz[a];
+        long vx = mesh_px[c]-mesh_px[a], vy = mesh_py[c]-mesh_py[a], vz = mesh_pz[c]-mesh_pz[a];
+        long fx = (uy*vz - uz*vy) >> 10, fy = (uz*vx - ux*vz) >> 10, fz = (ux*vy - uy*vx) >> 10;
+        macc_x[a]+=fx; macc_y[a]+=fy; macc_z[a]+=fz;
+        macc_x[b]+=fx; macc_y[b]+=fy; macc_z[b]+=fz;
+        macc_x[c]+=fx; macc_y[c]+=fy; macc_z[c]+=fz;
+    }
+    for (int i = 0; i < mesh_nv; i++) {
+        long x = macc_x[i], y = macc_y[i], z = macc_z[i];
+        unsigned long l = a_isqrt((unsigned long)(x*x + y*y + z*z)); if (!l) l = 1;
+        mesh_nx[i] = (short)(x*32767/(long)l);
+        mesh_ny[i] = (short)(y*32767/(long)l);
+        mesh_nz[i] = (short)(z*32767/(long)l);
+    }
+}
 
 /* ===== staged upload (filled by /actor/loadvm chunks) ===================== */
 #define AVM_STAGE_MAX (12*1024*1024)   /* room for a solid turntable (many frames) */
@@ -122,11 +182,14 @@ static int vm_spawn(int cls)
 #define BW 760
 #define BH 620
 static unsigned int g_buf[BW * BH];      /* off-screen ARGB raster          */
+static int          g_zbuf[BW * BH];     /* per-pixel depth for AVM2 mesh    */
 static int          g_buf_ready;
 #define VLINE_MAX 512
 #define VTRI_MAX  24000
-typedef struct { short x1,y1,x2,y2; unsigned char col; } avm_line_t;
-typedef struct { short x1,y1,x2,y2,x3,y3; unsigned char col; } avm_tri_t;
+/* col: a 16-colour palette index (0..15) OR, when bit 24 is set, a full 24-bit
+ * 0xRRGGBB true colour — so actors can drive the display in full colour. */
+typedef struct { short x1,y1,x2,y2; unsigned int col; } avm_line_t;
+typedef struct { short x1,y1,x2,y2,x3,y3; unsigned int col; } avm_tri_t;
 static avm_line_t v_line[VLINE_MAX];
 static int v_line_n;
 static avm_tri_t  v_tri[VTRI_MAX];
@@ -166,6 +229,11 @@ static unsigned int pal16(int c)
         0xFF808080U,0xFF80A0FFU,0xFF80FF80U,0xFF80FFFFU,
         0xFFFF8080U,0xFFFF80FFU,0xFFFFFF80U,0xFFFFFFFFU };
     return p[c & 15];
+}
+/* col -> ARGB: bit 24 set => true 24-bit colour, else a 16-colour palette index. */
+static unsigned int avm_color(unsigned int c)
+{
+    return (c & 0x1000000u) ? (0xFF000000u | (c & 0xFFFFFFu)) : pal16((int)c);
 }
 
 /* scanline-fill a triangle into g_buf, clipped to scanline band [ylo,yhi). */
@@ -209,10 +277,10 @@ static long avm_render_band(long lo, long hi, int core)
     }
     for (int i=0;i<v_tri_n;i++)
         buf_tri_band(v_tri[i].x1,v_tri[i].y1,v_tri[i].x2,v_tri[i].y2,v_tri[i].x3,v_tri[i].y3,
-                     pal16(v_tri[i].col),(int)lo,(int)hi);
+                     avm_color(v_tri[i].col),(int)lo,(int)hi);
     for (int i=0;i<v_line_n;i++)
         buf_line_band(v_line[i].x1,v_line[i].y1,v_line[i].x2,v_line[i].y2,
-                      pal16(v_line[i].col),(int)lo,(int)hi);
+                      avm_color(v_line[i].col),(int)lo,(int)hi);
     return 0;
 }
 /* rasterise the accumulated frame into g_buf, fanned out over all cores. */
@@ -222,6 +290,172 @@ static void avm_render(void)
     if (nc < 1) nc = 1;
     smp_parallel_sum(avm_render_band, BH, nc);
     g_buf_ready = 1;
+}
+
+/* ===== AVM2 mesh: project + shade + z-buffer rasterise (the 3-D display) ==
+ * Draws the embedded binary-vertex-buffer mesh straight into g_buf with a real
+ * per-pixel z-buffer (so occlusion is correct — closed eyes stay closed), at the
+ * runtime (yaw,pitch).  All integer/Q15 math; colours are R/B pre-swapped to
+ * match this Pi4 framebuffer.  This is the kernel twin of the host render_glb. */
+/* Render target (so the mesh can rasterise either straight into g_buf or into a
+ * 2x supersample buffer for the AA checkbox).  Set by vm_mesh3d before drawing. */
+#define SSW (BW*2)
+#define SSH (BH*2)
+static unsigned int ss_buf[SSW*SSH];     /* 2x supersample colour  (AA on) */
+static int          ss_zbuf[SSW*SSH];    /* 2x supersample depth           */
+static unsigned int *rbuf; static int *rz, rw, rh;
+static void mtri_z(int x0,int y0,long z0,int x1,int y1,long z1,
+                   int x2,int y2,long z2,unsigned int col)
+{
+    int tx; long tz;
+    if (y1<y0){ tx=x0;x0=x1;x1=tx; tx=y0;y0=y1;y1=tx; tz=z0;z0=z1;z1=tz; }
+    if (y2<y0){ tx=x0;x0=x2;x2=tx; tx=y0;y0=y2;y2=tx; tz=z0;z0=z2;z2=tz; }
+    if (y2<y1){ tx=x1;x1=x2;x2=tx; tx=y1;y1=y2;y2=tx; tz=z1;z1=z2;z2=tz; }
+    if (y2==y0) return;
+    for (int yy=y0; yy<=y2; yy++) {
+        if (yy<0 || yy>=rh) continue;
+        int xa = x0 + (int)((long)(x2-x0)*(yy-y0)/(y2-y0));
+        long za = z0 + (long)(z2-z0)*(yy-y0)/(y2-y0);
+        int xb; long zb;
+        if (yy<y1 && y1!=y0) { xb = x0 + (int)((long)(x1-x0)*(yy-y0)/(y1-y0));
+                               zb = z0 + (long)(z1-z0)*(yy-y0)/(y1-y0); }
+        else if (y2!=y1)     { xb = x1 + (int)((long)(x2-x1)*(yy-y1)/(y2-y1));
+                               zb = z1 + (long)(z2-z1)*(yy-y1)/(y2-y1); }
+        else                 { xb = x1; zb = z1; }
+        if (xa>xb){ int t=xa;xa=xb;xb=t; tz=za;za=zb;zb=tz; }
+        int span = xb-xa; if (span<0) continue;
+        unsigned int *row = rbuf + yy*rw; int *zr = rz + yy*rw;
+        for (int xx=xa; xx<=xb; xx++) {
+            if (xx<0 || xx>=rw) continue;
+            long z = span ? (za + (zb-za)*(xx-xa)/span) : za;
+            if (z > zr[xx]) { zr[xx] = (int)z; row[xx] = col; }
+        }
+    }
+}
+static void mline(int x0,int y0,int x1,int y1,unsigned int col)
+{
+    int dx=a_abs(x1-x0), sx=x0<x1?1:-1, dy=-a_abs(y1-y0), sy=y0<y1?1:-1, err=dx+dy, e2;
+    for (;;) {
+        if (x0>=0&&x0<rw&&y0>=0&&y0<rh) rbuf[y0*rw+x0]=col;
+        if (x0==x1&&y0==y1) break;
+        e2=2*err; if (e2>=dy){err+=dy;x0+=sx;} if (e2<=dx){err+=dx;y0+=sy;}
+    }
+}
+/* light direction (0.40,0.60,0.70) normalised, Q15 */
+#define MESH_LX 13044
+#define MESH_LY 19565
+#define MESH_LZ 22825
+/* ---- AVM2 mesh turntable + feature toggles (driven by the toolbar/checkboxes) */
+static int mesh_yaw_mrad, mesh_pitch_mrad, mesh_yaw0, mesh_pitch0;
+static int mesh_spin, mesh_wire, mesh_flat;        /* shading / motion          */
+static int mesh_aa, mesh_grid, mesh_persp;         /* AA / floor grid / perspective */
+static int mesh_spin_step = 96;                    /* mrad/frame (~5.5 deg)     */
+static int mesh_speed = 60;                        /* ms/frame while spinning   */
+static unsigned long mesh_last;
+static void vm_mesh3d(int yaw_mrad, int pitch_mrad)
+{
+    if (!mesh_has) return;
+    int cyq = icos_q15(yaw_mrad), syq = isin_q15(yaw_mrad);
+    int cpq = icos_q15(pitch_mrad), spq = isin_q15(pitch_mrad);
+    int SC = mesh_scale ? mesh_scale : 32000;
+    /* pick render target: 2x supersample buffer when AA is on, else g_buf */
+    int ssf = mesh_aa ? 2 : 1;
+    if (ssf == 2) { rbuf = ss_buf; rz = ss_zbuf; rw = SSW; rh = SSH; }
+    else          { rbuf = g_buf;  rz = g_zbuf;  rw = BW;  rh = BH;  }
+    int CXp = 380*ssf, CYp = 300*ssf, FS = 260*ssf;
+    for (int i = 0; i < rw*rh; i++) { rbuf[i] = G_BG; rz[i] = -0x40000000; }
+    /* Blender-style floor grid on the plane y=-SC (drawn first; the mesh, which
+     * is z-buffered, paints over it where they overlap). */
+    if (mesh_grid) {
+        int g1 = (3*SC)/2, step = SC/4; unsigned int gcol = 0xFF384848u;
+        for (int a = -g1; a <= g1; a += step) {
+            for (int dir = 0; dir < 2; dir++) {
+                int ex[2], ey[2];
+                for (int e = 0; e < 2; e++) {
+                    long wx = (dir==0) ? a : (e? g1 : -g1);
+                    long wz = (dir==0) ? (e? g1 : -g1) : a;
+                    long wy = -SC;
+                    long x2 = (wx*cyq + wz*syq) >> 15, z2 = (-wx*syq + wz*cyq) >> 15;
+                    long y3 = (wy*cpq - z2*spq) >> 15, z3 = (wy*spq + z2*cpq) >> 15;
+                    if (mesh_persp) { long zc = z3 + 3*SC; if (zc < 1) zc = 1;
+                        ex[e] = CXp + (int)((FS*3*x2)/zc); ey[e] = CYp - (int)((FS*3*y3)/zc); }
+                    else { ex[e] = CXp + (int)((FS*x2)/SC); ey[e] = CYp - (int)((FS*y3)/SC); }
+                }
+                mline(ex[0],ey[0],ex[1],ey[1],gcol);
+            }
+        }
+    }
+    for (int t = 0; t < mesh_nt; t++) {
+        int sx[3], sy[3]; long sz[3], cx3[3], cy3[3], cz3[3];
+        long fsum = 0, rsum = 0, gsum = 0, bsum = 0;
+        for (int k = 0; k < 3; k++) {
+            int i = mesh_idx[t*3+k];
+            long vx = mesh_px[i], vy = mesh_py[i], vz = mesh_pz[i];
+            long x2 = (vx*cyq + vz*syq) >> 15;
+            long z2 = (-vx*syq + vz*cyq) >> 15;
+            long y3 = (vy*cpq - z2*spq) >> 15;
+            long z3 = (vy*spq + z2*cpq) >> 15;
+            if (mesh_persp) {                       /* perspective divide        */
+                long zc = z3 + 3*SC; if (zc < 1) zc = 1;
+                sx[k] = CXp + (int)((FS*3*x2)/zc);
+                sy[k] = CYp - (int)((FS*3*y3)/zc);
+            } else {                                /* orthographic              */
+                sx[k] = CXp + (int)((FS*x2)/SC);
+                sy[k] = CYp - (int)((FS*y3)/SC);
+            }
+            sz[k] = z3; cx3[k] = x2; cy3[k] = y3; cz3[k] = z3;
+            if (!mesh_flat) {                       /* smooth (Gouraud-ish) shading */
+                long nx = mesh_nx[i], ny = mesh_ny[i], nz = mesh_nz[i];
+                long rx = (nx*cyq + nz*syq) >> 15;
+                long rzz = (-nx*syq + nz*cyq) >> 15;
+                long ry = (ny*cpq - rzz*spq) >> 15;
+                long rz2 = (ny*spq + rzz*cpq) >> 15;
+                long ndl = (rx*MESH_LX + ry*MESH_LY + rz2*MESH_LZ) >> 15;
+                if (ndl < 0) ndl = 0;
+                fsum += 14746 + ((18022*ndl) >> 15);   /* 0.45 + 0.55*ndl, Q15 */
+            }
+            rsum += mesh_cr[i]; gsum += mesh_cg[i]; bsum += mesh_cb[i];
+        }
+        long f;
+        if (mesh_flat) {                            /* flat: one face normal/tri */
+            long ux = cx3[1]-cx3[0], uy = cy3[1]-cy3[0], uz = cz3[1]-cz3[0];
+            long vx = cx3[2]-cx3[0], vy = cy3[2]-cy3[0], vz = cz3[2]-cz3[0];
+            long fx = uy*vz-uz*vy, fy = uz*vx-ux*vz, fz = ux*vy-uy*vx;
+            unsigned long l = a_isqrt((unsigned long)(fx*fx+fy*fy+fz*fz)); if (!l) l = 1;
+            long ndl = ((fx*32767/(long)l)*MESH_LX + (fy*32767/(long)l)*MESH_LY
+                        + (fz*32767/(long)l)*MESH_LZ) >> 15;
+            if (ndl < 0) ndl = -ndl;                /* shade either face */
+            f = 14746 + ((18022*ndl) >> 15);
+        } else {
+            f = fsum/3;
+        }
+        int r = (int)(((rsum/3)*f) >> 15); if (r > 255) r = 255;
+        int g = (int)(((gsum/3)*f) >> 15); if (g > 255) g = 255;
+        int b = (int)(((bsum/3)*f) >> 15); if (b > 255) b = 255;
+        /* ARGB with full alpha; R/B pre-swapped for this Pi4's framebuffer */
+        unsigned int col = 0xFF000000u | ((unsigned)b<<16) | ((unsigned)g<<8) | (unsigned)r;
+        if (mesh_wire) {
+            mline(sx[0],sy[0],sx[1],sy[1],col);
+            mline(sx[1],sy[1],sx[2],sy[2],col);
+            mline(sx[2],sy[2],sx[0],sy[0],col);
+        } else {
+            mtri_z(sx[0],sy[0],sz[0], sx[1],sy[1],sz[1], sx[2],sy[2],sz[2], col);
+        }
+    }
+    if (ssf == 2) {                                 /* box-downsample 2x -> g_buf */
+        for (int y = 0; y < BH; y++) {
+            unsigned int *o = g_buf + y*BW;
+            unsigned int *a = ss_buf + (2*y)*SSW, *b2 = ss_buf + (2*y+1)*SSW;
+            for (int x = 0; x < BW; x++) {
+                unsigned int p0=a[2*x],p1=a[2*x+1],p2=b2[2*x],p3=b2[2*x+1];
+                int rr=((p0>>16&255)+(p1>>16&255)+(p2>>16&255)+(p3>>16&255))>>2;
+                int gg=((p0>>8&255)+(p1>>8&255)+(p2>>8&255)+(p3>>8&255))>>2;
+                int bb=((p0&255)+(p1&255)+(p2&255)+(p3&255))>>2;
+                o[x]=0xFF000000u|(rr<<16)|(gg<<8)|bb;
+            }
+        }
+    }
+    g_buf_ready = 1; mesh_mode = 1;
 }
 
 /* Load a cached turntable frame into the live buffers and rasterise it. */
@@ -238,42 +472,77 @@ static void ctl_show(int idx)
 /* opcode-facing draw API (called from dispatch) */
 static void vm_cls(void)  { v_line_n = 0; v_tri_n = 0; }
 static void vm_line(int x1,int y1,int x2,int y2,int col)
-{ if (v_line_n<VLINE_MAX){ v_line[v_line_n].x1=x1;v_line[v_line_n].y1=y1;v_line[v_line_n].x2=x2;v_line[v_line_n].y2=y2;v_line[v_line_n].col=(unsigned char)col;v_line_n++; } }
+{ if (v_line_n<VLINE_MAX){ v_line[v_line_n].x1=x1;v_line[v_line_n].y1=y1;v_line[v_line_n].x2=x2;v_line[v_line_n].y2=y2;v_line[v_line_n].col=(unsigned int)col;v_line_n++; } }
 static void vm_tri(int x1,int y1,int x2,int y2,int x3,int y3,int col)
-{ if (v_tri_n<VTRI_MAX){ v_tri[v_tri_n].x1=x1;v_tri[v_tri_n].y1=y1;v_tri[v_tri_n].x2=x2;v_tri[v_tri_n].y2=y2;v_tri[v_tri_n].x3=x3;v_tri[v_tri_n].y3=y3;v_tri[v_tri_n].col=(unsigned char)col;v_tri_n++; } }
+{ if (v_tri_n<VTRI_MAX){ v_tri[v_tri_n].x1=x1;v_tri[v_tri_n].y1=y1;v_tri[v_tri_n].x2=x2;v_tri[v_tri_n].y2=y2;v_tri[v_tri_n].x3=x3;v_tri[v_tri_n].y3=y3;v_tri[v_tri_n].col=(unsigned int)col;v_tri_n++; } }
 
-/* ===== VM graphics window (toolbar + Blender display) ==================== */
-#define AVM_TB 22                                   /* toolbar height */
+/* ===== VM graphics window (toolbar + checkbox row + Blender display) ===== */
+#define AVM_TB 22                                   /* button row height   */
+#define AVM_CB 20                                   /* checkbox row height */
+#define AVM_NCB 6
 static const char *avm_btn[5] = { "Play", "Pause", "Stop", " <", " >" };
+static const char *avm_cbl[AVM_NCB] = { "Wire", "Flat", "Spin", "AA", "Grid", "Persp" };
+static int *avm_cbv(int i)                           /* checkbox -> state cell */
+{
+    switch (i) {
+        case 0: return &mesh_wire;  case 1: return &mesh_flat;  case 2: return &mesh_spin;
+        case 3: return &mesh_aa;    case 4: return &mesh_grid;  default: return &mesh_persp;
+    }
+}
 static window_t vmgfx_win;
 static int      vmgfx_added;
 static void vmgfx_draw(window_t *self, unsigned int frame)
 {
     (void)frame;
     avm_tick();                             /* advance / control the VM */
-    /* toolbar: Play / Pause / Stop / prev / next */
+    /* row 1: Play / Pause / Stop / prev / next */
     int tx = self->x + 2, ty = self->y + WM_TITLEBAR_H + 2, bw = BW / 5;
+    int playing = mesh_mode ? mesh_spin : ctl_play;
     for (int i = 0; i < 5; i++) {
         int bx = tx + i * bw;
         unsigned int bg = 0xFF1F3550U;
-        if ((i == 0 && ctl_play) || (i == 1 && !ctl_play)) bg = 0xFF1F6E2EU;  /* active */
+        if ((i == 0 && playing) || (i == 1 && !playing)) bg = 0xFF1F6E2EU;    /* active */
         fill_rect(bx, ty, bw - 2, AVM_TB, bg);
         draw_rect(bx, ty, bw - 2, AVM_TB, 0xFF6080A0U);
         draw_string_at(bx + 10, ty + (AVM_TB - 8) / 2, avm_btn[i], 0xFFE8F0F8U, bg);
     }
+    /* row 2: feature checkboxes (Wire / Flat / Spin) */
+    int cy = ty + AVM_TB + 1, cw = BW / AVM_NCB;
+    for (int i = 0; i < AVM_NCB; i++) {
+        int cx = tx + i * cw, on = *avm_cbv(i);
+        unsigned int bg = 0xFF152535U;
+        fill_rect(cx, cy, cw - 2, AVM_CB, bg);
+        draw_rect(cx, cy, cw - 2, AVM_CB, 0xFF40607FU);
+        int bxx = cx + 6, byy = cy + (AVM_CB - 12) / 2;     /* 12x12 tick box */
+        fill_rect(bxx, byy, 12, 12, on ? 0xFF30D040U : 0xFF0A1018U);
+        draw_rect(bxx, byy, 12, 12, 0xFF80A0C0U);
+        draw_string_at(bxx + 18, cy + (AVM_CB - 8) / 2, avm_cbl[i],
+                       0xFFE8F0F8U, bg);
+    }
     if (g_buf_ready)
-        video_blit(self->x + 2, self->y + WM_TITLEBAR_H + 2 + AVM_TB + 1, BW, BH, g_buf, BW);
+        video_blit(self->x + 2, self->y + WM_TITLEBAR_H + 2 + AVM_TB + 1 + AVM_CB + 1,
+                   BW, BH, g_buf, BW);
 }
-/* Toolbar click -> playback control.  (lx,ly) are window-local. */
+/* Toolbar / checkbox click -> control + feature toggle.  (lx,ly) window-local. */
 static void vmgfx_click(window_t *self, int lx, int ly)
 {
     (void)self;
-    int tytop = WM_TITLEBAR_H + 2, tybot = tytop + AVM_TB;
-    if (ly < tytop || ly >= tybot) return;
+    int r1top = WM_TITLEBAR_H + 2, r1bot = r1top + AVM_TB;
+    int r2top = r1bot + 1,         r2bot = r2top + AVM_CB;
     int bx = lx - 2; if (bx < 0) return;
-    int bw = BW / 5; if (bw < 1) bw = 1;
-    int i = bx / bw;
-    if (i >= 0 && i <= 4) avm_ctl(i);
+    if (ly >= r1top && ly < r1bot) {                 /* button row */
+        int bw = BW / 5; if (bw < 1) bw = 1;
+        int i = bx / bw;
+        if (i >= 0 && i <= 4) avm_ctl(i);
+    } else if (ly >= r2top && ly < r2bot) {          /* checkbox row */
+        int cw = BW / AVM_NCB; if (cw < 1) cw = 1;
+        int i = bx / cw;
+        if (i >= 0 && i < AVM_NCB) {
+            int *v = avm_cbv(i); *v = !*v;
+            if (i == 2) { if (mesh_spin) mesh_last = 0; }   /* Spin -> turntable */
+            else if (mesh_mode) vm_mesh3d(mesh_yaw_mrad, mesh_pitch_mrad); /* Wire/Flat */
+        }
+    }
 }
 /* Arrow / space keys when the VM window is active: rotate / play / pause.
  * The caller (main.c) only invokes this when wm_kbd_target() is this window. */
@@ -287,7 +556,7 @@ void avm_key(char c)
         case 'C': case 'd': avm_ctl(4); break;      /* right = next */
         case 'A': case 'w': avm_ctl(0); break;      /* up    = play */
         case 'B': case 's': avm_ctl(1); break;      /* down  = pause */
-        case ' ': avm_ctl(ctl_play ? 1 : 0); break; /* space = toggle */
+        case ' ': avm_ctl((mesh_mode ? mesh_spin : ctl_play) ? 1 : 0); break; /* space toggle */
         default: break;
     }
 }
@@ -390,8 +659,8 @@ void avm_draw_loadbar(int sw, int sh)
 static int avm_load(unsigned char *buf, int len)
 {
     if (len < 6) return -1;
-    if (buf[0]!='A'||buf[1]!='V'||buf[2]!='M'||buf[3]!='1') return -1;
-    vm_mod = buf; vm_mod_len = len;
+    if (buf[0]!='A'||buf[1]!='V'||buf[2]!='M'||(buf[3]!='1'&&buf[3]!='2')) return -1;
+    vm_mod = buf; vm_mod_len = len; mesh_has = 0; mesh_mode = 0;
     const unsigned char *p = buf + 4, *end = buf + len;
     int ns = vm_u16(p); p += 2; vm_n_str = 0; int sb = 0, i;
     for (i = 0; i < ns && i < VM_STR_MAX; i++) {
@@ -418,6 +687,26 @@ static int avm_load(unsigned char *buf, int len)
             p += cl->m[mi].code_len;
         }
         vm_n_class++;
+    }
+    /* AVM2: optional binary MESH region after the class table. */
+    if (buf[3] == '2' && p < end && *p == 1) {
+        p++;
+        if (p + 13 > end) return -1;
+        int nv = (int)vm_u32(p), nt = (int)vm_u32(p+4), idxw = p[8], scale = vm_i32(p+9);
+        p += 13;
+        if (nv < 0 || nt < 0 || nv > MESH_MAXV || nt > MESH_MAXT) return -1;
+        if (p + (long)nv*9 + (long)nt*3*idxw > end) return -1;
+        mesh_nv = nv; mesh_nt = nt; mesh_scale = scale;
+        for (int i = 0; i < nv; i++) {
+            mesh_px[i] = (short)vm_i16(p);   mesh_py[i] = (short)vm_i16(p+2);
+            mesh_pz[i] = (short)vm_i16(p+4); mesh_cr[i] = p[6]; mesh_cg[i] = p[7];
+            mesh_cb[i] = p[8]; p += 9;
+        }
+        for (int t = 0; t < nt*3; t++) {
+            mesh_idx[t] = (idxw == 2) ? (int)vm_u16(p) : (int)vm_u32(p); p += idxw;
+        }
+        avm_mesh_normals();
+        mesh_has = 1;
     }
     return vm_n_class > 0 ? 0 : -1;
 }
@@ -451,6 +740,7 @@ static void avm_dispatch(int self, int sender, const char *method, long *args, i
         case 0x07: {                                                            /* WAIT = frame boundary */
             vm_wait_ms = (int)VPOP();
             if (vm_wait_ms > 0) ctl_speed = vm_wait_ms;
+            if (mesh_mode) { vm_frame_done = 1; break; }   /* mesh already in g_buf */
             if (!ctl_cached) {
                 int cf = (self >= 0 && self < VM_MAXOBJ) ? (int)vm_obj[self].f[0] : 0;
                 if (cf >= 0 && cf < FC_MAX) {                /* cache this frame */
@@ -495,6 +785,10 @@ static void avm_dispatch(int self, int sender, const char *method, long *args, i
         case 0x46: vm_cls(); break;                                             /* CLS */
         case 0x47: { long col=VPOP(),y3=VPOP(),x3=VPOP(),y2=VPOP(),x2=VPOP(),y1=VPOP(),x1=VPOP(); /* TRI */
                      vm_tri((int)x1,(int)y1,(int)x2,(int)y2,(int)x3,(int)y3,(int)col); } break;
+        case 0x48: { long pitch=VPOP(), yaw=VPOP();                              /* MESH3D */
+                     mesh_yaw0 = mesh_yaw_mrad = (int)yaw;
+                     mesh_pitch0 = mesh_pitch_mrad = (int)pitch;
+                     vm_mesh3d((int)yaw,(int)pitch); } break;
         default: pc = clen; break;
         }
     }
@@ -527,6 +821,22 @@ static void avm_tick(void)
         return;
     }
 
+    /* AVM2 mesh mode: the toolbar Play/Pause/Stop/</> + checkboxes drive a live
+     * turntable.  When spinning, advance yaw and re-render the 3-D mesh; once the
+     * first MESH3D has run (mesh_mode set) the actor queue is idle. */
+    if (mesh_mode) {
+        if (mesh_spin) {
+            unsigned long now = avm_now_ms();
+            if (now - mesh_last >= (unsigned long)mesh_speed) {
+                mesh_yaw_mrad += mesh_spin_step;
+                if (mesh_yaw_mrad > 2*FX_PI) mesh_yaw_mrad -= 2*FX_PI;
+                vm_mesh3d(mesh_yaw_mrad, mesh_pitch_mrad);
+                mesh_last = now;
+            }
+        }
+        return;
+    }
+
     /* Caching phase: pace by the WAIT ms, advancing one actor frame at a time. */
     if (g_buf_ready && vm_wait_ms > 0) {
         unsigned long now = avm_now_ms();
@@ -544,6 +854,20 @@ static void avm_tick(void)
 /* ---- playback controls (toolbar buttons + arrow keys) ---- */
 void avm_ctl(int cmd)   /* 0 play, 1 pause, 2 stop, 3 prev, 4 next */
 {
+    if (mesh_mode) {                              /* AVM2 mesh turntable */
+        switch (cmd) {
+            case 0: mesh_spin = 1; mesh_last = 0; break;                       /* Play  */
+            case 1: mesh_spin = 0; break;                                      /* Pause */
+            case 2: mesh_spin = 0; mesh_yaw_mrad = mesh_yaw0;                  /* Stop  */
+                    vm_mesh3d(mesh_yaw_mrad, mesh_pitch_mrad); break;
+            case 3: mesh_spin = 0; mesh_yaw_mrad -= 160;                       /* <     */
+                    vm_mesh3d(mesh_yaw_mrad, mesh_pitch_mrad); break;
+            case 4: mesh_spin = 0; mesh_yaw_mrad += 160;                       /* >     */
+                    vm_mesh3d(mesh_yaw_mrad, mesh_pitch_mrad); break;
+            default: break;
+        }
+        return;
+    }
     if (!ctl_cached) return;
     switch (cmd) {
         case 0: ctl_play = 1; break;                                  /* Start  */
@@ -563,14 +887,17 @@ int avm_loadrun(int len)
     avm_ld_active = 0;                             /* upload finished: hide the bar */
     vm_qh = vm_qt = 0; vm_nobj = 0;
     for (int i=0;i<VM_MAXOBJ;i++) vm_obj[i].used = 0;
-    v_line_n = 0; v_tri_n = 0; g_buf_ready = 0;
+    v_line_n = 0; v_tri_n = 0; g_buf_ready = 0; mesh_mode = 0;
+    mesh_spin = 0; mesh_wire = 0; mesh_flat = 0;
+    mesh_aa = 0; mesh_grid = 0; mesh_persp = 0;
     ctl_cached = 0; ctl_nframes = 0; ctl_prevf = -1;    /* fresh turntable: re-cache */
     ctl_play = 1; ctl_idx = 0;
     if (avm_load(avm_stage, len) != 0) return -1;
 
     if (!vmgfx_added) {                          /* open the VM graphics window */
         vmgfx_win.x = 120; vmgfx_win.y = 50;
-        vmgfx_win.width = BW + 4; vmgfx_win.height = BH + WM_TITLEBAR_H + AVM_TB + 5;
+        vmgfx_win.width = BW + 4;
+        vmgfx_win.height = BH + WM_TITLEBAR_H + AVM_TB + AVM_CB + 6;
         const char *t = "VM graphics (AVM)";
         int k; for (k=0;k<WM_TITLE_MAX && t[k];k++) vmgfx_win.title[k]=t[k]; vmgfx_win.title[k]=0;
         vmgfx_win.font_scale = 1;
