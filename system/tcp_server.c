@@ -1517,11 +1517,16 @@ static int http_build(const char *req, char *out, int max)
             int id  = avm_loadrun(len);
             bl = s_put(body, bl, "loadvm: len="); bl = s_putdec(body, bl, len);
             bl = s_put(body, bl, " spawned actor id="); bl = s_putdec(body, bl, id);
-            if (want_save) {                                   /* persist to microSD */
+            if (want_save) {                                   /* RAM-resident (reliable) */
                 extern int avm_save(const char *, int);
                 int rc = avm_save(savename, len);
-                bl = s_put(body, bl, "  saved '"); bl = s_put(body, bl, savename);
+                bl = s_put(body, bl, "  saved(RAM) '"); bl = s_put(body, bl, savename);
                 bl = s_put(body, bl, "' rc="); bl = s_putdec(body, bl, rc);
+                if (q_int(req, "sd", 0)) {                     /* opt-in: persist to SD file */
+                    extern int avm_save_sd(const char *, int);
+                    int sdrc = avm_save_sd(savename, len);
+                    bl = s_put(body, bl, "  saved(SD) vol/rc="); bl = s_putdec(body, bl, sdrc);
+                }
             }
             bl = s_put(body, bl, "\n");
         } else {

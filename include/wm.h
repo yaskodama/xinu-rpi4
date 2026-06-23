@@ -57,6 +57,7 @@ typedef struct window {
  * everything previously added, so later windows are "on top" in
  * draw order, though we don't currently overlap them). */
 void wm_add(window_t *w);
+int  wm_contains(window_t *w);
 
 /* The window the user last clicked (NULL until the first click).  Keyboard
  * input is routed to this window (e.g. the BASIC window vs. the shell). */

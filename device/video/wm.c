@@ -214,6 +214,14 @@ void wm_add(window_t *w)
     t->next = w;
 }
 
+/* Is `w` currently in the window list?  (False after the user closes it with the
+ * titlebar [X] -> owners use this to know a window needs re-adding before reuse.) */
+int wm_contains(window_t *w)
+{
+    for (window_t *p = wm_head; p; p = p->next) if (p == w) return 1;
+    return 0;
+}
+
 /* ---- runtime window geometry (driven by the AIPL layout designer) ---- */
 static window_t *wm_nth(int idx)
 {

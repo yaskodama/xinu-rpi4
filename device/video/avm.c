@@ -304,15 +304,29 @@ static void avm_render(void)
 static unsigned int ss_buf[SSW*SSH];     /* 2x supersample colour  (AA on) */
 static int          ss_zbuf[SSW*SSH];    /* 2x supersample depth           */
 static unsigned int *rbuf; static int *rz, rw, rh;
-static void mtri_z(int x0,int y0,long z0,int x1,int y1,long z1,
-                   int x2,int y2,long z2,unsigned int col)
+
+/* ---- SMP fan-out: project once, then rasterise the frame across all 4 cores --
+ * Each core owns a disjoint horizontal scanline band [lo,hi), so it clears + draws
+ * into its own rows of rbuf/rz with no locks (D-cache is off -> writes are seen).*/
+typedef struct { short x0,y0,x1,y1,x2,y2; int z0,z1,z2; unsigned int col; } mtri_t;
+static mtri_t mproj[MESH_MAXT];               /* projected+shaded triangles */
+static int    mproj_n;
+typedef struct { short x0,y0,x1,y1; } gseg_t;
+static gseg_t mgseg[512];                     /* projected floor-grid segments */
+static int    mgseg_n;
+static int    mesh_wire_flag;                 /* snapshot for the band workers */
+
+/* one projected triangle, z-buffered, clipped to scanline band [ylo,yhi) */
+static void mtri_band(const mtri_t *t, int ylo, int yhi)
 {
-    int tx; long tz;
-    if (y1<y0){ tx=x0;x0=x1;x1=tx; tx=y0;y0=y1;y1=tx; tz=z0;z0=z1;z1=tz; }
-    if (y2<y0){ tx=x0;x0=x2;x2=tx; tx=y0;y0=y2;y2=tx; tz=z0;z0=z2;z2=tz; }
-    if (y2<y1){ tx=x1;x1=x2;x2=tx; tx=y1;y1=y2;y2=tx; tz=z1;z1=z2;z2=tz; }
+    int x0=t->x0,y0=t->y0, x1=t->x1,y1=t->y1, x2=t->x2,y2=t->y2;
+    long z0=t->z0,z1=t->z1,z2=t->z2; unsigned int col=t->col; int s; long sz;
+    if (y1<y0){s=x0;x0=x1;x1=s;s=y0;y0=y1;y1=s;sz=z0;z0=z1;z1=sz;}
+    if (y2<y0){s=x0;x0=x2;x2=s;s=y0;y0=y2;y2=s;sz=z0;z0=z2;z2=sz;}
+    if (y2<y1){s=x1;x1=x2;x2=s;s=y1;y1=y2;y2=s;sz=z1;z1=z2;z2=sz;}
     if (y2==y0) return;
-    for (int yy=y0; yy<=y2; yy++) {
+    int ya = y0<ylo?ylo:y0, yb = y2>=yhi?yhi-1:y2;
+    for (int yy=ya; yy<=yb; yy++) {
         if (yy<0 || yy>=rh) continue;
         int xa = x0 + (int)((long)(x2-x0)*(yy-y0)/(y2-y0));
         long za = z0 + (long)(z2-z0)*(yy-y0)/(y2-y0);
@@ -322,24 +336,62 @@ static void mtri_z(int x0,int y0,long z0,int x1,int y1,long z1,
         else if (y2!=y1)     { xb = x1 + (int)((long)(x2-x1)*(yy-y1)/(y2-y1));
                                zb = z1 + (long)(z2-z1)*(yy-y1)/(y2-y1); }
         else                 { xb = x1; zb = z1; }
-        if (xa>xb){ int t=xa;xa=xb;xb=t; tz=za;za=zb;zb=tz; }
+        if (xa>xb){ s=xa;xa=xb;xb=s; sz=za;za=zb;zb=sz; }
         int span = xb-xa; if (span<0) continue;
         unsigned int *row = rbuf + yy*rw; int *zr = rz + yy*rw;
-        for (int xx=xa; xx<=xb; xx++) {
-            if (xx<0 || xx>=rw) continue;
+        int lx = xa<0?0:xa, hx = xb>=rw?rw-1:xb;
+        for (int xx=lx; xx<=hx; xx++) {
             long z = span ? (za + (zb-za)*(xx-xa)/span) : za;
             if (z > zr[xx]) { zr[xx] = (int)z; row[xx] = col; }
         }
     }
 }
-static void mline(int x0,int y0,int x1,int y1,unsigned int col)
+/* a line clipped to band [ylo,yhi) (no z; for wireframe + floor grid) */
+static void mline_band(int x0,int y0,int x1,int y1,unsigned int col,int ylo,int yhi)
 {
     int dx=a_abs(x1-x0), sx=x0<x1?1:-1, dy=-a_abs(y1-y0), sy=y0<y1?1:-1, err=dx+dy, e2;
     for (;;) {
-        if (x0>=0&&x0<rw&&y0>=0&&y0<rh) rbuf[y0*rw+x0]=col;
+        if (x0>=0&&x0<rw&&y0>=ylo&&y0<yhi&&y0<rh) rbuf[y0*rw+x0]=col;
         if (x0==x1&&y0==y1) break;
         e2=2*err; if (e2>=dy){err+=dy;x0+=sx;} if (e2<=dx){err+=dx;y0+=sy;}
     }
+}
+/* SMP worker: clear band, draw grid, then every triangle clipped to the band. */
+static long mesh_render_band(long lo, long hi, int core)
+{
+    (void)core;
+    for (int yy=(int)lo; yy<(int)hi; yy++) {
+        unsigned int *row = rbuf + yy*rw; int *zr = rz + yy*rw;
+        for (int x=0;x<rw;x++){ row[x]=G_BG; zr[x]=-0x40000000; }
+    }
+    for (int i=0;i<mgseg_n;i++)
+        mline_band(mgseg[i].x0,mgseg[i].y0,mgseg[i].x1,mgseg[i].y1,0xFF384848u,(int)lo,(int)hi);
+    if (mesh_wire_flag) {
+        for (int i=0;i<mproj_n;i++) { const mtri_t *t=&mproj[i];
+            mline_band(t->x0,t->y0,t->x1,t->y1,t->col,(int)lo,(int)hi);
+            mline_band(t->x1,t->y1,t->x2,t->y2,t->col,(int)lo,(int)hi);
+            mline_band(t->x2,t->y2,t->x0,t->y0,t->col,(int)lo,(int)hi); }
+    } else {
+        for (int i=0;i<mproj_n;i++) mtri_band(&mproj[i],(int)lo,(int)hi);
+    }
+    return 0;
+}
+/* SMP worker: box-downsample the 2x supersample buffer into g_buf for band rows. */
+static long mesh_down_band(long lo, long hi, int core)
+{
+    (void)core;
+    for (int y=(int)lo; y<(int)hi; y++) {
+        unsigned int *o = g_buf + y*BW;
+        unsigned int *a = ss_buf + (2*y)*SSW, *b = ss_buf + (2*y+1)*SSW;
+        for (int x=0;x<BW;x++) {
+            unsigned int p0=a[2*x],p1=a[2*x+1],p2=b[2*x],p3=b[2*x+1];
+            int rr=((p0>>16&255)+(p1>>16&255)+(p2>>16&255)+(p3>>16&255))>>2;
+            int gg=((p0>>8&255)+(p1>>8&255)+(p2>>8&255)+(p3>>8&255))>>2;
+            int bb=((p0&255)+(p1&255)+(p2&255)+(p3&255))>>2;
+            o[x]=0xFF000000u|(rr<<16)|(gg<<8)|bb;
+        }
+    }
+    return 0;
 }
 /* light direction (0.40,0.60,0.70) normalised, Q15 */
 #define MESH_LX 13044
@@ -349,8 +401,7 @@ static void mline(int x0,int y0,int x1,int y1,unsigned int col)
 static int mesh_yaw_mrad, mesh_pitch_mrad, mesh_yaw0, mesh_pitch0;
 static int mesh_spin, mesh_wire, mesh_flat;        /* shading / motion          */
 static int mesh_aa, mesh_grid, mesh_persp;         /* AA / floor grid / perspective */
-static int mesh_spin_step = 96;                    /* mrad/frame (~5.5 deg)     */
-static int mesh_speed = 60;                        /* ms/frame while spinning   */
+#define MESH_SPIN_RATE 1500                        /* mrad/sec (~86 deg/s, ~4.2 s/rev) */
 static unsigned long mesh_last;
 static void vm_mesh3d(int yaw_mrad, int pitch_mrad)
 {
@@ -363,28 +414,29 @@ static void vm_mesh3d(int yaw_mrad, int pitch_mrad)
     if (ssf == 2) { rbuf = ss_buf; rz = ss_zbuf; rw = SSW; rh = SSH; }
     else          { rbuf = g_buf;  rz = g_zbuf;  rw = BW;  rh = BH;  }
     int CXp = 380*ssf, CYp = 300*ssf, FS = 260*ssf;
-    for (int i = 0; i < rw*rh; i++) { rbuf[i] = G_BG; rz[i] = -0x40000000; }
-    /* Blender-style floor grid on the plane y=-SC (drawn first; the mesh, which
-     * is z-buffered, paints over it where they overlap). */
-    if (mesh_grid) {
-        int g1 = (3*SC)/2, step = SC/4; unsigned int gcol = 0xFF384848u;
-        for (int a = -g1; a <= g1; a += step) {
+    /* ---- phase 1 (single core): project + shade every triangle into mproj ---- */
+    mesh_wire_flag = mesh_wire;
+    mgseg_n = 0;
+    if (mesh_grid) {                                /* project the floor grid once */
+        int g1 = (3*SC)/2, step = SC/4;
+        for (int a = -g1; a <= g1 && mgseg_n < 510; a += step) {
             for (int dir = 0; dir < 2; dir++) {
                 int ex[2], ey[2];
                 for (int e = 0; e < 2; e++) {
                     long wx = (dir==0) ? a : (e? g1 : -g1);
-                    long wz = (dir==0) ? (e? g1 : -g1) : a;
-                    long wy = -SC;
+                    long wz = (dir==0) ? (e? g1 : -g1) : a, wy = -SC;
                     long x2 = (wx*cyq + wz*syq) >> 15, z2 = (-wx*syq + wz*cyq) >> 15;
                     long y3 = (wy*cpq - z2*spq) >> 15, z3 = (wy*spq + z2*cpq) >> 15;
                     if (mesh_persp) { long zc = z3 + 3*SC; if (zc < 1) zc = 1;
                         ex[e] = CXp + (int)((FS*3*x2)/zc); ey[e] = CYp - (int)((FS*3*y3)/zc); }
                     else { ex[e] = CXp + (int)((FS*x2)/SC); ey[e] = CYp - (int)((FS*y3)/SC); }
                 }
-                mline(ex[0],ey[0],ex[1],ey[1],gcol);
+                mgseg[mgseg_n].x0=ex[0]; mgseg[mgseg_n].y0=ey[0];
+                mgseg[mgseg_n].x1=ex[1]; mgseg[mgseg_n].y1=ey[1]; mgseg_n++;
             }
         }
     }
+    mproj_n = 0;
     for (int t = 0; t < mesh_nt; t++) {
         int sx[3], sy[3]; long sz[3], cx3[3], cy3[3], cz3[3];
         long fsum = 0, rsum = 0, gsum = 0, bsum = 0;
@@ -395,16 +447,16 @@ static void vm_mesh3d(int yaw_mrad, int pitch_mrad)
             long z2 = (-vx*syq + vz*cyq) >> 15;
             long y3 = (vy*cpq - z2*spq) >> 15;
             long z3 = (vy*spq + z2*cpq) >> 15;
-            if (mesh_persp) {                       /* perspective divide        */
+            if (mesh_persp) {
                 long zc = z3 + 3*SC; if (zc < 1) zc = 1;
                 sx[k] = CXp + (int)((FS*3*x2)/zc);
                 sy[k] = CYp - (int)((FS*3*y3)/zc);
-            } else {                                /* orthographic              */
+            } else {
                 sx[k] = CXp + (int)((FS*x2)/SC);
                 sy[k] = CYp - (int)((FS*y3)/SC);
             }
             sz[k] = z3; cx3[k] = x2; cy3[k] = y3; cz3[k] = z3;
-            if (!mesh_flat) {                       /* smooth (Gouraud-ish) shading */
+            if (!mesh_flat) {
                 long nx = mesh_nx[i], ny = mesh_ny[i], nz = mesh_nz[i];
                 long rx = (nx*cyq + nz*syq) >> 15;
                 long rzz = (-nx*syq + nz*cyq) >> 15;
@@ -412,19 +464,19 @@ static void vm_mesh3d(int yaw_mrad, int pitch_mrad)
                 long rz2 = (ny*spq + rzz*cpq) >> 15;
                 long ndl = (rx*MESH_LX + ry*MESH_LY + rz2*MESH_LZ) >> 15;
                 if (ndl < 0) ndl = 0;
-                fsum += 14746 + ((18022*ndl) >> 15);   /* 0.45 + 0.55*ndl, Q15 */
+                fsum += 14746 + ((18022*ndl) >> 15);
             }
             rsum += mesh_cr[i]; gsum += mesh_cg[i]; bsum += mesh_cb[i];
         }
         long f;
-        if (mesh_flat) {                            /* flat: one face normal/tri */
+        if (mesh_flat) {
             long ux = cx3[1]-cx3[0], uy = cy3[1]-cy3[0], uz = cz3[1]-cz3[0];
             long vx = cx3[2]-cx3[0], vy = cy3[2]-cy3[0], vz = cz3[2]-cz3[0];
             long fx = uy*vz-uz*vy, fy = uz*vx-ux*vz, fz = ux*vy-uy*vx;
             unsigned long l = a_isqrt((unsigned long)(fx*fx+fy*fy+fz*fz)); if (!l) l = 1;
             long ndl = ((fx*32767/(long)l)*MESH_LX + (fy*32767/(long)l)*MESH_LY
                         + (fz*32767/(long)l)*MESH_LZ) >> 15;
-            if (ndl < 0) ndl = -ndl;                /* shade either face */
+            if (ndl < 0) ndl = -ndl;
             f = 14746 + ((18022*ndl) >> 15);
         } else {
             f = fsum/3;
@@ -432,29 +484,16 @@ static void vm_mesh3d(int yaw_mrad, int pitch_mrad)
         int r = (int)(((rsum/3)*f) >> 15); if (r > 255) r = 255;
         int g = (int)(((gsum/3)*f) >> 15); if (g > 255) g = 255;
         int b = (int)(((bsum/3)*f) >> 15); if (b > 255) b = 255;
-        /* ARGB with full alpha; R/B pre-swapped for this Pi4's framebuffer */
-        unsigned int col = 0xFF000000u | ((unsigned)b<<16) | ((unsigned)g<<8) | (unsigned)r;
-        if (mesh_wire) {
-            mline(sx[0],sy[0],sx[1],sy[1],col);
-            mline(sx[1],sy[1],sx[2],sy[2],col);
-            mline(sx[2],sy[2],sx[0],sy[0],col);
-        } else {
-            mtri_z(sx[0],sy[0],sz[0], sx[1],sy[1],sz[1], sx[2],sy[2],sz[2], col);
-        }
+        mtri_t *m = &mproj[mproj_n++];
+        m->x0=sx[0]; m->y0=sy[0]; m->x1=sx[1]; m->y1=sy[1]; m->x2=sx[2]; m->y2=sy[2];
+        m->z0=sz[0]; m->z1=sz[1]; m->z2=sz[2];
+        m->col = 0xFF000000u | ((unsigned)b<<16) | ((unsigned)g<<8) | (unsigned)r;
     }
-    if (ssf == 2) {                                 /* box-downsample 2x -> g_buf */
-        for (int y = 0; y < BH; y++) {
-            unsigned int *o = g_buf + y*BW;
-            unsigned int *a = ss_buf + (2*y)*SSW, *b2 = ss_buf + (2*y+1)*SSW;
-            for (int x = 0; x < BW; x++) {
-                unsigned int p0=a[2*x],p1=a[2*x+1],p2=b2[2*x],p3=b2[2*x+1];
-                int rr=((p0>>16&255)+(p1>>16&255)+(p2>>16&255)+(p3>>16&255))>>2;
-                int gg=((p0>>8&255)+(p1>>8&255)+(p2>>8&255)+(p3>>8&255))>>2;
-                int bb=((p0&255)+(p1&255)+(p2&255)+(p3&255))>>2;
-                o[x]=0xFF000000u|(rr<<16)|(gg<<8)|bb;
-            }
-        }
-    }
+    /* ---- phase 2 (all cores): clear+grid+rasterise, one scanline band/core --- */
+    int nc = smp_cores_online(); if (nc < 1) nc = 1;
+    smp_parallel_sum(mesh_render_band, rh, nc);
+    /* ---- phase 3 (all cores): AA box-downsample 2x -> g_buf -------------------*/
+    if (ssf == 2) smp_parallel_sum(mesh_down_band, BH, nc);
     g_buf_ready = 1; mesh_mode = 1;
 }
 
@@ -826,13 +865,15 @@ static void avm_tick(void)
      * first MESH3D has run (mesh_mode set) the actor queue is idle. */
     if (mesh_mode) {
         if (mesh_spin) {
+            /* time-based: constant angular velocity regardless of frame rate, and
+             * re-render every WM tick for the smoothest motion the 4 cores allow. */
             unsigned long now = avm_now_ms();
-            if (now - mesh_last >= (unsigned long)mesh_speed) {
-                mesh_yaw_mrad += mesh_spin_step;
-                if (mesh_yaw_mrad > 2*FX_PI) mesh_yaw_mrad -= 2*FX_PI;
-                vm_mesh3d(mesh_yaw_mrad, mesh_pitch_mrad);
-                mesh_last = now;
-            }
+            unsigned long dt = mesh_last ? (now - mesh_last) : 16;
+            if (dt > 250) dt = 250;                 /* clamp after a stall */
+            mesh_yaw_mrad += (int)(dt * MESH_SPIN_RATE / 1000);   /* mrad */
+            while (mesh_yaw_mrad > 2*FX_PI) mesh_yaw_mrad -= 2*FX_PI;
+            vm_mesh3d(mesh_yaw_mrad, mesh_pitch_mrad);
+            mesh_last = now;
         }
         return;
     }
@@ -894,7 +935,10 @@ int avm_loadrun(int len)
     ctl_play = 1; ctl_idx = 0;
     if (avm_load(avm_stage, len) != 0) return -1;
 
-    if (!vmgfx_added) {                          /* open the VM graphics window */
+    /* (Re-)open the VM graphics window if it isn't currently shown.  The user may
+     * have closed it with the titlebar [X] after the previous actor; without this
+     * the next actor would run with NO window and look like it "didn't start". */
+    if (!vmgfx_added || !wm_contains(&vmgfx_win)) {
         vmgfx_win.x = 120; vmgfx_win.y = 50;
         vmgfx_win.width = BW + 4;
         vmgfx_win.height = BH + WM_TITLEBAR_H + AVM_TB + AVM_CB + 6;
@@ -1157,6 +1201,29 @@ int avm_save(const char *name, int len)
     avm_ram_meta[slot].len = len; avm_ram_meta[slot].used = 1;
     for (int b = 0; b < len; b++) avm_ram[slot][b] = avm_stage[b];
     return 0;
+}
+
+/* Persist the just-staged .avm to a real file NAME.AVM on storage so it survives
+ * reboot and shows in the Actors menu (vol 'S'/'M').  Tries the USB /sd (verified
+ * block writes) first, then microSD.  Returns the volume letter ('S'/'M') on
+ * success, or <0.  Opt-in (loadvm ?sd=1) because a large multi-cluster FAT write
+ * is the heaviest storage path on this Pi4. */
+int avm_save_sd(const char *name, int len)
+{
+    if (len <= 0 || len > AVM_STAGE_MAX) return -1;
+    char path[20]; int p = 0;
+    for (int i = 0; name[i] && p < 11; i++) path[p++] = name[i];   /* NAME (<=11) */
+    path[p++]='.'; path[p++]='A'; path[p++]='V'; path[p++]='M'; path[p]=0;
+    extern int usbmsd_ready(void);
+    extern int usbmsd_read_block(unsigned long, void *);
+    extern int sd_read_block(unsigned long, void *);
+    static unsigned char probe[512];
+    fat32_t fs; int vol = 0;
+    if (usbmsd_ready() && usbmsd_read_block(0, probe) == 0 && avm_mount_vol('S', &fs) == 0) vol = 'S';
+    else if (sd_read_block(0, probe) == 0 && avm_mount_vol('M', &fs) == 0)                  vol = 'M';
+    if (!vol) return -2;                                /* no mountable/writable volume */
+    if (fat32_write_file_full(&fs, path, avm_stage, (unsigned int)len) != 0) return -3;
+    return vol;
 }
 
 /* Diagnostic: mount the USB /sd, open `name`, follow its cluster chain reading
