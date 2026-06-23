@@ -1709,6 +1709,37 @@ static int http_build(const char *req, char *out, int max)
             bl = s_put(body, bl, "staged="); bl = s_putdec(body, bl, g_chain_len);
             bl = s_put(body, bl, " bytes.  GET /chainload?go=1&len=<N> to boot it.\n");
         }
+    } else if (starts_with(req, "GET /kexec")) {
+        /* kexec: list / warm-boot a kernel image from the card.
+         *   GET /kexec            (or ?status)  -> scan SD/microSD for *.IMG
+         *   GET /kexec?img=OS1.IMG              -> read it + jump (warm boot) */
+        ctype = "text/plain";
+        char img[16];
+        if (q_param(req, "img", img, sizeof img)) {
+            extern int kexec_boot(const char *);
+            int rc = kexec_boot(img);              /* 0 = queued (WM streams + jumps) */
+            bl = s_put(body, bl, "kexec '"); bl = s_put(body, bl, img);
+            if (rc == 0)
+                bl = s_put(body, bl, "' queued — streaming off the card, warm boot follows.\n");
+            else {
+                bl = s_put(body, bl, "' FAILED rc="); bl = s_putdec(body, bl, rc);
+                bl = s_put(body, bl, " (-1 not found, -2 mount, -3 open)\n");
+            }
+        } else {
+            extern int kexec_scan(void), kexec_count(void), kexec_size(int);
+            extern const char *kexec_name(int); extern char kexec_vol(int);
+            kexec_scan();
+            int n = kexec_count();
+            bl = s_put(body, bl, "kexec candidates ("); bl = s_putdec(body, bl, n);
+            bl = s_put(body, bl, " on SD/microSD):\n");
+            for (int i = 0; i < n; i++) {
+                char vv[3] = { ' ', ' ', 0 }; vv[1] = kexec_vol(i);
+                bl = s_put(body, bl, vv); bl = s_put(body, bl, ": ");
+                bl = s_put(body, bl, kexec_name(i)); bl = s_put(body, bl, "  ");
+                bl = s_putdec(body, bl, kexec_size(i)); bl = s_put(body, bl, " B\n");
+            }
+            bl = s_put(body, bl, "boot: GET /kexec?img=NAME.IMG   (S=USB /sd, M=microSD)\n");
+        }
     } else if (path_eq(req, "/shell")) {
         /* Remote login: run a Xinu shell command and return its console
          * output.  e.g.  GET /shell?cmd=help   ·   /shell?cmd=wifi%20scan

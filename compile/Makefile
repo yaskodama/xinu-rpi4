@@ -147,6 +147,61 @@ qemu kernel_virt.img: $(QEMU_OBJS) link_virt.ld
 	$(OBJCOPY) -O binary kernel_virt.elf kernel_virt.img
 	@ls -la kernel_virt.img
 
+# ----- kexec-switchable OS images -------------------------------------
+# Both are MINIMAL kernels (-DOS_MINIMAL): shell window + Ethernet + HTTP + kexec,
+# no desktop windows / blender / BASIC / LLM.  They differ only in WiFi:
+#   OS1.IMG = minimal, NO WiFi  (drops LLM ~1.0 MB + WiFi fw ~0.55 MB)  ~0.4 MB
+#   OS2.IMG = OS1 + WiFi        (drops LLM ~1.0 MB only; keeps wifi_fw.o) ~0.9 MB
+# 1-byte stubs satisfy the dropped data symbols so the dormant drivers still link.
+# Switch at runtime with the `kexec` command or GET /kexec?img=OSx.IMG.
+OS1_CFLAGS    := $(PI4_CFLAGS) -DOS_MINIMAL
+OS1_FP_CFLAGS := $(filter-out -mgeneral-regs-only,$(OS1_CFLAGS))
+
+# ---- OS1: minimal, no LLM, no WiFi, no blender ----
+OS1_OBJS := $(filter-out obj/os1/blob.o obj/os1/wifi_fw.o obj/os1/avm.o, \
+              $(patsubst %.c,obj/os1/%.o,$(notdir $(C_SRCS))) \
+              $(patsubst %.S,obj/os1/%.o,$(notdir $(S_SRCS)))) \
+            obj/os1/os_llm_stub.o obj/os1/os_wifi_stub.o obj/os1/os_avm_stub.o
+obj/os1: ; @mkdir -p $@
+obj/os1/os_llm_stub.o:  os_llm_stub.S  | obj/os1 ; $(CC) $(OS1_CFLAGS) -c $< -o $@
+obj/os1/os_wifi_stub.o: os_wifi_stub.S | obj/os1 ; $(CC) $(OS1_CFLAGS) -c $< -o $@
+obj/os1/os_avm_stub.o:  os_avm_stub.c  | obj/os1 ; $(CC) $(OS1_CFLAGS) -c $< -o $@
+obj/os1/cc.o:       cc.c       | obj/os1 ; $(CC) $(OS1_FP_CFLAGS) -c $< -o $@
+obj/os1/llm.o:      llm.c      | obj/os1 ; $(CC) $(OS1_FP_CFLAGS) -c $< -o $@
+obj/os1/basic.o:    basic.c    | obj/os1 ; $(CC) $(OS1_FP_CFLAGS) -c $< -o $@
+obj/os1/basicwin.o: basicwin.c | obj/os1 ; $(CC) $(OS1_FP_CFLAGS) -c $< -o $@
+obj/os1/%.o: %.c | obj/os1 ; $(CC) $(OS1_CFLAGS) -c $< -o $@
+obj/os1/%.o: %.S | obj/os1 ; $(CC) $(OS1_CFLAGS) -c $< -o $@
+
+os1 OS1.IMG: $(OS1_OBJS) link.ld
+	$(LD) -nostdlib $(OS1_OBJS) -T link.ld -o OS1.elf
+	$(OBJCOPY) -O binary OS1.elf OS1.IMG
+	@ls -la OS1.IMG
+
+# ---- OS2: minimal + WiFi (= OS1 + the real WiFi firmware), no LLM, no blender ----
+OS2_CFLAGS    := $(PI4_CFLAGS) -DOS_MINIMAL
+OS2_FP_CFLAGS := $(filter-out -mgeneral-regs-only,$(OS2_CFLAGS))
+OS2_OBJS := $(filter-out obj/os2/blob.o obj/os2/avm.o, \
+              $(patsubst %.c,obj/os2/%.o,$(notdir $(C_SRCS))) \
+              $(patsubst %.S,obj/os2/%.o,$(notdir $(S_SRCS)))) \
+            obj/os2/os_llm_stub.o obj/os2/os_avm_stub.o
+obj/os2: ; @mkdir -p $@
+obj/os2/os_llm_stub.o:  os_llm_stub.S  | obj/os2 ; $(CC) $(OS2_CFLAGS) -c $< -o $@
+obj/os2/os_avm_stub.o:  os_avm_stub.c  | obj/os2 ; $(CC) $(OS2_CFLAGS) -c $< -o $@
+obj/os2/cc.o:       cc.c       | obj/os2 ; $(CC) $(OS2_FP_CFLAGS) -c $< -o $@
+obj/os2/llm.o:      llm.c      | obj/os2 ; $(CC) $(OS2_FP_CFLAGS) -c $< -o $@
+obj/os2/basic.o:    basic.c    | obj/os2 ; $(CC) $(OS2_FP_CFLAGS) -c $< -o $@
+obj/os2/basicwin.o: basicwin.c | obj/os2 ; $(CC) $(OS2_FP_CFLAGS) -c $< -o $@
+obj/os2/%.o: %.c | obj/os2 ; $(CC) $(OS2_CFLAGS) -c $< -o $@
+obj/os2/%.o: %.S | obj/os2 ; $(CC) $(OS2_CFLAGS) -c $< -o $@
+
+os2 OS2.IMG: $(OS2_OBJS) link.ld
+	$(LD) -nostdlib $(OS2_OBJS) -T link.ld -o OS2.elf
+	$(OBJCOPY) -O binary OS2.elf OS2.IMG
+	@ls -la OS2.IMG
+
+osimgs: os1 os2
+
 # ----- QEMU run targets ----------------------------------------------
 QEMU             ?= qemu-system-aarch64
 QEMU_COMMON       = -M virt -cpu cortex-a76 -m 256M -kernel kernel_virt.img
@@ -179,7 +234,7 @@ install: install_pi4
 clean:
 	rm -rf obj kernel_*.elf kernel_*.img kernel8.elf kernel8.img qemu-smoke.log
 
-.PHONY: all pi4 qemu qemu-run qemu-smoke install install_pi4 clean
+.PHONY: all pi4 qemu qemu-run qemu-smoke install install_pi4 clean os1 os2 osimgs
 
 # Auto-generated header dependencies (-MMD): a change to e.g. a struct in a
 # header now recompiles every .c that includes it, instead of leaving stale

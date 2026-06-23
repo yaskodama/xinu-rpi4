@@ -194,7 +194,7 @@ static avm_line_t v_line[VLINE_MAX];
 static int v_line_n;
 static avm_tri_t  v_tri[VTRI_MAX];
 static int v_tri_n;
-#define G_BG 0xFF06100AU                          /* content background */
+#define G_BG 0xFF2C3238U                          /* content background (soft dark slate) */
 
 /* ---- SMP: rasterise across the 4 Cortex-A72 cores -------------------------
  * The frame is split into horizontal scanline bands; each core fills ONE band
@@ -946,7 +946,7 @@ int avm_loadrun(int len)
         int k; for (k=0;k<WM_TITLE_MAX && t[k];k++) vmgfx_win.title[k]=t[k]; vmgfx_win.title[k]=0;
         vmgfx_win.font_scale = 1;
         vmgfx_win.chrome_color = 0xFFAACCEEU; vmgfx_win.title_bg = 0xFF102030U;
-        vmgfx_win.title_fg = 0xFFFFFFFFU; vmgfx_win.content_bg = 0xFF06100AU;
+        vmgfx_win.title_fg = 0xFFFFFFFFU; vmgfx_win.content_bg = 0xFF2C3238U;
         vmgfx_win.draw_content = vmgfx_draw;
         vmgfx_win.on_click     = vmgfx_click;
         wm_add(&vmgfx_win);
@@ -1225,6 +1225,7 @@ int avm_save_sd(const char *name, int len)
     if (fat32_write_file_full(&fs, path, avm_stage, (unsigned int)len) != 0) return -3;
     return vol;
 }
+
 
 /* Diagnostic: mount the USB /sd, open `name`, follow its cluster chain reading
  * the whole file into avm_stage.  Reports first cluster, size, bytes read, the

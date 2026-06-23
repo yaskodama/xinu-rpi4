@@ -895,7 +895,36 @@ static int cmd_wifi(int argc, char **argv)
     return 0;
 }
 
+/* kexec: list *.IMG kernels on SD/microSD, or warm-boot one of them. */
+static int kx_streq(const char *a, const char *b)
+{ while (*a && *b) { if (*a != *b) return 0; a++; b++; } return *a == *b; }
+static int cmd_kexec(int argc, char **argv)
+{
+    extern int kexec_scan(void), kexec_count(void), kexec_size(int), kexec_boot(const char *);
+    extern const char *kexec_name(int); extern char kexec_vol(int);
+    if (argc >= 2 && !kx_streq(argv[1], "status")) {       /* kexec NAME.IMG -> boot */
+        int rc = kexec_boot(argv[1]);                      /* 0 = queued (streamed by WM) */
+        if (rc == 0) {
+            uart_puts("kexec: streaming "); uart_puts(argv[1]);
+            uart_puts(" off the card (watch the load bar) — warm boot follows.\n");
+        } else {
+            uart_puts("kexec FAILED rc="); puts_dec(rc);
+            uart_puts("  (-1 not found, -2 mount, -3 open)\n");
+        }
+        return rc;
+    }
+    int n = kexec_scan();                                  /* kexec / kexec status */
+    uart_puts("kexec candidates ("); puts_dec(n); uart_puts(" on SD/microSD):\n");
+    for (int i = 0; i < n; i++) {
+        uart_puts("  "); uart_putc(kexec_vol(i)); uart_puts(": ");
+        uart_puts(kexec_name(i)); uart_puts("  "); puts_dec(kexec_size(i)); uart_puts(" B\n");
+    }
+    uart_puts("boot: kexec NAME.IMG   (S=USB /sd, M=microSD)\n");
+    return 0;
+}
+
 static const struct centry commandtab[] = {
+    { "kexec",  "kexec status | kexec NAME.IMG — list/boot SD kernels", cmd_kexec },
     { "wifi",   "wifi on|aps|save <ssid> <pass>|forget <ssid>|scan|up|off", cmd_wifi },
     { "wine",   "spin a 3-D wireframe wine glass in the BASIC window",      cmd_wine   },
     { "help",   "list the commands",                       cmd_help   },

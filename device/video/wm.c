@@ -701,6 +701,7 @@ void wm_run(void)
         video_set_viewport(0, 0);
         draw_wifi_badge(sw, sh);
         { extern void avm_draw_loadbar(int sw, int sh); avm_draw_loadbar(sw, sh); }  /* .avm upload progress */
+        { extern void kexec_tick(void); kexec_tick(); }                              /* stream+jump a queued kexec */
         video_set_viewport(vp_x, vp_y);
 
         /* Composite the cursor INTO the finished backbuffer *before* the flip

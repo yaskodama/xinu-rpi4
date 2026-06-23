@@ -1851,6 +1851,7 @@ void kernel_main(void)
         /* Title-bar window: full *virtual* desktop width, slimmer
          * to make room for everything below.  Only the part inside
          * the viewport (0..sw) shows at any moment. */
+#ifndef OS_MINIMAL               /* OS1: skip the full desktop, keep only the shell */
         banner_win.x = 0;            /* default layout from the AIPL designer (1024x768) */
         banner_win.y = 10;
         banner_win.width  = 469;
@@ -1910,6 +1911,7 @@ void kernel_main(void)
         mem_win.draw_content = win_mem;
         wm_add(&mem_win);
 
+#endif                           /* OS_MINIMAL: no banner/status/ftree/mem windows */
         /* Shell window: left half of the *initial* viewport — the
          * boot log lives here and must stay visible without any
          * scrolling so the user can read what happened during
@@ -1928,6 +1930,7 @@ void kernel_main(void)
         wm_add(&shell_win);
         wm_set_tick(net_yield_tick);   /* yield to the IRQ-woken net process */
 
+#ifndef OS_MINIMAL               /* OS1: no softkbd/actors/gfx(blender)/BASIC/runtime */
         /* Soft keyboard window: bottom-left of the initial 640×480
          * viewport.  Half-size as the user requested. */
         softkbd_win.x = 635;
@@ -2021,6 +2024,7 @@ void kernel_main(void)
          * persistent WiFi status badge (signal bars + SSID + IP when connected)
          * fixed in the screen's bottom-right corner, so no window is added. */
 
+#endif                           /* OS_MINIMAL: only the shell window is shown */
         /* Start the cursor at the centre of the *screen* (not the
          * virtual desktop) so it stays in view as the viewport
          * pans.  USPi (later) will drive it from mouse reports. */
