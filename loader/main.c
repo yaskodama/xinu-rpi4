@@ -285,6 +285,10 @@ static void net_yield_tick(void)
     shellwin_step();
     wifi_net_poll();
     xhci_mouse_pump();
+    /* Run a queued /wifi-adhoc mesh-join here (off the request path): WiFi
+     * bring-up blocks this wm tick ~1 min, but net/app keep serving the
+     * Ethernet gateway + /fb mirror, and the HTTP reply already flushed. */
+    { extern void wifi_adhoc_poll_pending(void); wifi_adhoc_poll_pending(); }
     proc_yield();
 }
 

@@ -202,6 +202,12 @@ void screen_puts(const char *s)
 unsigned int video_screen_width(void)  { return fb_width;  }
 unsigned int video_screen_height(void) { return fb_height; }
 
+/* Raw access to the *visible* framebuffer (the composited frame after the last
+ * video_present flip).  Used by the /fb HTTP route to mirror the screen to a
+ * remote browser even when no HDMI display is attached. */
+const volatile unsigned char *video_fb_base(void)  { return fb_base;  }
+unsigned int                  video_fb_pitch(void) { return fb_pitch; }
+
 /* ---- double buffering (anti-flicker) ----
  * The window manager redraws the whole screen every frame, including a
  * full background wipe.  Drawing that straight to the visible HDMI

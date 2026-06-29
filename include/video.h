@@ -47,6 +47,10 @@ extern const unsigned char font8x8[96][8];
 unsigned int video_screen_width(void);
 unsigned int video_screen_height(void);
 
+/* Raw visible-framebuffer access (for the /fb remote screen-mirror route). */
+const volatile unsigned char *video_fb_base(void);
+unsigned int                  video_fb_pitch(void);
+
 /* Double buffering (anti-flicker).  video_enable_backbuffer() allocates
  * an off-screen render target the size of the framebuffer and points all
  * drawing primitives at it (returns 1 on success, 0 if no memory — in
