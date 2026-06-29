@@ -554,6 +554,65 @@ static long bench_count_primes(long lo, long hi, int core)
     return cnt;
 }
 
+/* ---- N-Queens (SMP): count solutions with the first queen pinned to each
+ * column in [lo,hi).  Summing over all n columns gives the full count, so the
+ * 1-core and N-core runs MUST agree.  g_nq_n holds the board size, set by the
+ * /bench route before dispatch.  Pure integer bitmask backtracking. */
+static int g_nq_n = 13;
+static long nq_solve(int row, unsigned cols, unsigned d1, unsigned d2, unsigned all)
+{
+    (void)row;
+    if (cols == all) return 1;
+    long count = 0;
+    unsigned avail = ~(cols | d1 | d2) & all;
+    while (avail) {
+        unsigned bit = avail & (unsigned)(-(long)avail);
+        avail -= bit;
+        count += nq_solve(row + 1, cols | bit, (d1 | bit) << 1, (d2 | bit) >> 1, all);
+    }
+    return count;
+}
+static long bench_nqueens(long lo, long hi, int core)
+{
+    (void)core;
+    int n = g_nq_n;
+    unsigned all = (n >= 32) ? 0xFFFFFFFFu : ((1u << n) - 1u);
+    long total = 0;
+    for (long c = lo; c < hi && c < n; c++) {
+        unsigned bit = 1u << c;
+        total += nq_solve(1, bit, bit << 1, bit >> 1, all);
+    }
+    return total;
+}
+
+/* ---- Dining Philosophers (SMP): run independent dining tables in [lo,hi),
+ * each = g_din_n philosophers doing DIN_ROUNDS deadlock-free meal cycles
+ * (Dijkstra resource hierarchy) with a little per-meal compute.  Independent
+ * tables → honest throughput speedup.  Returns total meals across [lo,hi). */
+#define DIN_ROUNDS 24
+static int g_din_n = 5;
+static volatile unsigned g_din_sink = 0;
+static long bench_dining(long lo, long hi, int core)
+{
+    (void)core;
+    int np = g_din_n;
+    long meals = 0;
+    unsigned acc = (unsigned)lo * 2654435761u;
+    for (long t = lo; t < hi; t++) {
+        for (int round = 0; round < DIN_ROUNDS; round++) {
+            for (int p = 0; p < np; p++) {
+                int l = p, r = (p + 1) % np;
+                int fa = (l < r) ? l : r;
+                int fb = (l < r) ? r : l;
+                acc = acc * 1103515245u + 12345u + (unsigned)(fa * 131 + fb);
+                meals++;
+            }
+        }
+    }
+    g_din_sink ^= acc;
+    return meals;
+}
+
 /* Free-running counter in milliseconds (CNTPCT_EL0 / CNTFRQ_EL0 * 1000). */
 static unsigned long now_ms(void)
 {
@@ -615,6 +674,25 @@ static int url_decode(const char *in, char *out, int max)
 
 /* Build the HTTP response for NUL-terminated request `req` into `out`
  * (capacity `max`).  Returns the byte length. */
+/* ---- /wifi-adhoc : join the WiFi ad-hoc (IBSS) mesh -----------------
+ * The Mesh Control Center hits GET /wifi-adhoc?ssid=NAME&ch=N&n=M to put this
+ * board on the 10.0.0.M MANET cell.  WiFi bring-up blocks its caller for ~1 min,
+ * so we stash the params and let the wm-tick poller (wifi_adhoc_poll_pending,
+ * from net_yield_tick) run it once AFTER this reply is flushed — net/app keep
+ * serving the Ethernet gateway + /fb mirror throughout.  rpi4's wifi_adhoc does
+ * NOT move the gateway to WiFi, so the LAN control plane is preserved. */
+static volatile int g_adhoc_pending = 0;
+static char         g_adhoc_ssid[40];
+static int          g_adhoc_ch = 6, g_adhoc_n = 0;
+
+void wifi_adhoc_poll_pending(void)
+{
+    if (!g_adhoc_pending) return;
+    g_adhoc_pending = 0;
+    extern int wifi_adhoc(const char *ssid, int channel, int n);
+    wifi_adhoc(g_adhoc_ssid, g_adhoc_ch, g_adhoc_n);
+}
+
 static int http_build(const char *req, char *out, int max)
 {
     /* 2026-05-31: bumped 1400 -> 16384 so /api/actors-gc can carry a
@@ -625,8 +703,104 @@ static int http_build(const char *req, char *out, int max)
     static char body[16384];
     int  bl = 0;
     const char *ctype = "application/json";
+    const char *extra = "";              /* optional extra response header(s) */
     (void)max;
 
+    if (starts_with(req, "GET /wifi-adhoc")) {
+        char sb[40];
+        if (!q_param(req, "ssid", sb, sizeof sb) || !sb[0]) {
+            sb[0]='M'; sb[1]='A'; sb[2]='N'; sb[3]='E'; sb[4]='T'; sb[5]=0;
+        }
+        int ch = q_int(req, "ch", 6);
+        int nn = q_int(req, "n", 0);
+        int i = 0; for (; sb[i] && i < (int)sizeof(g_adhoc_ssid)-1; i++) g_adhoc_ssid[i] = sb[i];
+        g_adhoc_ssid[i] = 0;
+        g_adhoc_ch = ch; g_adhoc_n = nn;
+        g_adhoc_pending = 1;             /* wm tick runs the join shortly */
+
+        int p = 0;
+        p = s_put(out, p, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                          "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
+        p = s_put(out, p, "adhoc queued ssid=");
+        p = s_put(out, p, g_adhoc_ssid);
+        p = s_put(out, p, " ch=");        p = s_putdec(out, p, ch);
+        p = s_put(out, p, " ip=10.0.0.");  p = s_putdec(out, p, nn);
+        p = s_put(out, p, " (gateway stays on ethernet; wifi joins mesh in ~1 min)\n");
+        return p;
+    }
+
+    /* ---- /fb : remote screen mirror -------------------------------------
+     * This minimal TCP stack sends a response in ONE segment (<=~1400 B), so
+     * the 1024x768 framebuffer can't go in one reply.  Instead serve a small
+     * RGB565 thumbnail in chunks the browser stitches back together:
+     *   GET /fb?info            -> "DW DH SRCW SRCH"  (text)
+     *   GET /fb?off=N[&w=W]     -> up to 1200 bytes of the thumbnail's RGB565
+     *                              pixel stream starting at byte offset N
+     * Default thumbnail width 160 (height tracks the 4:3 source).  A browser
+     * page (served from the Mac) loops off=0,1200,... to rebuild each frame. */
+    if (starts_with(req, "GET /fb")) {
+        /* Self-contained: build the WHOLE response into `out` and return here,
+         * so it never touches the shared header/404 tail (which was corrupting
+         * the binary body). */
+        extern const volatile unsigned char *video_fb_base(void);
+        extern unsigned int video_fb_pitch(void);
+        extern unsigned int video_screen_width(void), video_screen_height(void);
+
+        unsigned srcw = video_screen_width(), srch = video_screen_height();
+        const volatile unsigned char *fb = video_fb_base();
+        unsigned pitch = video_fb_pitch();
+
+        int dw = q_int(req, "w", 160);
+        if (dw < 16)  dw = 16;
+        if (dw > 480) dw = 480;
+        int dh = (srcw && srch) ? (int)((unsigned)dw * srch / srcw) : (dw * 3 / 4);
+        if (dh < 1) dh = 1;
+
+        char offbuf[12];
+        int has_off = q_param(req, "off", offbuf, sizeof offbuf);
+
+        /* Render the body into body[] first so we know its exact length. */
+        bl = 0;
+        const char *fbctype;
+        if (!has_off) {                              /* /fb or /fb?info -> dims */
+            fbctype = "text/plain";
+            bl = s_putdec(body, bl, dw);   bl = s_put(body, bl, " ");
+            bl = s_putdec(body, bl, dh);   bl = s_put(body, bl, " ");
+            bl = s_putdec(body, bl, (long)srcw); bl = s_put(body, bl, " ");
+            bl = s_putdec(body, bl, (long)srch); bl = s_put(body, bl, "\n");
+        } else {                                     /* /fb?off=N -> RGB565 chunk */
+            fbctype = "application/octet-stream";
+            int total = dw * dh * 2;
+            int off = q_int(req, "off", 0);
+            if (off < 0) off = 0;
+            if (off & 1) off++;
+            int chunk = 1200;
+            if (off + chunk > total) chunk = total - off;
+            if (chunk < 0) chunk = 0;
+            if (fb && pitch) {
+                int p0 = off / 2, np = chunk / 2;
+                for (int i = 0; i < np; i++) {
+                    int pi = p0 + i, ox = pi % dw, oy = pi / dw;
+                    unsigned sx = (unsigned)ox * srcw / (unsigned)dw;
+                    unsigned sy = (unsigned)oy * srch / (unsigned)dh;
+                    unsigned px = *(const volatile unsigned int *)(fb + sy * pitch + sx * 4);
+                    unsigned r = (px >> 16) & 0xFF, g = (px >> 8) & 0xFF, b = px & 0xFF;
+                    unsigned v = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+                    body[bl++] = (char)(v & 0xFF);
+                    body[bl++] = (char)((v >> 8) & 0xFF);
+                }
+            }
+        }
+
+        int p = 0;
+        p = s_put(out, p, "HTTP/1.0 200 OK\r\nContent-Type: ");
+        p = s_put(out, p, fbctype);
+        p = s_put(out, p, "\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: ");
+        p = s_putdec(out, p, bl);
+        p = s_put(out, p, "\r\n\r\n");
+        for (int i = 0; i < bl; i++) out[p++] = body[i];
+        return p;
+    }
     if (starts_with(req, "POST /reboot") || starts_with(req, "GET /reboot")) {
         /* Soft-wedge recovery: trigger BCM2711 watchdog reset.  The
          * actor system / cc JIT may be unresponsive, but as long as
@@ -749,6 +923,66 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, "1-core   ms  = "); bl = s_putdec(body, bl, (long)ms1); bl = s_put(body, bl, "\n");
         bl = s_put(body, bl, "N-core   ms  = "); bl = s_putdec(body, bl, (long)msN); bl = s_put(body, bl, "\n");
         /* speedup x100 (integer) = ms1*100/msN */
+        bl = s_put(body, bl, "speedup x100 = ");
+        bl = s_putdec(body, bl, msN ? (long)((ms1 * 100UL) / msN) : 0);
+        bl = s_put(body, bl, "  (e.g. 385 = 3.85x)\n");
+    } else if (starts_with(req, "GET /bench") || starts_with(req, "POST /bench")) {
+        /* Unified SMP benchmark: kind=nqueens|dining|primes.  Same 1-core vs
+         * N-core wall-time + speedup fields as /smp-bench, so the Mesh Control
+         * Center tabulates them uniformly.
+         *   curl 'http://192.168.3.100/bench?kind=nqueens&n=13'
+         *   curl 'http://192.168.3.100/bench?kind=dining&n=5' */
+        ctype = "text/plain";
+        int online = smp_cores_online();
+        char kind[16];
+        kind[0] = 0;
+        q_param(req, "kind", kind, sizeof kind);
+        int is_dining = (kind[0] == 'd');
+        int is_primes = (kind[0] == 'p');
+        smp_range_fn fn;
+        long units;
+        const char *label;
+        if (is_dining) {
+            g_din_n = q_int(req, "n", 5);
+            if (g_din_n < 2)  g_din_n = 2;
+            if (g_din_n > 64) g_din_n = 64;
+            units = 200000;
+            fn = bench_dining;  label = "dining";
+        } else if (is_primes) {
+            units = q_int(req, "n", 300000);
+            if (units < 1) units = 1;
+            fn = bench_count_primes;  label = "primes";
+        } else {
+            g_nq_n = q_int(req, "n", 13);
+            if (g_nq_n < 1)  g_nq_n = 1;
+            if (g_nq_n > 15) g_nq_n = 15;
+            units = g_nq_n;
+            fn = bench_nqueens;  label = "nqueens";
+        }
+
+        unsigned long t0 = now_ms();
+        long r1 = smp_parallel_sum(fn, units, 1);
+        unsigned long t1 = now_ms();
+        long rN = smp_parallel_sum(fn, units, online);
+        unsigned long t2 = now_ms();
+        unsigned long ms1 = t1 - t0;
+        unsigned long msN = t2 - t1;
+
+        bl = s_put(body, bl, "SMP bench kind="); bl = s_put(body, bl, label); bl = s_put(body, bl, "\n");
+        bl = s_put(body, bl, "cores_online = "); bl = s_putdec(body, bl, (long)online); bl = s_put(body, bl, "\n");
+        if (is_dining) {
+            bl = s_put(body, bl, "philosophers = "); bl = s_putdec(body, bl, (long)g_din_n); bl = s_put(body, bl, "\n");
+            bl = s_put(body, bl, "meals        = "); bl = s_putdec(body, bl, r1);
+        } else if (is_primes) {
+            bl = s_put(body, bl, "n            = "); bl = s_putdec(body, bl, units); bl = s_put(body, bl, "\n");
+            bl = s_put(body, bl, "primes       = "); bl = s_putdec(body, bl, r1);
+        } else {
+            bl = s_put(body, bl, "board_size   = "); bl = s_putdec(body, bl, (long)g_nq_n); bl = s_put(body, bl, "\n");
+            bl = s_put(body, bl, "solutions    = "); bl = s_putdec(body, bl, r1);
+        }
+        bl = s_put(body, bl, (r1 == rN) ? " (match)\n" : " MISMATCH!\n");
+        bl = s_put(body, bl, "1-core   ms  = "); bl = s_putdec(body, bl, (long)ms1); bl = s_put(body, bl, "\n");
+        bl = s_put(body, bl, "N-core   ms  = "); bl = s_putdec(body, bl, (long)msN); bl = s_put(body, bl, "\n");
         bl = s_put(body, bl, "speedup x100 = ");
         bl = s_putdec(body, bl, msN ? (long)((ms1 * 100UL) / msN) : 0);
         bl = s_put(body, bl, "  (e.g. 385 = 3.85x)\n");
@@ -1780,7 +2014,9 @@ static int http_build(const char *req, char *out, int max)
     int p = 0;
     p = s_put(out, p, "HTTP/1.0 200 OK\r\nContent-Type: ");
     p = s_put(out, p, ctype);
-    p = s_put(out, p, "\r\nConnection: close\r\nContent-Length: ");
+    p = s_put(out, p, "\r\n");
+    p = s_put(out, p, extra);                  /* e.g. CORS header for /fb */
+    p = s_put(out, p, "Connection: close\r\nContent-Length: ");
     p = s_putdec(out, p, bl);
     p = s_put(out, p, "\r\n\r\n");
     for (int i = 0; i < bl; i++) out[p++] = body[i];
