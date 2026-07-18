@@ -613,6 +613,31 @@ static long bench_dining(long lo, long hi, int core)
     return meals;
 }
 
+/* ---- Memory-fill benchmark (cross-board: does bulk store scale on A72?) ----
+ * Identical workload to the Pi 3's smpbench fill: a plain buffer written 8
+ * times.  With the D-cache off (as on both boards) every store is a RAM
+ * transaction, so this is memory-bound, exactly like framebuffer drawing.
+ * smp_parallel_sum splits [0,n) into contiguous per-core bands. */
+#define BENCH_FILL_WORDS  (256 * 1024)   /* 1 MB, matches Pi 3 */
+#define BENCH_FILL_PASSES 8
+static unsigned bench_fill_buf[BENCH_FILL_WORDS];
+static long bench_fill(long lo, long hi, int core)
+{
+    volatile unsigned *b = bench_fill_buf;
+    (void)core;
+    for (long p = 0; p < BENCH_FILL_PASSES; p++)
+        for (long i = lo; i < hi; i++) b[i] = (unsigned)(i + p);
+    return hi - lo;
+}
+
+/* Pool round-trip: does nothing, so the N-core time is the dispatch+collect
+ * overhead — the parallelise/don't break-even point. */
+static long bench_null(long lo, long hi, int core)
+{
+    (void)core;
+    return hi - lo;
+}
+
 /* ---- N-Queens partial (distributed): count solutions for first-queen columns
  * [g_nqp_c0+lo, g_nqp_c0+hi) at board size g_nqp_n.  Used by /nqpart so a Mac
  * orchestrator can hand each board a disjoint column range and sum the partials.
@@ -641,6 +666,18 @@ static unsigned long now_ms(void)
     __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz));
     if (!hz) return 0;
     return (ct * 1000UL) / hz;
+}
+
+/* Microsecond timer off the same generic counter — the ms version rounds too
+ * coarsely for the sub-millisecond fill benchmark.  Matches the resolution of
+ * the Pi 3's clkcount() so the two boards' numbers are comparable. */
+static unsigned long now_us(void)
+{
+    unsigned long ct, hz;
+    __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(ct));
+    __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz));
+    if (!hz) return 0;
+    return (ct * 1000000UL) / hz;
 }
 
 /* Value of the Content-Length header (case-insensitive), or -1. */
@@ -959,53 +996,61 @@ static int http_build(const char *req, char *out, int max)
         q_param(req, "kind", kind, sizeof kind);
         int is_dining = (kind[0] == 'd');
         int is_primes = (kind[0] == 'p');
+        int is_fill   = (kind[0] == 'f');
+        int is_null   = (kind[0] == 'x');   /* kind=x... : pool round-trip */
+        /* cores caps the parallel run for an Amdahl sweep; 0 = all online.
+         * Matches the Pi 3's /bench?cores=N so both boards sweep identically. */
+        int cores = q_int(req, "cores", 0);
+        int nc = (cores >= 1 && cores <= online) ? cores : online;
         smp_range_fn fn;
         long units;
-        const char *label;
+        const char *label, *metric;
         if (is_dining) {
             g_din_n = q_int(req, "n", 5);
             if (g_din_n < 2)  g_din_n = 2;
             if (g_din_n > 64) g_din_n = 64;
             units = 200000;
-            fn = bench_dining;  label = "dining";
+            fn = bench_dining;  label = "dining"; metric = "meals";
         } else if (is_primes) {
             units = q_int(req, "n", 300000);
             if (units < 1) units = 1;
-            fn = bench_count_primes;  label = "primes";
+            fn = bench_count_primes;  label = "primes"; metric = "primes";
+        } else if (is_fill) {
+            units = q_int(req, "n", BENCH_FILL_WORDS);
+            if (units < 1) units = 1;
+            if (units > BENCH_FILL_WORDS) units = BENCH_FILL_WORDS;
+            fn = bench_fill;  label = "fill"; metric = "words";
+        } else if (is_null) {
+            units = nc;
+            fn = bench_null;  label = "null"; metric = "chunks";
         } else {
             g_nq_n = q_int(req, "n", 13);
             if (g_nq_n < 1)  g_nq_n = 1;
             if (g_nq_n > 15) g_nq_n = 15;
             units = g_nq_n;
-            fn = bench_nqueens;  label = "nqueens";
+            fn = bench_nqueens;  label = "nqueens"; metric = "solutions";
         }
 
-        unsigned long t0 = now_ms();
+        /* Timed with now_us() (generic-timer microseconds), NOT now_ms():
+         * fill is sub-millisecond.  Serial (1 core) then parallel (nc cores)
+         * back-to-back, so the speedup ratio is robust to clock changes —
+         * the same reporting discipline as the Pi 3. */
+        unsigned long t0 = now_us();
         long r1 = smp_parallel_sum(fn, units, 1);
-        unsigned long t1 = now_ms();
-        long rN = smp_parallel_sum(fn, units, online);
-        unsigned long t2 = now_ms();
-        unsigned long ms1 = t1 - t0;
-        unsigned long msN = t2 - t1;
+        unsigned long us1 = now_us() - t0;
+        t0 = now_us();
+        long rN = smp_parallel_sum(fn, units, nc);
+        unsigned long usN = now_us() - t0;
 
         bl = s_put(body, bl, "SMP bench kind="); bl = s_put(body, bl, label); bl = s_put(body, bl, "\n");
-        bl = s_put(body, bl, "cores_online = "); bl = s_putdec(body, bl, (long)online); bl = s_put(body, bl, "\n");
-        if (is_dining) {
-            bl = s_put(body, bl, "philosophers = "); bl = s_putdec(body, bl, (long)g_din_n); bl = s_put(body, bl, "\n");
-            bl = s_put(body, bl, "meals        = "); bl = s_putdec(body, bl, r1);
-        } else if (is_primes) {
-            bl = s_put(body, bl, "n            = "); bl = s_putdec(body, bl, units); bl = s_put(body, bl, "\n");
-            bl = s_put(body, bl, "primes       = "); bl = s_putdec(body, bl, r1);
-        } else {
-            bl = s_put(body, bl, "board_size   = "); bl = s_putdec(body, bl, (long)g_nq_n); bl = s_put(body, bl, "\n");
-            bl = s_put(body, bl, "solutions    = "); bl = s_putdec(body, bl, r1);
-        }
-        bl = s_put(body, bl, (r1 == rN) ? " (match)\n" : " MISMATCH!\n");
-        bl = s_put(body, bl, "1-core   ms  = "); bl = s_putdec(body, bl, (long)ms1); bl = s_put(body, bl, "\n");
-        bl = s_put(body, bl, "N-core   ms  = "); bl = s_putdec(body, bl, (long)msN); bl = s_put(body, bl, "\n");
+        bl = s_put(body, bl, "cores_online = "); bl = s_putdec(body, bl, (long)nc); bl = s_put(body, bl, "\n");
+        bl = s_put(body, bl, metric); bl = s_put(body, bl, " = "); bl = s_putdec(body, bl, r1); bl = s_put(body, bl, "\n");
+        bl = s_put(body, bl, "1-core   us  = "); bl = s_putdec(body, bl, (long)us1); bl = s_put(body, bl, "\n");
+        bl = s_put(body, bl, "N-core   us  = "); bl = s_putdec(body, bl, (long)usN); bl = s_put(body, bl, "\n");
         bl = s_put(body, bl, "speedup x100 = ");
-        bl = s_putdec(body, bl, msN ? (long)((ms1 * 100UL) / msN) : 0);
-        bl = s_put(body, bl, "  (e.g. 385 = 3.85x)\n");
+        bl = s_putdec(body, bl, usN ? (long)((us1 * 100UL) / usN) : 0);
+        bl = s_put(body, bl, "\n");
+        bl = s_put(body, bl, "agree = "); bl = s_put(body, bl, (r1 == rN) ? "yes\n" : "NO\n");
     } else if (starts_with(req, "GET /nqpart") || starts_with(req, "POST /nqpart")) {
         /* Distributed N-Queens partial: count solutions for first-queen columns
          * [c0,c1) at board size n, using all cores.  See rpi5 for the protocol.
