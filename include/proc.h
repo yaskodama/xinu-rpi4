@@ -38,6 +38,7 @@ enum proc_state {
     PR_READY,      /* on ready list, waiting for CPU             */
     PR_CURR,       /* currpid points here                        */
     PR_WAIT,       /* blocked (e.g. on an empty mailbox)         */
+    PR_SLEEP,      /* timed sleep: readied by the timer tick      */
     PR_TERM        /* exited, awaiting reaper                    */
 };
 
@@ -52,6 +53,7 @@ struct procent {
     void           *arg;            /* opaque per-process argument */
     char            name[PROC_NAME_LEN];
     struct procent *next;           /* ready-list link            */
+    unsigned long   wake_at_us;     /* PR_SLEEP: CNTPCT-us release time */
 };
 
 extern struct procent proctab[NPROC];
@@ -66,6 +68,16 @@ void proc_ready(int pid);
 void proc_resched(void);
 void proc_yield(void);
 void proc_exit(void);
+/* Real-time additions (P1): priority-ordered dispatch + timed sleep.
+ * proc_setprio() sets a process's scheduling priority (higher = runs first,
+ * now that ready dispatch is priority-ordered).  proc_sleep_us() blocks the
+ * caller until `us` microseconds have passed; the timer tick (proc_timer_tick)
+ * readies due sleepers and requests a preemptive switch, so a high-priority
+ * periodic task wakes and preempts lower-priority compute.  These only affect
+ * processes that call them — resident actors keep running cooperatively. */
+void proc_setprio(int pid, int prio);
+void proc_sleep_us(unsigned long us);
+void proc_timer_tick(void);     /* called from the timer IRQ handler */
 /* Preemptive scheduling (timer-driven round-robin).  proc_set_preempt(1)
  * enables it; proc_resched_request() is called from the timer ISR; and
  * proc_preempt() (after the IRQ is EOI'd) performs the switch. */

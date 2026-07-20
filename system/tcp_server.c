@@ -818,6 +818,10 @@ extern int  proc_create(void (*)(void), unsigned long, const char *);
 extern void proc_ready(int);
 extern void proc_yield(void);
 extern void proc_exit(void);
+extern void proc_setprio(int, int);
+extern void proc_sleep_us(unsigned long);
+extern unsigned long proc_dbg_ppcalls(void), proc_dbg_ppoff(void), proc_dbg_ppactor(void),
+                     proc_dbg_ppfired(void), proc_dbg_wakes(void), proc_dbg_hidisp(void);
 
 struct jit_stat {
     volatile int  done;
@@ -830,6 +834,12 @@ static volatile unsigned long g_jit_chunk_us;
 
 static void jit_hog(void)
 {
+    /* A newly-dispatched proc inherits the dispatcher's masked-IRQ state (the
+     * ctxsw happens inside proc_resched's irq_save critical section) and, being
+     * a tight compute loop, never restores it — so the timer can't preempt it.
+     * Explicitly enable IRQs so preemption works.  (The general fix belongs in
+     * proc dispatch; this proves the mechanism.) */
+    __asm__ volatile ("msr daifclr, #2" ::: "memory");
     volatile unsigned x = 2463534242u;
     while (g_jit_hog_run) {
         unsigned long s = now_us();
@@ -843,6 +853,7 @@ static void jit_hog(void)
 
 static void jit_measure(void)
 {
+    __asm__ volatile ("msr daifclr, #2" ::: "memory");   /* run with IRQs enabled */
     /* RELATIVE schedule: each release is measured `target` after the ACTUAL
      * previous wake, so a late wake never triggers a catch-up burst — the next
      * period simply starts from where we actually woke.  Accumulate in locals
@@ -851,9 +862,8 @@ static void jit_measure(void)
     unsigned long mn = 0xffffffffUL, mx = 0, sum = 0, mj = 0, miss = 0;
     unsigned long prev = now_us(), i;
     for (i = 0; i < N; i++) {
-        unsigned long rel = prev + target;          /* wanted release time */
-        while (now_us() < rel) proc_yield();         /* wait, yielding to others */
-        unsigned long t = now_us(), d = t - prev;    /* actual period (>= target) */
+        proc_sleep_us(target);                       /* RT timed sleep to next release */
+        unsigned long t = now_us(), d = t - prev;    /* actual period */
         prev = t;
         if (d < mn) mn = d;
         if (d > mx) mx = d;
@@ -876,16 +886,19 @@ static void jit_run(unsigned long period_ms, unsigned long samples,
     if (with_hog) {
         g_jit_hog_run = 1; g_jit_chunk_us = chunk_us;
         int hp = proc_create(jit_hog, 8192, "jit_hog");
-        if (hp > 0) proc_ready(hp);
+        if (hp > 0) { proc_setprio(hp, 5); proc_ready(hp); }   /* low priority */
     }
     int mp = proc_create(jit_measure, 8192, "jit_meas");
     if (mp <= 0) { g_jit.done = 1; g_jit_hog_run = 0; return; }
+    proc_setprio(mp, 50);                                     /* high (RT) priority */
     proc_ready(mp);
-    unsigned long guard = 0,
-        budget = samples * (period_ms + chunk_us / 1000UL + 2UL) + 8000UL;
-    while (!g_jit.done && guard++ < budget) proc_yield();
+    /* Time-based guard: the run lasts ~samples*(period+chunk); wait until done
+     * or well past that (yield-count guards mis-fire when yields are cheap). */
+    unsigned long deadline = now_us()
+        + (unsigned long)samples * (period_ms * 1000UL + chunk_us) + 3000000UL;
+    while (!g_jit.done && now_us() < deadline) proc_yield();
     g_jit_hog_run = 0;
-    { int k; for (k = 0; k < 128; k++) proc_yield(); }   /* let the hog exit */
+    { int k; for (k = 0; k < 256; k++) proc_yield(); }   /* let the hog exit */
 }
 
 /* Value of the Content-Length header (case-insensitive), or -1. */
@@ -1332,6 +1345,8 @@ static int http_build(const char *req, char *out, int max)
         int pe = q_int(req, "preempt", 0);
         proc_set_preempt(pe ? 1 : 0);
         jit_run(P, NS, 0, 0);               struct jit_stat a = g_jit;   /* idle   */
+        unsigned long dc=proc_dbg_ppcalls(), doff=proc_dbg_ppoff(), dac=proc_dbg_ppactor(),
+                      dfi=proc_dbg_ppfired(), dwk=proc_dbg_wakes(), dhi=proc_dbg_hidisp();
         jit_run(P, NS, 1, (unsigned long)C); struct jit_stat b = g_jit;  /* + hog  */
         proc_set_preempt(0);
         bl = s_put(body, bl, "rtos-jitter (rpi4 cooperative) period_ms="); bl = s_putdec(body, bl, P);
@@ -1347,6 +1362,12 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, " max_us=");     bl = s_putdec(body, bl, (long)b.max_us);
         bl = s_put(body, bl, " max_jit_us="); bl = s_putdec(body, bl, (long)b.max_abs_jit_us);
         bl = s_put(body, bl, " misses=");     bl = s_putdec(body, bl, (long)b.misses);
+        bl = s_put(body, bl, "\n[diag]  pp_calls="); bl = s_putdec(body, bl, (long)(proc_dbg_ppcalls()-dc));
+        bl = s_put(body, bl, " off=");     bl = s_putdec(body, bl, (long)(proc_dbg_ppoff()-doff));
+        bl = s_put(body, bl, " actor=");   bl = s_putdec(body, bl, (long)(proc_dbg_ppactor()-dac));
+        bl = s_put(body, bl, " fired=");   bl = s_putdec(body, bl, (long)(proc_dbg_ppfired()-dfi));
+        bl = s_put(body, bl, " tickwakes="); bl = s_putdec(body, bl, (long)(proc_dbg_wakes()-dwk));
+        bl = s_put(body, bl, " hi_disp=");   bl = s_putdec(body, bl, (long)(proc_dbg_hidisp()-dhi));
         bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "GET /preempt") || starts_with(req, "POST /preempt")) {
         /* Demo: 2 CPU-bound procs time-sliced by the timer.  Cooperative ->

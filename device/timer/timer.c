@@ -47,6 +47,7 @@ static void timer_irq_handler(void *arg)
      * of the handler takes a few μs. */
     cntp_set_tval(timer_interval);
     tick_count++;
+    proc_timer_tick();              /* wake due RT sleepers (may set resched_pending) */
     proc_resched_request();         /* ask for a preemptive switch (acted on after EOI) */
 }
 

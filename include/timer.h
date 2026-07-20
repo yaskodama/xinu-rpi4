@@ -9,7 +9,7 @@
 #ifndef XINU_RPI4_TIMER_H
 #define XINU_RPI4_TIMER_H
 
-#define TIMER_HZ 100
+#define TIMER_HZ 1000   /* 1 ms tick — RT sleep/preempt granularity (P1) */
 
 /* Configure CNTFRQ_EL0 / CNTP_TVAL_EL0 / CNTP_CTL_EL0, register
  * the IRQ handler via connect_interrupt(), and enable PPI 30 in

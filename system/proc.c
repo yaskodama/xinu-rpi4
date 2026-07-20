@@ -25,6 +25,19 @@ int            currpid;
 static volatile int g_preempt_on;
 static volatile int g_resched_pending;
 static volatile unsigned long g_ctxsw;     /* context switches (live diagnostic) */
+/* P1 preemption diagnostics (why doesn't a woken RT task preempt a CPU hog?) */
+static volatile unsigned long g_dbg_pp_calls;   /* proc_preempt() entered        */
+static volatile unsigned long g_dbg_pp_offgate;  /* returned: !on || !pending     */
+static volatile unsigned long g_dbg_pp_actorgate;/* returned: actor pump active   */
+static volatile unsigned long g_dbg_pp_fired;    /* reached proc_resched()        */
+static volatile unsigned long g_dbg_tick_wakes;  /* sleepers readied by the tick  */
+static volatile unsigned long g_dbg_hi_dispatch; /* ready_pop returned prio>=40    */
+unsigned long proc_dbg_ppcalls(void)  { return g_dbg_pp_calls; }
+unsigned long proc_dbg_ppoff(void)    { return g_dbg_pp_offgate; }
+unsigned long proc_dbg_ppactor(void)  { return g_dbg_pp_actorgate; }
+unsigned long proc_dbg_ppfired(void)  { return g_dbg_pp_fired; }
+unsigned long proc_dbg_wakes(void)    { return g_dbg_tick_wakes; }
+unsigned long proc_dbg_hidisp(void)   { return g_dbg_hi_dispatch; }
 void proc_set_preempt(int on)      { g_preempt_on = on ? 1 : 0; }
 void proc_resched_request(void)    { g_resched_pending = 1; }
 
@@ -93,12 +106,23 @@ static void ready_push(struct procent *p)
 
 static struct procent *ready_pop(void)
 {
-    struct procent *p = ready_head;
-    if (p == 0) return 0;
-    ready_head = p->next;
-    if (ready_head == 0) ready_tail = 0;
-    p->next = 0;
-    return p;
+    if (ready_head == 0) return 0;
+    /* Priority-ordered dispatch (rpi3-style): return the highest-prio ready
+     * process; ties keep FIFO order (first of the highest prio) for fairness.
+     * O(n) over a short ready list.  This is what makes proc->prio actually
+     * govern who runs — the previous cut was plain FIFO. */
+    struct procent *best = ready_head, *bestprev = 0;
+    struct procent *prev = ready_head, *curr = ready_head->next;
+    while (curr) {
+        if (curr->prio > best->prio) { best = curr; bestprev = prev; }
+        prev = curr; curr = curr->next;
+    }
+    if (bestprev) bestprev->next = best->next;
+    else          ready_head = best->next;
+    if (ready_tail == best) ready_tail = bestprev;
+    best->next = 0;
+    if (best->prio >= 40) g_dbg_hi_dispatch++;   /* RT proc actually dispatched */
+    return best;
 }
 
 /* Unlink `target` from the ready list if present.  A killed process MUST
@@ -282,17 +306,72 @@ void proc_yield(void)
     proc_resched();
 }
 
+/* ---- Real-time additions (P1): priority + timed sleep ---- */
+
+static unsigned long proc_now_us(void)
+{
+    unsigned long ct, hz;
+    __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(ct));
+    __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz));
+    return hz ? (ct * 1000000UL) / hz : 0;
+}
+
+void proc_setprio(int pid, int prio)
+{
+    if (pid < 0 || pid >= NPROC) return;
+    proctab[pid].prio = prio;
+}
+
+/* Block the caller until `us` microseconds elapse.  Like proc_block(), but the
+ * timer tick (proc_timer_tick) readies it when its deadline passes and requests
+ * a preemptive switch, so a high-priority periodic task wakes on time and (with
+ * preemption on) preempts lower-priority compute.  Only callers of this sleep —
+ * resident actors never do, so they keep running cooperatively. */
+void proc_sleep_us(unsigned long us)
+{
+    unsigned long d = irq_save();
+    struct procent *oldp = &proctab[currpid];
+    oldp->wake_at_us = proc_now_us() + us;
+    oldp->state = PR_SLEEP;
+    struct procent *newp = ready_pop();
+    if (newp == 0) newp = &proctab[NULLPROC];
+    newp->state = PR_CURR;
+    currpid = (int)(newp - proctab);
+    g_ctxsw++;
+    ctxsw(&oldp->sp, newp->sp);
+    irq_restore(d);
+}
+
+/* Called from the timer IRQ handler (interrupts already masked): ready any
+ * sleeper whose deadline has passed and request a reschedule so a woken
+ * high-priority task runs immediately (via proc_preempt after EOI). */
+void proc_timer_tick(void)
+{
+    unsigned long now = proc_now_us();
+    int woke = 0, i;
+    for (i = 0; i < NPROC; i++) {
+        if (proctab[i].state == PR_SLEEP && now >= proctab[i].wake_at_us) {
+            proctab[i].state = PR_READY;
+            ready_push(&proctab[i]);
+            g_dbg_tick_wakes++;
+            woke = 1;
+        }
+    }
+    if (woke) g_resched_pending = 1;
+}
+
 /* Timer-driven preemption point: called from irq_dispatch_c after the IRQ is
  * EOI'd (so the next process can still receive timer IRQs).  Only preempts a
  * non-NULLPROC (i.e. a real process) when enabled and a tick is pending. */
 void proc_preempt(void)
 {
-    if (!g_preempt_on || !g_resched_pending) return;
+    g_dbg_pp_calls++;
+    if (!g_preempt_on || !g_resched_pending) { g_dbg_pp_offgate++; return; }
     /* Suppress preemption while the actor pump runs (leave g_resched_pending set
      * so a tick isn't lost — the next tick after the pump leaves acts on it). */
-    if (g_actor_pump) return;
+    if (g_actor_pump) { g_dbg_pp_actorgate++; return; }
     g_resched_pending = 0;
-    if (currpid != NULLPROC) proc_resched();
+    if (currpid != NULLPROC) { g_dbg_pp_fired++; proc_resched(); }
 }
 
 /* Reap a process that is blocked (PR_WAIT) — not on the ready list and
