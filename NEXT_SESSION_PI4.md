@@ -1,7 +1,96 @@
 # Pi4 (xinu-rpi4) — Next-Session Handoff
 
-Last updated: **2026-07-20** (OS assessment + Tier-0 hardening + host tests).
+Last updated: **2026-07-20** (OS assessment; Tier-0 + Tier-1 hardening;
+scheduler rework; TCP segmentation/retransmit; /chainload repaired).
 Older notes kept below for reference.
+
+---
+
+## ★★ 2026-07-20 session (evening) — scheduler, TCP, and why /chainload bricked the box
+
+Commits `ce106cc` (scheduler) and `256dbe9` (network).  Build md5
+**`becaf060`**, flashed and verified on hardware.  Card fallbacks:
+`kernel8.img.prev` = `44d22be6`, `kernel8.img.good-769fcfef-sched` = `769fcfef`.
+
+### /chainload NOW WORKS — and here is why it did not
+
+**The staging address sat inside the running kernel's own .bss.**
+
+```
+stage at   0x4000000 = 67,108,864
+_end      = 0x4233B18 = 69,286,168     <- 2.08 MB ABOVE the staging base
+```
+
+Every uploaded chunk overwrote live kernel state, so the board died
+*during the upload*, before `go=1` was ever sent.  It killed the box twice
+this session.  Chainload was written when the kernel was ~115 KB (see
+`kernel8.img.actor`, 115,144 bytes, still on the card); .bss grew to 69 MB
+and swallowed the fixed address.  README and both manuals meanwhile kept
+advertising it as the safe no-SD-swap iteration path.
+
+Fixed: stage into a heap buffer (always above `_end`), bound the offset,
+and refuse `go=1` if the staging area overlaps the running image.
+`system/kexec.c:108` already staged from the heap — this route had just
+never been updated.
+
+**Measured: 2,008,152 bytes uploaded in 23.1 s, all 123 chunks acked, staged
+kernel booted.**  Hardware iteration no longer needs a card swap.  Note the
+old kernels on the card do NOT have this fix, so chainloading *from* one of
+them will still wedge the board.
+
+### Scheduler (assessment items 7, 8, 12)
+
+- `proc_resched()` popped the best ready process **before** requeueing the
+  runner, so the runner's priority never competed — a tick handed a prio-50
+  RT task's CPU to a prio-5 hog.  Requeue first, then pick.
+- Ready processes moved to per-priority FIFOs + a 64-bit bitmap (one CLZ to
+  dispatch).  The old linear walk cost ~1300 uncached link traversals per
+  switch under the actor workload.
+- Sleepers moved to a deadline-sorted list; the timer ISR no longer scans
+  all 2048 proctab entries twice per fire.
+- Stack canary at `stkbase`, checked at every switch point, surfaced as
+  `stkbad=` in `GET /ticks`.  Minimum stack 1 KB -> 2 KB (the IRQ frame
+  alone is 768 bytes).
+
+Measured: `/rtos-jitter` 10 ms period under a hog — preempt=0 gives 5162 us
+max jitter and 46/100 misses, preempt=1 gives **10 us and 0 misses** with
+1002 preemptions fired.  SMP benchmarks unchanged.  `stkbad` stayed 0.
+
+### TCP (assessment item 14)
+
+Responses over ~1.4 KB used to be dropped whole while `g_app_served++` still
+ran and the FIN still went out — the client saw a clean close with zero
+bytes.  Now: per-conn send buffer, MSS segmentation, go-back-N retransmit on
+a 500 ms RTO, peer window honoured, FIN held until everything is acked.
+`http_build()` also ignored its `max` (`(void)max;`) and overflowed
+`g_app_resp` by ~120 bytes; the body is now truncated before Content-Length
+is written.
+
+Measured: `GET /shell?cmd=help` returns 2618 bytes against Content-Length
+2618 (was zero), identical md5 over six fetches, `retrans=0`, `txfail=0`.
+
+### `/preempt` — settled, it is NOT a regression
+
+Chainloaded `ccb6437` into RAM and ran it side by side: the old kernel also
+returns a near-empty log (`BA` / `B` / `AB` / empty, varying; 20 chars
+expected) and also strands `cpuA`/`cpuB`, two more per call.  Pre-existing.
+
+Cause is the assumption `preempt_demo`'s own comment states — "run from the
+shell/NULLPROC context".  Over HTTP the caller is the app worker at prio 1,
+equal to the children, so round-robin returns to it before they finish.
+NULLPROC is never queued, so from the serial shell it should behave.  Same
+shape as `procdemo` returning early (proved identical old vs new on host).
+
+### Still open
+
+- **`/microsd` and `/sd` enumerate empty** — unchanged, still blocks
+  verifying the `cat` NULL-data guard and makes FAT32 untestable on
+  hardware.  Best next target.
+- `make qemu` / `qemu-smoke` still do not link (`sd_last_int`, `xhci_msd_*`).
+- Next from `docs/OS_ASSESSMENT_JA.md`: W^X (item 6 — `.data`/`.bss` are
+  RWX today), then DMA cache discipline in genet/xhci so `DCACHE_ON` can be
+  turned on (item 10, the largest single performance lever), then the GENET
+  TX ring to kill the 50 ms busy-wait per packet (item 15).
 
 ---
 

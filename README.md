@@ -90,8 +90,13 @@ xychart-beta
 - **MMU**: identity map + a **demand-paged virtual-memory window** (page-fault
   driven, VA `0x80000000`..`0x80400000`, 512-frame pool). D-cache off for DMA
   coherency; I-cache + MMU on.
-- **Scheduler**: cooperative AArch64 `ctxsw` (S0) **and** preemptive 100 Hz
-  round-robin off the GIC-400 + generic timer (S1).
+- **Scheduler**: cooperative AArch64 `ctxsw` **and** preemptive fixed-priority
+  off the GIC-400 + generic timer, with round-robin among equal priorities.
+  Ready processes sit in per-priority FIFOs indexed by a 64-bit bitmap (O(1)
+  dispatch); sleepers are on a deadline-sorted list, so the timer ISR reads a
+  head instead of scanning `proctab`. Stack canaries catch overflow
+  (`stkbad=` in `GET /ticks`). Measured on a 10 ms RT period under a CPU hog:
+  **10 µs max jitter, 0 deadlines missed** (cooperative: 5162 µs, 46 % missed).
 - First-fit kernel heap (`getmem`/`freemem`), 16-byte granular/aligned,
   coalescing, IRQ-safe. Covered by host unit tests (see *Testing*).
 
@@ -161,9 +166,14 @@ The card needs the stock Raspberry Pi OS firmware blobs (`bootcode.bin`,
 
 ```sh
 python3 tools/remote_chainload.py 192.168.3.100 compile/kernel8.img
-# ~50 s upload; a bad image just needs a power cycle (the SD is untouched).
+# ~23 s for a 2 MB image; a bad image just needs a power cycle (SD untouched).
 # Requires the device's HTTP server to be responsive.
 ```
+
+> The running kernel must be recent enough to stage the upload on the heap.
+> Kernels before `256dbe9` staged at a fixed `0x4000000`, which is now ~2 MB
+> *inside* the kernel's own `.bss` — uploading to one of those overwrites live
+> kernel state and hangs the board partway through the transfer.
 
 ## Console
 
@@ -300,11 +310,11 @@ xinu-rpi4/
   power cycle clears it.
 - WiFi / ad-hoc are not restored after a reboot — re-run `wifi probe` + `wifi up`
   (or `wifi adhoc`) each boot.
-- The TCP server is a subset: no retransmission, no windowing, no reassembly,
-  and **no segmentation** — an HTTP response over ~1.4 KB is dropped and the
-  client sees a clean close with zero bytes. Idle/half-open connections are
-  reaped (5 s / 60 s) so a stalled peer can't hold a slot forever; `tcpstat`
-  reports `reaped=`.
+- The TCP server is a subset of RFC 793: 4 connections, no out-of-order
+  reassembly, no TIME_WAIT, and no checksum validation on receive. It *does*
+  segment to the MSS, retransmit (go-back-N, 500 ms RTO), honour the peer's
+  window, and reap idle/half-open connections (5 s / 60 s); `tcpstat` reports
+  `retrans=` and `reaped=`.
 - The IP address is hardcoded (`192.168.3.100`); the DHCP client reaches BOUND
   but its lease is never applied.
 - `/microsd` and `/sd` currently enumerate empty — the FAT32 mount does not
