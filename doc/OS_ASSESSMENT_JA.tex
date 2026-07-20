@@ -1,0 +1,576 @@
+% OS_ASSESSMENT_JA.tex — xinu-rpi4 OS アセスメント (日本語版)
+% Build: lualatex OS_ASSESSMENT_JA.tex   (目次のため 2 回実行)
+% Markdown 版: docs/OS_ASSESSMENT_JA.md
+\documentclass[a4paper,11pt]{ltjsarticle}
+
+\usepackage{luatexja-fontspec}
+\setmonofont{Menlo}[Scale=0.82]
+\usepackage[a4paper,margin=2.0cm]{geometry}
+\usepackage{amssymb}
+\usepackage{xcolor}
+\usepackage{fancyvrb}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{newunicodechar}
+\usepackage[hidelinks]{hyperref}
+
+\newunicodechar{→}{\textrightarrow}
+\newunicodechar{←}{\textleftarrow}
+\newunicodechar{↔}{\ensuremath{\leftrightarrow}}
+\newunicodechar{×}{\ensuremath{\times}}
+\newunicodechar{…}{\dots}
+\newunicodechar{≥}{\ensuremath{\geq}}
+\newunicodechar{≤}{\ensuremath{\leq}}
+\newunicodechar{≠}{\ensuremath{\neq}}
+\newunicodechar{✅}{\textcolor{green!55!black}{\checkmark}}
+\newunicodechar{◐}{\textcolor{orange!80!black}{\textbf{\small 一部}}}
+\newunicodechar{⚠}{\textcolor{orange!80!black}{\textbf{!}}}
+\newunicodechar{①}{\textbf{(1)}}  \newunicodechar{②}{\textbf{(2)}}
+\newunicodechar{③}{\textbf{(3)}}  \newunicodechar{④}{\textbf{(4)}}
+\newunicodechar{⑤}{\textbf{(5)}}  \newunicodechar{⑥}{\textbf{(6)}}
+\newunicodechar{⑦}{\textbf{(7)}}  \newunicodechar{⑧}{\textbf{(8)}}
+\newunicodechar{⑨}{\textbf{(9)}}  \newunicodechar{⑩}{\textbf{(10)}}
+\newunicodechar{⑪}{\textbf{(11)}} \newunicodechar{⑫}{\textbf{(12)}}
+\newunicodechar{⑬}{\textbf{(13)}} \newunicodechar{⑭}{\textbf{(14)}}
+\newunicodechar{⑮}{\textbf{(15)}} \newunicodechar{⑯}{\textbf{(16)}}
+\newunicodechar{⑰}{\textbf{(17)}} \newunicodechar{⑱}{\textbf{(18)}}
+\newunicodechar{⑲}{\textbf{(19)}} \newunicodechar{⑳}{\textbf{(20)}}
+\newunicodechar{㉑}{\textbf{(21)}}
+
+\DefineVerbatimEnvironment{code}{Verbatim}%
+  {fontsize=\small,frame=single,framerule=0.3pt,rulecolor=\color{gray!60},%
+   framesep=5pt,xleftmargin=2pt,xrightmargin=2pt}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt}
+\renewcommand{\arraystretch}{1.25}
+
+% 「所見」見出し用
+\newcommand{\finding}[2]{\subsection{#1 --- \texttt{#2}}}
+
+\title{\textbf{xinu-rpi4 --- OS としての改良余地アセスメント}\\[3pt]
+       \large Raspberry Pi 4 (BCM2711 / Cortex-A72, AArch64) 向け Embedded Xinu}
+\author{}
+\date{2026 年 7 月 20 日}
+
+\begin{document}
+\maketitle
+\vspace{-2.0em}
+\begin{center}\rule{0.9\textwidth}{0.4pt}\end{center}
+
+\begin{center}\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{対象} & Pi 4 カーネル (\texttt{compile/make pi4} → \texttt{kernel8.img})\\
+\textbf{基準コミット} & \texttt{ccb6437} (proc: harden tickless one-shot against total hang)\\
+\textbf{規模} & \texttt{.c/.h/.S} 130 ファイル、約 31.4k 行、195 コミット\\
+              & (\texttt{extern/} \texttt{obj/} \texttt{references/} を除く)\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\bigskip
+
+本書は Pi 4 カーネルを「OS として」評価し、改良余地を影響度と工数で順位付けしたものである。
+スケジューラ／メモリ／ネットワーク・ドライバ／ファイルシステムとツーリングの 4 領域を
+精読した結果をまとめている。重大な所見は実際にソースで裏取りし、そのうち Tier 0 の 5 件と
+Tier 1 の 4 件は本アセスメントと同日に修正・実機検証した (第 5 章・第 6 章)。
+
+行番号はアセスメント時点のもので、以後の編集でずれる。関数名を併記しているのでそちらを
+頼りにすること。Markdown 版は \texttt{docs/OS\_ASSESSMENT\_JA.md}。
+
+{\small\tableofcontents}
+\bigskip
+
+%======================================================================
+\section{総評}
+
+\textbf{上半分 (プロセス／IRQ アーキテクチャ) は本物、下半分 (メモリ安全性・ネットワーク・
+ファイルシステム) はデモ級}という非対称な成熟度にある。
+
+評価できる点:
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{ISR の中で重い処理をしていない}。net プロセス + app ワーカー + aipl プロセスを
+      park/kick で分離し (\texttt{loader/main.c:206-269})、タイマ ISR はティック更新と
+      RT スリーパの起床のみ、GENET ISR は計数・自己マスク・ack のみ。HTTP 処理は必ず
+      プロセス文脈で走る。
+\item \textbf{フォルト後も生き延びる}。\texttt{recover\_spin()} (\texttt{system/exception.c:61})
+      が AIPL ヒープロックを解放し IRQ を再開してスピンするので、同期例外のあとも HTTP が
+      応答し \texttt{/fault} で原因を読める。
+\item \textbf{MMIO プローブが箱を殺さない}。\texttt{safe\_mmio\_read32/write32}
+      (\texttt{system/exception.c:79-104}) が \texttt{\_\_builtin\_setjmp} でガードし、
+      ゲートされた PCIe レジスタへの書き込みが $-1$ を返すだけで済む。
+\item ヘッダコメントの質が高い。\texttt{device/sd/sd.c:73-86} (74 クロックの電源投入
+      ウィンドウ)、\texttt{fs/fat32.c:180-184} (クラスタ確保の off-by-2) など、根本原因が
+      文章として残っている。
+\end{itemize}
+
+いずれも「1 回のハングが電源再投入 1 回」という開発コストへの対処として設計が筋道立っている。
+
+弱いのは、\textbf{落ちないので気づけない類のバグ}が各層に残っていること。以下はその棚卸しである。
+
+%======================================================================
+\section{Tier 0 --- 実害があり修正コストが小さいもの}
+
+すべてソースで裏取り済み。\textbf{本アセスメントと同日に全件修正した} (第 5 章)。
+
+\finding{ヒープ分割の 8 バイト境界オーバーラン}{mem/memory.c getmem()}
+
+\begin{code}
+if (curr->mlength > nbytes) {              /* <- 残り 8 バイトでも成立 */
+    struct memblk *leftover = (curr + nbytes);
+    leftover->mnext = ...; leftover->mlength = ...;   /* 16 バイト書く */
+\end{code}
+
+\texttt{struct memblk} は 16 バイト、\texttt{ROUNDMB} は 8 バイト粒度。残余がちょうど
+8 バイトのとき、\textbf{返却したブロックの隣に 8 バイトはみ出して書き、偽の free ノードを
+リストに繋ぐ}。以後ヒープが静かに壊れる。
+
+同型の欠陥が \texttt{freemem()} 側にもあった (8 バイト領域に 16 バイトのヘッダを書く)。
+こちらは目視では見落としており、ホスト側のランダム churn テストが検出した。
+
+\finding{ヒープが IRQ／プリエンプション非安全}{mem/memory.c}
+
+\texttt{getmem}/\texttt{freemem}/\texttt{kmalloc}/\texttt{kfree} に critical section が
+一切ない。プリエンプションは実際に有効化される経路がある
+(\texttt{/netpreempt}, \texttt{/rtos-jitter}, \texttt{preempt\_demo})。
+\texttt{proc\_create} は \texttt{getmem} を\textbf{ irq\_save の外}で、\texttt{proc\_kill}
+は \texttt{freemem} を\textbf{中}で呼んでおり (\texttt{system/proc.c:207} vs \texttt{:422})、
+この非対称さ自体が症状である。
+
+\finding{ICMP エコー応答からのメモリ情報漏洩}{system/net\_responder.c:210-234}
+
+\begin{code}
+int total_len = ip[2]<<8 | ip[3];
+if (icmp_len < 8 || total_len + 14 > 1518) return 0;   /* len と比較していない */
+int reply_len = 14 + total_len;
+for (int i = 0; i < reply_len; i++) tx_reply[i] = frame[i];
+\end{code}
+
+\texttt{total\_len} を\textbf{実受信長 \texttt{len} と照合していない}。60 バイトの ICMP に
+\texttt{total\_len=1400} を書いて送ると、RX リング上の隣接メモリ (＝直前のパケット) 約
+1.3\,KB を攻撃者に送り返す。
+
+同型の欠陥が \texttt{system/tcp\_server.c:2537-2541} (\texttt{data\_off} も未検証。
+\texttt{data} がフレーム外を指し、偽の \texttt{data\_len} が \texttt{peer\_seq} を
+desync させる)。なお IP／TCP／UDP／ICMP のいずれもチェックサムを検証していない。
+
+\finding{SYN 4 発で恒久 DoS}{system/tcp\_server.c alloc\_conn()}
+
+\texttt{struct tcp\_conn} にタイムスタンプがなく、状態は受信パケットでしか進まない。
+再送タイマもない。ACK を返さない SYN を \texttt{NCONN}(=4) 本打つと\textbf{全スロットが
+SYN\_RCVD で永久に固まり、再起動まで HTTP が死ぬ}。\texttt{alloc\_conn()} は
+LISTEN/CLOSED しか回収しない。
+
+\finding{\texttt{cat /microsd/xxx} が物理アドレス 0 を読む}{shell/fscmd.c:127}
+
+FAT32 のファイルを VFS に登録する際 \texttt{node->size} は入れるが \texttt{node->data} は
+NULL のまま (意図的、コメントあり)。\texttt{cat}/\texttt{cp}/\texttt{mv} はそれを無条件に
+deref する。アドレス 0 が RW 識別マップ (\texttt{system/mmu.c:200}) なのでフォルトせず、
+\textbf{低位 RAM の中身を表示・コピーする}。\texttt{ls} はもっともらしいサイズを出すので
+気づけない。
+
+\finding{W\textasciicircum X が壊れている}{system/mmu.c:191,214}
+
+\texttt{kern\_2mb = \_start \& \textasciitilde 2MiB = 0x0} なので、属性を分ける L3
+(4\,KiB ページ) 層が覆うのは \texttt{0x0--0x200000} だけ。実際の \texttt{\_data = 0x268000}。
+つまり\textbf{ \texttt{.rodata} の約 416\,KB と \texttt{.data}/\texttt{.bss} 全部 (＝全 DMA
+リング、\texttt{proctab}、\texttt{smp\_stack}) が 2\,MiB ブロックの RW+X} になっている。
+イメージが 2\,MiB を超えた時点で静かに劣化したもので、ビルド時アサートもない。
+
+%======================================================================
+\section{Tier 1 --- 設計上の本丸}
+
+\finding{優先度プリエンプションが実質ラウンドロビン}{system/proc.c proc\_resched()}
+
+\texttt{proc\_resched()} が\textbf{走行中プロセスを ready に戻す前に最良候補を pop する}
+(\texttt{:283} vs \texttt{:292-295}) ので、現在プロセスの優先度が比較に参加しない。
+prio=50 の RT タスクが prio=5 の hog に叩き落とされる。\texttt{g\_dbg\_hi\_dispatch}
+カウンタ (\texttt{:124}) は、これが追われていた形跡である。
+
+関連して、NULLPROC は決してプリエンプトされず (\texttt{:403}) ready リストにも載らない
+(\texttt{:292})。NULLPROC は\textbf{シェル／ウィンドウマネージャのループそのもの}なので、
+対話文脈は純粋に協調的で、\texttt{net\_yield\_tick} の明示 \texttt{proc\_yield()} でしか
+進まない。さらに AIPL アクター実行中はプリエンプションが全面的に無効化される
+(\texttt{proc.c:401})。つまり主要ワークロードでは、このカーネルは協調型である。
+
+\textbf{修正は数行}。P1 (RTOS 化) の看板そのものなので優先度は高い。
+
+\subsection{(8) ready リストが O(n)、タイマ ISR が毎回 proctab を 2 周}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \texttt{ready\_pop()} は最大 prio の線形探索 (\texttt{system/proc.c:107-126})。
+      \texttt{NPROC=2048}、N-Queens で約 1300 アクター、しかも\textbf{ D-cache は意図的に
+      OFF} (\texttt{system/mmu.c:263}) なので 1 ノード＝1 DRAM 往復。
+\item \texttt{proc\_next\_delay\_us()} (\texttt{:342-355}) と \texttt{proc\_timer\_tick()}
+      (\texttt{:377-390}) が同一 ISR で 2048 エントリを 2 周。最大 5\,kHz。
+      \texttt{PROC\_TICK\_MIN\_US} のコメント (\texttt{:337-341}) 自身が、この ISR が
+      システムを餓死させうると認めている。
+\end{itemize}
+
+→ 優先度別 FIFO + ビットマップ (\texttt{CLZ}) で O(1) 化、スリープはソート済みデルタキューへ。
+
+\subsection{(9) タイムベースが壊れている}
+
+\texttt{timer\_ticks()} は\textbf{可変長のワンショット発火回数}であって時計ではない。
+にもかかわらず 4 つのサブシステムが固定周期として扱っている:
+\texttt{actorproc.c:150,282,335} (\texttt{* 10} = 100\,Hz 前提)、\texttt{cc/cc.c:514}、
+\texttt{device/usb/uspi\_glue.c:95-100}、\texttt{device/usb/xhci/xhci.c:1119-1476}。
+アクター GC の経過時間もキーリピートも約 10 倍ずれ、しかも非線形。
+\texttt{CNTPCT\_EL0} 由来の真の \texttt{now\_ms()} は既に 2 箇所にある。
+
+\subsection{(10) D-cache OFF が最大の性能レバー、ただし解放には DMA 規律が要る}
+
+\texttt{SCTLR.C=0} は SMP コヒーレンシを「全アクセスが RAM に届く」で担保する設計判断
+(\texttt{include/smp.h:10-12}) で理屈は通っているが、4 コア分の D-cache を捨てている。
+\texttt{DCACHE\_ON} を有効にする前提として:
+
+\begin{center}\small
+\begin{tabular}{@{}l l@{}}
+\toprule
+\textbf{ドライバ} & \textbf{cache maintenance}\\ \midrule
+mailbox (\texttt{device/mbox/mbox.c:51-53,85-87}) & 正しい\\
+video (\texttt{device/video/video.c:247-249})     & 正しい\\
+smp mailbox (\texttt{system/smp.c:47-50,110})     & 正しい\\
+JIT (\texttt{cc/cc.c:723-735})                    & 正しい (\texttt{dc civac} + \texttt{ic iallu})\\
+wifi (\texttt{device/wifi/wifi.c:2138-2141})      & 部分的\\
+\textbf{genet} (\texttt{device/genet/genet.c})    & \textbf{\texttt{dc} 命令ゼロ} (\texttt{dsb sy} のみ)\\
+\textbf{xhci} (\texttt{device/usb/xhci/xhci.c})   & \textbf{\texttt{dc} 命令ゼロ} (\texttt{dsb sy} のみ)\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+規律は存在するのに 2 大 DMA ドライバだけ抜けている。\texttt{DCACHE\_ON} は現状どのターゲットも
+定義しておらず、実質デッドコードである。
+
+\subsection{(11) セマフォが偽物、\texttt{network/} が丸ごとデッドコード}
+
+\texttt{system/xinu\_compat.c:86-102} の \texttt{wait()}/\texttt{signal()} はカウンタの
+増減のみで、\textbf{キューなし・ブロックなし}。\texttt{struct sement.queue} は宣言されて未使用。
+\texttt{sleep()} は即 return、\texttt{yield()} は yield しない、\texttt{create()} は
+スレッドを作らない。
+
+その結果、\texttt{network/**} (ARP/IPv4/ICMP/netaddr 約 1500 行) は\textbf{完全にデッドコード}
+である。\texttt{netUp}/\texttt{netRecv}/\texttt{ipv4Recv}/\texttt{arpRecv} の呼び出しは
+\texttt{network/} の外にコメントとしてしか存在しない。それでも
+\texttt{compile/Makefile:47-49} はビルドし続けている。生かす (本物の netif + ブロックする
+セマフォ) か消すかの決断が要る。
+
+なお、ネットワークスタックは現在\textbf{ 4 系統が並存}している:
+\texttt{system/net\_responder.c} (ARP+ICMP)、\texttt{system/dhcp\_client.c}、
+\texttt{system/tcp\_server.c}、\texttt{device/wifi/wifi.c:1238-2100}
+(ARP+ICMP+DHCP+DNS+NTP+TCP+AODV を独自に再実装)。
+
+\subsection{(12) スタックガードが皆無}
+
+カナリアも guard page も高水位マークもない。一方 IRQ エントリは\textbf{ 768 バイトのフレーム}
+(GPR 31 本 + q0-q31 全部、\texttt{system/exception\_vectors.S:97-131}) を割り込まれた
+プロセスのスタックに積み、\texttt{proc\_create} は 1024 バイトのスタックを受け付ける
+(\texttt{proc.c:192})。NULLPROC に至っては \texttt{sp = \_start = 0x80000} で下方向に
+firmware spin table へ伸びる、長さ未知のスタックである。
+
+\subsection{(13) 2\,GB のうち 1\,GB が使えない}
+
+\texttt{HEAP\_END=0x40000000} が \texttt{compile/Makefile:90} にハードコードされ、しかも
+\texttt{0x40000000-0x7FFFFFFF} (実 DRAM) を\textbf{ Device-nGnRnE でマップ}しているので
+(\texttt{system/mmu.c:221-228}) 触ることすらできない。mailbox の
+\texttt{GET\_ARM\_MEMORY} か、既にパース済みの DTB \texttt{/memory} から取るべき。
+
+\subsection{(14) TCP に再送も分割もない}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{再送なし}。\texttt{struct tcp\_conn} に RTO タイマもタイマフィールドもない。
+\item \textbf{ウィンドウなし}。送出ウィンドウは \texttt{0x2000} 固定、相手の広告ウィンドウは
+      読まない。
+\item \textbf{順序外の再組み立てなし}。\texttt{seq == peer\_seq} のときだけ追記し、他は
+      黙って捨てる。
+\item \textbf{分割なし}。\texttt{tcp\_send()} は 1 フレーム超を拒否するのに、
+      \texttt{tcp\_app\_flush()} は最大 16384 バイトを 1 回で渡す。\textbf{約 1464\,B を
+      超える HTTP 応答は丸ごと落ちる}のに \texttt{g\_app\_served++} は回り FIN も出るので、
+      クライアントには「0 バイトの正常終了」に見える。
+\item \textbf{ISN が \texttt{0xDEADBEEF} + 接続ごとに \texttt{0x100}} で完全に予測可能、
+      かつ ESTABLISHED で ACK のウィンドウ検査をしないので、経路外からの注入が容易。
+\end{itemize}
+
+\subsection{(15) GENET TX が 50\,ms のビジーループ}
+
+\texttt{genet\_tx\_frame()} (\texttt{device/genet/genet.c:902-952}) は
+\texttt{TDMA\_CONS\_INDEX} を最大 50\,ms ポーリングする。yield しない。ARP 応答も ICMP 応答も
+ACK も HTTP 応答もこのループを通る。256 個ある TX ディスクリプタのうち、常に 1 個しか
+使っていない。しかも送信バッファは \texttt{tx\_buf\_pool} 1 枚を全呼び出し元で共有し、
+各呼び出し元も自前の \texttt{tx\_frame[1518]} を持つので\textbf{パケットごとに 2 回コピー}
+している。
+
+加えて \texttt{genet\_rx\_poll()} は\textbf{ディスクリプタのエラー／status ビットも
+DMA\_OWN も SOP/EOP も検査せず}、\texttt{length} (12 ビット、最大 4095) を
+\texttt{RX\_BUF\_LENGTH}(2048) にクランプもしない。\texttt{CMD\_PROMISC} が常時 ON で、
+フィルタはソフトウェアの IP 比較のみ。
+
+\subsection{(16) DHCP が飾り}
+
+\texttt{dhcp\_client.c:340-352} は BOUND まで到達してリースをログに出すが、
+\texttt{tcp\_set\_ip()} の呼び出し元がゼロで、\texttt{net\_responder.c} には IP セッタすら
+存在しない。IP は \texttt{192.168.3.100} のハードコード。T1/T2 更新もリース失効も
+DECLINE/RELEASE もない。
+
+\subsection{(17) ユーザ空間が存在しない}
+
+全てが EL1 の単一アドレス空間で動く。\texttt{TCR.EPD1=1} で TTBR1 は無効
+(\texttt{system/mmu.c:240})、ASID なし、\texttt{SP\_EL0} 不使用、\textbf{\texttt{svc}
+命令はツリー内に 1 つもない}。シェルは 51 個の C 関数ポインタの線形探索
+(\texttt{shell/shell.c:926-978}) で、ハンドラはカーネル内部を直接呼ぶ。\texttt{cc/} が
+JIT したコードも EL1 特権のまま実行可能ヒープ上で走る。
+
+Tier 0 の (1)(5)(6)(12) が全て「EL0 がないことの緩和策」である以上、いずれ避けられない
+分岐点である。ただし \texttt{/mmio-write} や \texttt{/chainload} が\textbf{無認証で任意
+ハードウェア書き込み・任意コードロード}を提供している現状では、まずネットワーク面を締める
+ほうが先である。
+
+%======================================================================
+\section{Tier 2 --- ファイルシステムとエンジニアリング実践}
+
+\subsection{(18) FAT32 にキャッシュがなく、共有 static が無防備}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \texttt{fat32\_next\_cluster()} (\texttt{fs/fat32.c:96-107}) は\textbf{ 1 エントリ
+      ごとに 512 バイト読む}。N クラスタのファイルを辿るのに FAT 読みだけで N 回の SD アクセス。
+\item \texttt{fat\_find\_free()} (\texttt{:290-302}) はクラスタ 1 個試すごとに 1 セクタ読む
+      → 書き込みは O(クラスタ数$^2$)。
+\item \texttt{static unsigned char scratch[512]} (\texttt{:19}) を 5 つの関数が共有。
+      プリエンプティブなスケジューラの下で \texttt{sdmount} プロセス・\texttt{kexec\_tick}・
+      AVM ストリーミングから到達しうるが、\textbf{ロックは一切ない}。
+\item \textbf{一貫性の保証がない}。\texttt{fat32\_write\_file\_full} は新クラスタを確保する
+      \textbf{前に}旧チェーンを解放するので、途中で電源が落ちるとディレクトリエントリが
+      解放済みクラスタを指す。FSInfo も更新しないので、Linux/macOS でマウントすると空き容量が狂う。
+\item 削除・mkdir・truncate・rename・LFN なし。ルートディレクトリのみ (パス解決がない)。
+\end{itemize}
+
+\subsection{(19) VFS が抽象化になっていない}
+
+\texttt{include/vfs.h:22-32} は単一の具象 \texttt{vfs\_node\_t}。\texttt{file\_ops} の
+関数ポインタもマウントテーブルも inode もファイルディスクリプタも
+\texttt{open/close/seek} もない。\texttt{vfs\_write} は\textbf{オフセット引数を持たず}
+ファイル全体を置き換える。FAT32 は完全に別 API で、VFS には配管されていない。
+
+\subsection{(20) 自動テストが実質ゼロ}
+
+これが最大の構造的ギャップである。31k 行・195 コミットに対して:
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \texttt{make qemu-smoke} は出力を \texttt{tee} するだけで\textbf{何もアサートしない}。
+      \textbf{しかも現在リンクエラーでビルドすら通らない} (\texttt{sd\_last\_int} /
+      \texttt{xhci\_msd\_*} が未定義。\texttt{ccb6437} 時点で既に破綻)。
+\item \texttt{examples\_http/test.sh} は \texttt{192.168.3.100} 固定の curl 7 発、期待値比較なし。
+\item CI なし。\texttt{panic()} も \texttt{assert()} もない。\texttt{-Wall} のみ。
+\end{itemize}
+
+\texttt{fs/fat32.c} は read/write コールバックを受け取るので、FAT32 イメージファイルに
+対する\textbf{ホスト側テストが新しい抽象化なしで今すぐ書ける}。\texttt{fs/vfs.c} と
+\texttt{cc/} も同様。ここが投資効率の最も高い領域である。
+
+\subsection{(21) 重複と腐敗}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \texttt{str\_eq}/\texttt{puts\_dec}/\texttt{puts\_hex} の near-duplicate が約 21 箇所。
+\item アクターランタイムが 3 実装並存 (\texttt{system/actor.c} / \texttt{system/actorproc.c} /
+      \texttt{avm.c} 内蔵)。
+\item 陳腐化したコメント: \texttt{fat32.h:1}「read-only FAT32 reader」(write 実装済み)、
+      \texttt{proc.h:12}「No preemption yet」(実装済み)、\texttt{shell.c:966}「no scheduler yet」。
+\item デッドコード: \texttt{device/usb/dwc2.c}、\texttt{include/qemu\_repro\_src.h}、
+      \texttt{repro} コマンド、ビルドルールから参照されない \texttt{examples/} の 11 ファイル。
+\item \textbf{\texttt{make install\_pi4} は地雷}。\texttt{config.txt} を上書きして
+      \texttt{total\_mem=2048} を落とす。この事実は \texttt{NEXT\_SESSION\_PI4.md} にしか
+      書かれておらず、Makefile 自身は警告しない。
+\end{itemize}
+
+%======================================================================
+\section{推奨着手順序と進捗}
+
+\begin{center}\small
+\begin{longtable}{@{}c p{7.2cm} p{3.0cm} c c@{}}
+\toprule
+\textbf{順} & \textbf{内容} & \textbf{効果} & \textbf{工数} & \textbf{状態}\\ \midrule
+\endhead
+1  & (1)(2) ヒープ分割 + irq\_save                       & クリティカル            & 30 分   & ✅\\
+2  & (3)(4) パケット長検証 + half-open reap              & 情報漏洩 / DoS          & 半日    & ✅\\
+3  & (5) \texttt{node->data} NULL ガード                 & サイレント破壊の代表    & 半日    & ✅$^{*}$\\
+4  & (7) 優先度プリエンプション修正                      & RTOS の看板そのもの     & 1 時間  & ✅\\
+5  & (8) ready キュー O(1) + sleep 整列リスト            & アクター系の実測が動く  & 1--2 日 & ✅\\
+6  & (12) スタックカナリア                               & サイレント破壊の封じ込め& 半日    & ✅\\
+7  & (14) TCP 分割・再送・ウィンドウ                     & HTTP が 1.4\,KB で壊れない & 1 日 & ✅\\
+8  & ホストテスト基盤 + CI                               & 以降の全変更の安全網    & 半日    & ◐\\
+9  & (6) W\textasciicircum X 修正                        & \texttt{.data}/\texttt{.bss} が RWX & 半日 & ---\\
+10 & (10) genet/xhci の DMA 規律 → \texttt{DCACHE\_ON}   & \textbf{最大の性能改善} & 2--3 日 & ---\\
+11 & (15) GENET TX リング、50\,ms スピン除去             & スループット / レイテンシ & 1--2 日 & ---\\
+12 & (9) タイムベース、(13)(16) 2\,GB 開放・DHCP 適用、(11) \texttt{network/} の去就 & 中期 & 数日 & ---\\
+13 & (17) EL0/ユーザ空間分離、SVC 境界                   & OS としての次の段階     & 大      & ---\\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\vspace{-0.6em}
+{\small $^{*}$ \texttt{/microsd} が空でマウント未成立のため実機未検証。}
+
+%======================================================================
+\section{第 1 次改良 --- Tier 0 の 5 件}
+
+コミット \texttt{e6973d5}。ビルド md5 \texttt{74d3ff7f} (修正前 \texttt{cfeeb18c})。
+
+\begin{center}\small
+\begin{tabular}{@{}c p{10.4cm} p{3.2cm}@{}}
+\toprule
+\textbf{\#} & \textbf{修正} & \textbf{ファイル}\\ \midrule
+1 & \texttt{MEM\_ALIGN} を 8 → \textbf{16} (= \texttt{sizeof(struct memblk)})。分割の余りは
+    0 か 16 以上にしかならず、\texttt{getmem} と \texttt{freemem} 双方のはみ出しが
+    \textbf{構造的に消える}。副次的に AArch64 が要求する 16 バイトスタックアラインメントも満たす
+  & \texttt{include/memory.h}\newline \texttt{mem/memory.c}\\
+2 & ヒープ操作を \texttt{irq\_save}/\texttt{irq\_restore} で保護 & \texttt{mem/memory.c}\\
+3 & ICMP と TCP の長さ検証。\texttt{total\_len}・\texttt{data\_off} を実受信長と照合
+  & \texttt{net\_responder.c}\newline \texttt{tcp\_server.c}\\
+4 & アイドル接続リーパー。half-open 5 秒 / ESTABLISHED 60 秒でスロット回収
+  & \texttt{tcp\_server.c}\newline \texttt{loader/main.c}\\
+5 & \texttt{cat}/\texttt{cp}/\texttt{mv} の \texttt{node->data} NULL ガード & \texttt{shell/fscmd.c}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{ホストテスト基盤の追加 --- \texttt{test/host/}}
+
+\begin{code}
+make -C test/host run
+\end{code}
+
+カーネルの純ロジックをビルドマシン上で直接走らせる枠組み。\texttt{mem/memory.c} をそのまま
+\texttt{\#include} し、\texttt{critical.h} だけホスト用スタブで差し替える。インクルード順で
+実カーネルヘッダを使うので、テストと本番が同じ定義を共有する。
+
+\textbf{この枠組みは実際に仕事をした}。目視では (1) の \texttt{getmem} 側しか見つけておらず、
+\texttt{freemem} 側の同型バグは 20000 回のランダム churn テストが検出した。歯があることの
+確認として、修正前のツリーに同じテストを掛けると\textbf{ 5 件 FAIL}、修正後は全 PASS になる。
+
+\subsection{実機検証結果}
+
+\begin{center}\small
+\begin{tabular}{@{}p{6.2cm} p{8.6cm}@{}}
+\toprule
+\textbf{項目} & \textbf{結果}\\ \midrule
+ICMP (リグレッション確認)   & \texttt{ping} 5/5 応答、パケットロス 0\,\%\\
+HTTP                        & \texttt{GET /}, \texttt{/ticks} 正常。\texttt{txfail=0}\\
+リーパーの誤検出            & 正常接続 10 本で \texttt{reaped=0}、\texttt{drop\_syn=0}\\
+\textbf{リーパーの DoS 解除}& アイドル接続でスロット占有 → \textbf{\texttt{reaped=3}}、全スロット LISTEN に復帰\\
+ヒープ                      & free 977733\,KiB、\textbf{free blocks = 1} (完全合体)\\
+\texttt{cat} ガード         & \textbf{未検証} (\texttt{/microsd} が空でマウント未成立)\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%======================================================================
+\section{第 2 次改良 --- Tier 1 の (7)(8)(12)(14)}
+
+コミット \texttt{ce106cc} (スケジューラ) と \texttt{256dbe9} (ネットワーク)。
+ビルド md5 \texttt{becaf060}。実機検証済み。
+
+\subsection{スケジューラ}
+
+\begin{center}\small
+\begin{tabular}{@{}p{7.4cm} p{7.4cm}@{}}
+\toprule
+\textbf{修正} & \textbf{実測}\\ \midrule
+(7) 走行中プロセスを pop の\textbf{前}に requeue し、自分の優先度を比較に参加させる。
+    同優先度のラウンドロビンも自然に得られる
+  & \texttt{/rtos-jitter} 10\,ms 周期・CPU hog 下で\newline
+    \textbf{max jitter 10\,µs / ミス 0/100}\newline
+    (協調モード: 5162\,µs / 46 ミス)、プリエンプション 1002 回発火\\
+(8) 優先度別 FIFO + 64\,bit ビットマップ (\texttt{CLZ} 1 発)、sleep は deadline 整列リスト
+  & SMP ベンチ劣化なし (dining 3.99×、primes 3.01×、n-queens 1.80×、\texttt{agree=yes})\\
+(12) \texttt{stkbase} にカナリア、全スイッチ点で検査、\texttt{/ticks} に \texttt{stkbad=}
+  & 全負荷試験を通して \texttt{stkbad=0}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+作業中に見つけた既存バグも同時に修正した:
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \texttt{shell.c} の \texttt{procdemo} が ready キューから外さずに \texttt{PR\_FREE} を
+      直書き (次のディスパッチが解放済みスタックへ ctxsw する)。
+\item \texttt{proc\_ready()} が \texttt{PR\_FREE}/\texttt{PR\_TERM} を受け付ける。
+\item \texttt{proc\_ready()} が \texttt{PR\_SLEEP} を sleep リストから外さずに ready へ入れる
+      (両リストが同じ \texttt{next} を共有)。
+\item \texttt{proc\_block}/\texttt{proc\_sleep\_us} が NULLPROC を自分の古い SP へ ctxsw しうる。
+\end{itemize}
+
+\texttt{test/host/proctest.c} を追加 (14 テスト)。\texttt{ctxsw} をスタブ化して実物の
+\texttt{proc.c} を走らせ、毎回ビットマップ／FIFO／カウント／sleep リストの不変条件を検査する。
+核心のテストは \texttt{ccb6437} の順序に対して FAIL する --- そこでは prio-50 のタスクが
+prio-5 の hog に叩き落とされ、実機と同じ挙動になる。
+
+\subsection{ネットワーク (14)}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{分割}: コネクションごとの送信バッファ + MSS 単位の \texttt{tcp\_pump()}。
+      FIN は全バイト ACK 後。実測 \texttt{GET /shell?cmd=help} が\textbf{ 2618 バイト =
+      Content-Length 2618} (従来は 0 バイト)、6 回連続で同一 md5、\texttt{retrans=0}。
+\item \textbf{再送}: RTO 500\,ms の go-back-N、6 回で打ち切り。相手の広告ウィンドウを尊重。
+      net プロセスは RX 割り込みでしか起きないため、wm ループが \texttt{tcp\_needs\_tick()}
+      で必要時のみ起こす (送信は \texttt{tx\_frame} 共有のため net プロセスに一本化)。
+\item \textbf{\texttt{http\_build} の \texttt{max} 無視}: \texttt{body[16384]} + ヘッダを
+      \texttt{out[16384]} に書いて約 120 バイト BSS を溢れさせていた。
+\end{itemize}
+
+\subsection{\texttt{/chainload} が箱を落としていた真因}
+
+\textbf{ステージングアドレス \texttt{0x4000000} が、走行中カーネル自身の \texttt{.bss} の
+内側にあった。}
+
+\begin{code}
+ステージング先   0x4000000 = 67,108,864
+カーネル _end    0x4233B18 = 69,286,168   <- 2.08 MB 上
+\end{code}
+
+アップロードの全域が生きたカーネル状態を上書きするため、\texttt{go=1} を撃つ前、
+\textbf{転送中に必ず死ぬ}。本セッション中に 2 回落とした。チェーンロード実装当時カーネルは
+約 115\,KB で、\texttt{.bss} が 69\,MB に育つ過程で固定アドレスが飲み込まれた\textbf{設計の
+腐食}である。README とマニュアルはこれを「SD 交換不要の安全な高速反復パス」と謳い続けていた。
+
+修正: ヒープから確保 (必ず \texttt{\_end} より上)、オフセットの境界検査、\texttt{go=1} 時に
+走行中イメージと重なるステージングを拒否。\texttt{system/kexec.c:108} が既にヒープバッファを
+\texttt{kernel\_chainload()} に渡しており、実績のあるパターンだった。
+
+\textbf{実測: 2,008,152 バイトを 23.1 秒で転送、全 123 チャンク ACK、ステージした
+カーネルが起動。}これで実機検証が SD カードの往復なしで回せるようになった。
+
+\subsection{決着した懸案 --- \texttt{/preempt} は既存の壊れ}
+
+\texttt{/preempt} が空ログを返し \texttt{cpuA}/\texttt{cpuB} が居残る件は、修理した
+チェーンロードで旧カーネル (\texttt{ccb6437}) を RAM 起動して A/B した結果、
+\textbf{旧カーネルでも同じ}と確認できた (ログは \texttt{BA} / \texttt{B} / \texttt{AB} / 空と
+毎回変動、期待値 20 文字。子プロセスは呼ぶたび 2 個ずつ蓄積)。スケジューラ変更による
+回帰ではない。
+
+原因は \texttt{preempt\_demo} 自身のコメントが書いている前提 ---「shell/NULLPROC
+コンテキストから実行する」。HTTP 経由だと app ワーカー (prio 1) が呼び出し元になり、
+子と同格なのでラウンドロビンで先に戻ってしまう。NULLPROC は ready キューに載らないので
+シリアルシェルからなら意図どおり動くはず。\texttt{procdemo} が途中で戻るのと同じ構図
+(こちらはホスト側で新旧のディスパッチ順が同一と実証済み)。
+
+%======================================================================
+\section{未解決の課題}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=3pt]
+\item \textbf{\texttt{/microsd} と \texttt{/sd} が空}。SD の FAT32 列挙が成立していない。
+      (5) の検証を阻んでおり、FAT32 経路が実機で一切テストできない。\textbf{次の本命}。
+\item \texttt{make qemu} / \texttt{qemu-smoke} がリンクしない (\texttt{sd\_last\_int}、
+      \texttt{xhci\_msd\_*} が未定義)。\texttt{ccb6437} 時点で既に破綻していた。
+\item 残る優先課題は表の 9--13 --- W\textasciicircum X、DMA キャッシュ規律 →
+      \texttt{DCACHE\_ON}、GENET TX リング、そして EL0 分離。
+\end{itemize}
+
+\vfill
+{\small\itshape 本書は \texttt{docs/OS\_ASSESSMENT\_JA.md} の LaTeX 清書版である。
+数値はすべて実機 (Raspberry Pi 4 / 192.168.3.100) での測定値。}
+
+\end{document}
