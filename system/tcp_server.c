@@ -834,12 +834,8 @@ static volatile unsigned long g_jit_chunk_us;
 
 static void jit_hog(void)
 {
-    /* A newly-dispatched proc inherits the dispatcher's masked-IRQ state (the
-     * ctxsw happens inside proc_resched's irq_save critical section) and, being
-     * a tight compute loop, never restores it — so the timer can't preempt it.
-     * Explicitly enable IRQs so preemption works.  (The general fix belongs in
-     * proc dispatch; this proves the mechanism.) */
-    __asm__ volatile ("msr daifclr, #2" ::: "memory");
+    /* IRQs are enabled at entry by proc_entry_trampoline (ctxsw.S), so the timer
+     * can preempt this tight compute loop. */
     volatile unsigned x = 2463534242u;
     while (g_jit_hog_run) {
         unsigned long s = now_us();
@@ -853,7 +849,7 @@ static void jit_hog(void)
 
 static void jit_measure(void)
 {
-    __asm__ volatile ("msr daifclr, #2" ::: "memory");   /* run with IRQs enabled */
+    /* IRQs enabled at entry by proc_entry_trampoline (ctxsw.S). */
     /* RELATIVE schedule: each release is measured `target` after the ACTUAL
      * previous wake, so a late wake never triggers a catch-up burst — the next
      * period simply starts from where we actually woke.  Accumulate in locals

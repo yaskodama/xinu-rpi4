@@ -232,10 +232,11 @@ int proc_create_arg(proc_entry_t entry, unsigned long stksize, const char *name,
      * 20 quadwords = 160 bytes, keeping the 16-byte SP alignment.
      * Initial FP regs are zeroed — fresh process has no meaningful
      * FP state. */
+    extern void proc_entry_trampoline(void);   /* ctxsw.S: enables IRQs then br x19 */
     unsigned long *sp_top = (unsigned long *)((unsigned char *)stk + stksize);
     unsigned long *sp     = sp_top - 20;
-    sp[0]  = 0;                          /* x29 (FP)            */
-    sp[1]  = (unsigned long)entry;       /* x30 (LR -> entry)   */
+    sp[0]  = 0;                          /* x29 (FP)                                */
+    sp[1]  = (unsigned long)proc_entry_trampoline;  /* x30 (LR): enable IRQs, br x19 */
     sp[2]  = 0; sp[3]  = 0;              /* d14, d15            */
     sp[4]  = 0; sp[5]  = 0;              /* d12, d13            */
     sp[6]  = 0; sp[7]  = 0;              /* d10, d11            */
@@ -244,7 +245,8 @@ int proc_create_arg(proc_entry_t entry, unsigned long stksize, const char *name,
     sp[12] = 0; sp[13] = 0;              /* x25, x26            */
     sp[14] = 0; sp[15] = 0;              /* x23, x24            */
     sp[16] = 0; sp[17] = 0;              /* x21, x22            */
-    sp[18] = 0; sp[19] = 0;              /* x19, x20            */
+    sp[18] = (unsigned long)entry;       /* x19 -> trampoline br target (entry) */
+    sp[19] = 0;                          /* x20                 */
     p->sp = (void *)sp;
 
     ready_push(p);
