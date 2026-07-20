@@ -808,6 +808,86 @@ static unsigned long now_us(void)
     return (ct * 1000000UL) / hz;
 }
 
+/* ---- RTOS gap harness: periodic-task release jitter on a COOPERATIVE kernel.
+ * rpi4 is cooperative (round-robin preemption off by default), so a periodic
+ * task only runs when other tasks yield.  A CPU-bound "hog" yields every
+ * chunk_us us; the periodic task's release therefore slips by up to one chunk
+ * — the cooperative gap.  Contrast rpi3 (preemptive priority): <60 us jitter
+ * regardless of load.  Runs in the `net` proc, so proc_yield here is safe. */
+extern int  proc_create(void (*)(void), unsigned long, const char *);
+extern void proc_ready(int);
+extern void proc_yield(void);
+extern void proc_exit(void);
+
+struct jit_stat {
+    volatile int  done;
+    unsigned long target_us, n, min_us, max_us, sum_us, max_abs_jit_us, misses;
+    long          max_late_us, min_early_us;
+};
+static struct jit_stat      g_jit;
+static volatile int         g_jit_hog_run;
+static volatile unsigned long g_jit_chunk_us;
+
+static void jit_hog(void)
+{
+    volatile unsigned x = 2463534242u;
+    while (g_jit_hog_run) {
+        unsigned long s = now_us();
+        while (now_us() - s < g_jit_chunk_us) {
+            int i; for (i = 0; i < 64; i++) x ^= x << 13, x ^= x >> 17, x ^= x << 5;
+        }
+        proc_yield();                     /* cooperative: give up the CPU */
+    }
+    proc_exit();
+}
+
+static void jit_measure(void)
+{
+    /* RELATIVE schedule: each release is measured `target` after the ACTUAL
+     * previous wake, so a late wake never triggers a catch-up burst — the next
+     * period simply starts from where we actually woke.  Accumulate in locals
+     * and publish once, so a reader never sees a half-updated struct. */
+    unsigned long target = g_jit.target_us, N = g_jit.n;
+    unsigned long mn = 0xffffffffUL, mx = 0, sum = 0, mj = 0, miss = 0;
+    unsigned long prev = now_us(), i;
+    for (i = 0; i < N; i++) {
+        unsigned long rel = prev + target;          /* wanted release time */
+        while (now_us() < rel) proc_yield();         /* wait, yielding to others */
+        unsigned long t = now_us(), d = t - prev;    /* actual period (>= target) */
+        prev = t;
+        if (d < mn) mn = d;
+        if (d > mx) mx = d;
+        sum += d;
+        unsigned long jit = (d > target) ? (d - target) : (target - d);
+        if (jit > mj) mj = jit;
+        if (jit > target / 2UL) miss++;
+    }
+    g_jit.min_us = mn; g_jit.max_us = mx; g_jit.sum_us = sum;
+    g_jit.max_abs_jit_us = mj; g_jit.misses = miss; g_jit.n = N;
+    g_jit_hog_run = 0;                     /* release the hog */
+    g_jit.done = 1;
+    proc_exit();
+}
+
+static void jit_run(unsigned long period_ms, unsigned long samples,
+                    int with_hog, unsigned long chunk_us)
+{
+    g_jit.done = 0; g_jit.target_us = period_ms * 1000UL; g_jit.n = samples;
+    if (with_hog) {
+        g_jit_hog_run = 1; g_jit_chunk_us = chunk_us;
+        int hp = proc_create(jit_hog, 8192, "jit_hog");
+        if (hp > 0) proc_ready(hp);
+    }
+    int mp = proc_create(jit_measure, 8192, "jit_meas");
+    if (mp <= 0) { g_jit.done = 1; g_jit_hog_run = 0; return; }
+    proc_ready(mp);
+    unsigned long guard = 0,
+        budget = samples * (period_ms + chunk_us / 1000UL + 2UL) + 8000UL;
+    while (!g_jit.done && guard++ < budget) proc_yield();
+    g_jit_hog_run = 0;
+    { int k; for (k = 0; k < 128; k++) proc_yield(); }   /* let the hog exit */
+}
+
 /* Value of the Content-Length header (case-insensitive), or -1. */
 static int content_length(const char *s)
 {
@@ -1239,6 +1319,34 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, " solutions="); bl = s_putdec(body, bl, sol);
         bl = s_put(body, bl, " ms="); bl = s_putdec(body, bl, (long)(t1 - t0));
         bl = s_put(body, bl, " cores="); bl = s_putdec(body, bl, (long)online);
+        bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "GET /rtos-jitter")) {
+        /* Cooperative-scheduler jitter gap: a periodic task's release slips by
+         * up to one hog chunk (it only runs when the hog yields).  With
+         * preempt=1 the 100 Hz round-robin tick bounds the slip to ~10 ms.
+         *   curl '.../rtos-jitter?period_ms=10&samples=100&chunk_us=5000&preempt=0' */
+        ctype = "text/plain";
+        int P  = q_int(req, "period_ms", 10);  if (P < 1) P = 1;  if (P > 1000) P = 1000;
+        int NS = q_int(req, "samples", 100);   if (NS < 1) NS = 1; if (NS > 2000) NS = 2000;
+        int C  = q_int(req, "chunk_us", 5000); if (C < 0) C = 0;  if (C > 100000) C = 100000;
+        int pe = q_int(req, "preempt", 0);
+        proc_set_preempt(pe ? 1 : 0);
+        jit_run(P, NS, 0, 0);               struct jit_stat a = g_jit;   /* idle   */
+        jit_run(P, NS, 1, (unsigned long)C); struct jit_stat b = g_jit;  /* + hog  */
+        proc_set_preempt(0);
+        bl = s_put(body, bl, "rtos-jitter (rpi4 cooperative) period_ms="); bl = s_putdec(body, bl, P);
+        bl = s_put(body, bl, " samples=");      bl = s_putdec(body, bl, NS);
+        bl = s_put(body, bl, " hog_chunk_us="); bl = s_putdec(body, bl, C);
+        bl = s_put(body, bl, " preempt=");      bl = s_putdec(body, bl, pe);
+        bl = s_put(body, bl, " target_us=");    bl = s_putdec(body, bl, (long)a.target_us);
+        bl = s_put(body, bl, "\n[idle]   mean_us="); bl = s_putdec(body, bl, (long)(a.n ? a.sum_us / a.n : 0));
+        bl = s_put(body, bl, " max_us=");     bl = s_putdec(body, bl, (long)a.max_us);
+        bl = s_put(body, bl, " max_jit_us="); bl = s_putdec(body, bl, (long)a.max_abs_jit_us);
+        bl = s_put(body, bl, " misses=");     bl = s_putdec(body, bl, (long)a.misses);
+        bl = s_put(body, bl, "\n[loaded] mean_us="); bl = s_putdec(body, bl, (long)(b.n ? b.sum_us / b.n : 0));
+        bl = s_put(body, bl, " max_us=");     bl = s_putdec(body, bl, (long)b.max_us);
+        bl = s_put(body, bl, " max_jit_us="); bl = s_putdec(body, bl, (long)b.max_abs_jit_us);
+        bl = s_put(body, bl, " misses=");     bl = s_putdec(body, bl, (long)b.misses);
         bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "GET /preempt") || starts_with(req, "POST /preempt")) {
         /* Demo: 2 CPU-bound procs time-sliced by the timer.  Cooperative ->
