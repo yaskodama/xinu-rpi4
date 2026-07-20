@@ -1,3 +1,4 @@
 # Host test binaries (built by `make -C test/host run`)
 memtest
+proctest
 *.dSYM/

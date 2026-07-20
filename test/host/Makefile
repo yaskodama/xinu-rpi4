@@ -15,13 +15,17 @@ CC      ?= cc
 CFLAGS  ?= -O1 -g -Wall -Wextra -Wshadow -fno-strict-aliasing
 INCS     = -I. -I../../include
 
-TESTS    = memtest
+TESTS    = memtest proctest
 
 .PHONY: all run clean
 all: $(TESTS)
 
 memtest: memtest.c ../../mem/memory.c ../../include/memory.h critical.h
 	$(CC) $(CFLAGS) $(INCS) -o $@ memtest.c
+
+proctest: proctest.c ../../system/proc.c ../../mem/memory.c \
+          ../../include/proc.h ../../include/memory.h critical.h
+	$(CC) $(CFLAGS) $(INCS) -o $@ proctest.c
 
 run: $(TESTS)
 	@rc=0; \

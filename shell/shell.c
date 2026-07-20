@@ -492,7 +492,12 @@ static int cmd_procdemo(int argc, char **argv)
     q = proc_create(procdemo_pong_entry, PROCDEMO_STK, "pong-proc");
     if (q < 0) {
         uart_puts("procdemo: proc_create(pong) failed\n");
-        proctab[p].state = PR_FREE;
+        /* proc_kill, not a bare state write: `p` is already PR_READY and
+         * therefore sitting in a ready FIFO.  Marking the slot free without
+         * dequeuing leaves a node whose state says PR_FREE on the run queue,
+         * and the next dispatch ctxsw's into a stack that has been handed
+         * back to the heap.  proc_kill unlinks it and frees the stack. */
+        proc_kill(p);
         return 1;
     }
 

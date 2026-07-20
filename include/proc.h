@@ -1,4 +1,4 @@
-// kernel/proc.h — cooperative process / scheduler interface.
+// kernel/proc.h — process / scheduler interface.
 //
 // Mirrors classic Embedded Xinu:
 //   - proctab[] holds each process's state, priority, name, stack
@@ -9,9 +9,19 @@
 //   - resched() is the dispatcher; user code normally calls
 //     proc_yield() (resched) or proc_exit() (resched + free slot).
 //
-// No preemption yet — phase S1 will add the generic timer + GIC
-// IRQ that drives `resched()` from a clock tick.  For now, every
-// context switch is voluntary.
+// Scheduling is preemptive fixed-priority (proc_set_preempt) over a
+// generic-timer one-shot, with round-robin among equal priorities:
+//   - Ready processes live in per-priority FIFOs indexed by a 64-bit
+//     bitmap, so dispatch is O(1) (a CLZ) rather than a list walk.
+//     This matters here: NPROC is 2048, the actor workload keeps ~1300
+//     ready, and the D-cache is off, so every link traversal is a DRAM
+//     round trip.
+//   - The running process is requeued BEFORE the next one is picked, so
+//     its own priority participates in the comparison.  Without that a
+//     tick hands the CPU to a lower-priority task (which is what made
+//     "priority preemption" behave as plain round-robin).
+//   - Sleepers live on a list sorted by deadline, so the timer ISR looks
+//     at the head instead of scanning all NPROC entries twice.
 
 #ifndef XINU_RPI4_PROC_H
 #define XINU_RPI4_PROC_H
@@ -44,6 +54,17 @@ enum proc_state {
 
 typedef void (*proc_entry_t)(void);
 
+/* Scheduling priorities are clamped to [0, PROC_PRIO_MAX] because the ready
+ * bitmap is one 64-bit word.  0 is NULLPROC's; 1 is the default; the RT
+ * harness uses 50. */
+#define PROC_PRIO_MAX       63
+#define PROC_DEFAULT_PRIO 1
+
+/* Written at stkbase (the LOWEST address of a process stack, i.e. the far
+ * end from where SP starts) so an overflow destroys it.  Checked at every
+ * context-switch point.  Cheap: one load and compare per switch. */
+#define PROC_STK_CANARY 0xC0DEFEEDDEADBEEFUL
+
 struct procent {
     enum proc_state state;
     int             prio;
@@ -52,7 +73,13 @@ struct procent {
     void           *sp;             /* saved kernel SP            */
     void           *arg;            /* opaque per-process argument */
     char            name[PROC_NAME_LEN];
-    struct procent *next;           /* ready-list link            */
+    /* Queue links.  While PR_READY these thread the per-priority ready
+     * FIFO (doubly linked so proc_kill can unlink in O(1)); while
+     * PR_SLEEP `next` threads the deadline-sorted sleep list.  A process
+     * is never on both. */
+    struct procent *next;
+    struct procent *prev;
+    int             qprio;          /* priority this was queued AT      */
     unsigned long   wake_at_us;     /* PR_SLEEP: CNTPCT-us release time */
 };
 
@@ -94,6 +121,18 @@ void proc_actor_pump_leave(void);
 /* Live runtime accessors (read by the HDMI runtime monitor). */
 int           proc_preempt_on(void);
 unsigned long proc_ctxsw_count(void);
+/* Stack-overflow detection: how many times a process was found with its
+ * canary destroyed, and who it was last time.  A non-zero count means some
+ * process ran off the bottom of its stack into the neighbouring heap block
+ * — the damage is already done, but this makes it visible instead of
+ * silent.  Remember the IRQ frame alone is 768 bytes. */
+unsigned long proc_stk_bad_count(void);
+int           proc_stk_bad_pid(void);
+const char   *proc_stk_bad_name(void);
+/* Ready-queue depth (diagnostic): total ready processes, and the highest
+ * priority currently runnable (-1 if none). */
+int proc_ready_count(void);
+int proc_ready_top_prio(void);
 /* Block the current process (removes it from CURR; resched won't re-ready
  * it) until proc_ready() puts it back.  Used by mailbox receive. */
 void proc_block(void);

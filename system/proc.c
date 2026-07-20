@@ -83,8 +83,31 @@ volatile int           g_lock_stuck_by;           /* pid that gave up waiting   
 int proc_aipl_owner(void) { return g_aipl_owner; }
 int proc_aipl_depth(void) { return g_aipl_depth; }
 
-static struct procent *ready_head;
-static struct procent *ready_tail;
+/* ---------------- Ready queue: per-priority FIFO + bitmap ----------------
+ *
+ * rq_head/rq_tail[p] is the FIFO of ready processes at priority p, and bit p
+ * of rq_bitmap is set exactly when that FIFO is non-empty.  Dispatch is then
+ * "highest set bit" = one CLZ, and enqueue/dequeue/remove are all O(1).
+ *
+ * The previous implementation was a single list walked linearly on every
+ * dispatch.  With NPROC=2048, ~1300 ready actors under the N-Queens workload,
+ * and SCTLR.C=0 (D-cache deliberately off, see include/smp.h), that walk was
+ * ~1300 DRAM round trips per context switch.
+ *
+ * Queue links live in procent.next/prev, and qprio records the priority the
+ * process was *inserted at* so a proc_setprio() between enqueue and removal
+ * cannot make us unlink from the wrong FIFO. */
+static struct procent *rq_head[PROC_PRIO_MAX + 1];
+static struct procent *rq_tail[PROC_PRIO_MAX + 1];
+static unsigned long long rq_bitmap;
+static int rq_count;                     /* diagnostic only */
+
+static int prio_clamp(int prio)
+{
+    if (prio < 0)        return 0;
+    if (prio > PROC_PRIO_MAX) return PROC_PRIO_MAX;
+    return prio;
+}
 
 static void copy_name(char *dst, const char *src)
 {
@@ -95,34 +118,46 @@ static void copy_name(char *dst, const char *src)
 
 static void ready_push(struct procent *p)
 {
-    p->next = 0;
-    if (ready_head == 0) {
-        ready_head = ready_tail = p;
-    } else {
-        ready_tail->next = p;
-        ready_tail = p;
-    }
+    int q = prio_clamp(p->prio);
+    p->qprio = q;
+    p->next  = 0;
+    p->prev  = rq_tail[q];
+    if (rq_tail[q]) rq_tail[q]->next = p;
+    else            rq_head[q]       = p;
+    rq_tail[q] = p;
+    rq_bitmap |= 1ULL << q;
+    rq_count++;
 }
 
+/* Unlink a node from its FIFO.  Caller guarantees it is queued. */
+static void rq_unlink(struct procent *p)
+{
+    int q = p->qprio;
+    if (p->prev) p->prev->next = p->next;
+    else         rq_head[q]    = p->next;
+    if (p->next) p->next->prev = p->prev;
+    else         rq_tail[q]    = p->prev;
+    if (rq_head[q] == 0) rq_bitmap &= ~(1ULL << q);
+    p->next = p->prev = 0;
+    rq_count--;
+}
+
+/* Highest-priority ready process, FIFO among equals.  0 if none. */
 static struct procent *ready_pop(void)
 {
-    if (ready_head == 0) return 0;
-    /* Priority-ordered dispatch (rpi3-style): return the highest-prio ready
-     * process; ties keep FIFO order (first of the highest prio) for fairness.
-     * O(n) over a short ready list.  This is what makes proc->prio actually
-     * govern who runs — the previous cut was plain FIFO. */
-    struct procent *best = ready_head, *bestprev = 0;
-    struct procent *prev = ready_head, *curr = ready_head->next;
-    while (curr) {
-        if (curr->prio > best->prio) { best = curr; bestprev = prev; }
-        prev = curr; curr = curr->next;
-    }
-    if (bestprev) bestprev->next = best->next;
-    else          ready_head = best->next;
-    if (ready_tail == best) ready_tail = bestprev;
-    best->next = 0;
-    if (best->prio >= 40) g_dbg_hi_dispatch++;   /* RT proc actually dispatched */
+    if (rq_bitmap == 0) return 0;
+    int q = 63 - __builtin_clzll(rq_bitmap);
+    struct procent *best = rq_head[q];
+    rq_unlink(best);
+    if (q >= 40) g_dbg_hi_dispatch++;      /* RT proc actually dispatched */
     return best;
+}
+
+/* Priority of the best ready process, or -1 when nothing is ready. */
+static int ready_best_prio(void)
+{
+    if (rq_bitmap == 0) return -1;
+    return 63 - __builtin_clzll(rq_bitmap);
 }
 
 /* Unlink `target` from the ready list if present.  A killed process MUST
@@ -133,12 +168,41 @@ static struct procent *ready_pop(void)
  * frame the process has already overwritten (return address = garbage). */
 static void ready_remove(struct procent *target)
 {
-    struct procent *prev = 0, *curr = ready_head;
+    if (target->state != PR_READY) return;   /* not queued */
+    rq_unlink(target);
+}
+
+int proc_ready_count(void)    { return rq_count; }
+int proc_ready_top_prio(void) { return ready_best_prio(); }
+
+/* ---------------- Sleep queue: sorted by deadline ------------------------
+ *
+ * Sleepers hang off sleep_head in ascending wake_at_us order, threaded
+ * through procent.next (a process is never on the ready list and the sleep
+ * list at the same time).  The timer ISR then reads the head instead of
+ * scanning all NPROC entries — twice, which is what proc_next_delay_us() and
+ * proc_timer_tick() used to do on every one-shot fire, at up to 5 kHz. */
+static struct procent *sleep_head;
+
+static void sleep_insert(struct procent *p)
+{
+    struct procent *prev = 0, *curr = sleep_head;
+    while (curr && curr->wake_at_us <= p->wake_at_us) {
+        prev = curr;
+        curr = curr->next;
+    }
+    p->next = curr;
+    if (prev) prev->next = p;
+    else      sleep_head = p;
+}
+
+static void sleep_remove(struct procent *p)
+{
+    struct procent *prev = 0, *curr = sleep_head;
     while (curr) {
-        if (curr == target) {
+        if (curr == p) {
             if (prev) prev->next = curr->next;
-            else      ready_head = curr->next;
-            if (ready_tail == curr) ready_tail = prev;
+            else      sleep_head = curr->next;
             curr->next = 0;
             return;
         }
@@ -147,17 +211,51 @@ static void ready_remove(struct procent *target)
     }
 }
 
+/* ---------------- Stack canary ------------------------------------------ */
+static volatile unsigned long g_stk_bad;
+static volatile int           g_stk_bad_pid = -1;
+static char                   g_stk_bad_name[PROC_NAME_LEN];
+
+unsigned long proc_stk_bad_count(void) { return g_stk_bad; }
+int           proc_stk_bad_pid(void)   { return g_stk_bad_pid; }
+const char   *proc_stk_bad_name(void)  { return g_stk_bad_name; }
+
+/* Verify a process has not run off the bottom of its stack.  NULLPROC has no
+ * allocated stack (it inherits boot.S's), so it is skipped — see the note in
+ * proc_init.  Called at every switch point; one uncached load. */
+static void stk_check(struct procent *p)
+{
+    if (p->stkbase == 0) return;
+    if (*(volatile unsigned long *)p->stkbase == PROC_STK_CANARY) return;
+    g_stk_bad++;
+    g_stk_bad_pid = (int)(p - proctab);
+    copy_name(g_stk_bad_name, p->name);
+    /* Re-arm so one overflowing process doesn't count on every switch;
+     * the counter records that it happened at least once. */
+    *(volatile unsigned long *)p->stkbase = PROC_STK_CANARY;
+}
+
 void proc_init(void)
 {
     int i;
     for (i = 0; i < NPROC; i++) {
         proctab[i].state = PR_FREE;
         proctab[i].next  = 0;
+        proctab[i].prev  = 0;
+        proctab[i].qprio = 0;
     }
+    for (i = 0; i <= PROC_PRIO_MAX; i++) rq_head[i] = rq_tail[i] = 0;
+    rq_bitmap  = 0;
+    rq_count   = 0;
+    sleep_head = 0;
 
     /* NULLPROC = the live boot/shell context. We don't allocate a
      * stack for it (it inherits boot.S's stack at _start) and we
-     * leave .sp = 0 until the first ctxsw OUT writes the real SP. */
+     * leave .sp = 0 until the first ctxsw OUT writes the real SP.
+     * That also means it gets no canary: its stack starts at _start
+     * (0x80000) and grows down into the firmware spin table with no
+     * known bound.  Giving NULLPROC a real bounded stack is a separate
+     * change (see docs/OS_ASSESSMENT_JA.md). */
     struct procent *p = &proctab[NULLPROC];
     p->state   = PR_CURR;
     p->prio    = 0;
@@ -166,7 +264,6 @@ void proc_init(void)
     p->sp      = 0;
     copy_name(p->name, "null/shell");
 
-    ready_head = ready_tail = 0;
     currpid    = NULLPROC;
 }
 
@@ -189,7 +286,12 @@ int proc_create_arg(proc_entry_t entry, unsigned long stksize, const char *name,
     int pid = alloc_slot();
     if (pid < 0) return -1;
 
-    if (stksize < 1024) stksize = 1024;
+    /* Minimum stack: the IRQ entry frame alone is 768 bytes (31 GPRs + all
+     * 32 q-registers, see exception_vectors.S), pushed onto whichever
+     * process was interrupted.  A 1 KB stack could not survive one IRQ plus
+     * a nested resched, so the floor is 2 KB and there is a canary at the
+     * base to catch what still overflows. */
+    if (stksize < 2048) stksize = 2048;
     stksize = ROUNDMB(stksize);
 
     /* If a previous occupant of this slot died via proc_exit (self-exit),
@@ -209,12 +311,16 @@ int proc_create_arg(proc_entry_t entry, unsigned long stksize, const char *name,
 
     struct procent *p = &proctab[pid];
     p->state   = PR_READY;
-    p->prio    = 1;
+    p->prio    = PROC_DEFAULT_PRIO;
     p->stkbase = stk;
     p->stklen  = stksize;
     p->arg     = arg;
     copy_name(p->name, name);
     p->next    = 0;
+    p->prev    = 0;
+
+    /* Canary at the lowest address of the stack — the end SP grows toward. */
+    *(volatile unsigned long *)stk = PROC_STK_CANARY;
 
     /* Lay out an initial saved-register frame at the top of the
      * stack, in the exact order ctxsw.S restores them:
@@ -268,34 +374,65 @@ void proc_ready(int pid)
      * drops an actor from scheduling and livelocks ap_run (the MultiAgent wedge:
      * app=WORKING, hb frozen, lock own=-1, sw still climbing). */
     if (p->state == PR_READY || p->state == PR_CURR) { irq_restore(d); return; }
+    /* A freed or exited slot must never be queued: ready_pop would hand back
+     * a PR_FREE entry whose stack has already been returned to the heap, and
+     * the next ctxsw would jump into reused memory. */
+    if (p->state == PR_FREE || p->state == PR_TERM) { irq_restore(d); return; }
+    /* Waking a timed sleeper early: take it off the deadline list first,
+     * otherwise it sits on both lists and the two sets of links collide. */
+    if (p->state == PR_SLEEP) sleep_remove(p);
     p->state = PR_READY;
     ready_push(p);
     irq_restore(d);
 }
 
-/* Pick the next ready process and ctxsw into it.  Returns once we
- * resume on the original stack.  If the ready list is empty, we
- * stay where we are (the no-op makes proc_yield() safe to call
- * unconditionally). */
+/* Pick the next process to run and ctxsw into it.  Returns once we resume on
+ * the original stack.  A no-op when nothing better is ready, which is what
+ * makes proc_yield() safe to call unconditionally.
+ *
+ * IMPORTANT — order of operations.  The running process is requeued BEFORE
+ * the next one is picked, so its own priority takes part in the comparison.
+ * The previous version popped first and pushed the runner back afterwards,
+ * so the runner never competed: a timer tick would hand a prio-50 RT task's
+ * CPU to a prio-5 hog.  That is why "priority preemption" measured as plain
+ * round-robin.  Pushing first also gives round-robin among equals for free —
+ * the runner goes to the tail of its own FIFO, so an equal-priority peer is
+ * picked ahead of it, while a strictly-lower-priority peer is not. */
 void proc_resched(void)
 {
     unsigned long d = irq_save();
-    struct procent *newp = ready_pop();
-    if (newp == 0) { irq_restore(d); return; }
 
-    int new_pid       = (int)(newp - proctab);
     struct procent *oldp = &proctab[currpid];
-    int old_pid       = currpid;
+    int old_pid          = currpid;
 
-    /* If the current proc is still runnable (and isn't the null
-     * proc — which never goes on the ready list), park it. */
+    stk_check(oldp);
+
+    /* NULLPROC never goes on the ready list (it is the fallback target), so
+     * it does not participate — anything ready outranks it. */
     if (oldp->state == PR_CURR && old_pid != NULLPROC) {
         oldp->state = PR_READY;
         ready_push(oldp);
     }
 
+    struct procent *newp = ready_pop();
+    if (newp == 0) {
+        /* Nothing ready at all — only reachable when we did not requeue,
+         * i.e. NULLPROC or an already-blocked caller. */
+        irq_restore(d);
+        return;
+    }
+
+    if (newp == oldp) {
+        /* We are still the best choice: stay put, no context switch.  This is
+         * the common case for a high-priority task that yields while only
+         * lower-priority work is pending. */
+        oldp->state = PR_CURR;
+        irq_restore(d);
+        return;
+    }
+
     newp->state = PR_CURR;
-    currpid     = new_pid;
+    currpid     = (int)(newp - proctab);
     g_ctxsw++;
 
     ctxsw(&oldp->sp, newp->sp);
@@ -321,7 +458,19 @@ static unsigned long proc_now_us(void)
 void proc_setprio(int pid, int prio)
 {
     if (pid < 0 || pid >= NPROC) return;
-    proctab[pid].prio = prio;
+    prio = prio_clamp(prio);
+    unsigned long d = irq_save();
+    struct procent *p = &proctab[pid];
+    if (p->state == PR_READY && p->qprio != prio) {
+        /* Already queued: move it to the FIFO for its new priority, or the
+         * bitmap and the new priority disagree and dispatch goes wrong. */
+        rq_unlink(p);
+        p->prio = prio;
+        ready_push(p);
+    } else {
+        p->prio = prio;
+    }
+    irq_restore(d);
 }
 
 /* Block the caller until `us` microseconds elapse.  Like proc_block(), but the
@@ -339,18 +488,21 @@ void proc_setprio(int pid, int prio)
  * net/NULL process into a total hang; the worst case is a survivable slowdown.
  * 200 us = <=5000 IRQ/s; far above the ~150-230 us periods we actually use. */
 #define PROC_TICK_MIN_US    200UL
+/* O(1): the sleep list is sorted, so the earliest deadline is the head.
+ * This used to scan all NPROC entries — and proc_timer_tick() scanned them
+ * again in the same ISR, so every one-shot fire cost ~4096 uncached probes
+ * at up to 5 kHz. */
 unsigned long proc_next_delay_us(void)
 {
-    unsigned long now = proc_now_us();
     unsigned long best = PROC_TICK_FLOOR_US;
-    int i;
-    for (i = 0; i < NPROC; i++) {
-        if (proctab[i].state == PR_SLEEP) {
-            unsigned long w = proctab[i].wake_at_us;
-            unsigned long dd = (w > now) ? (w - now) : 0;
-            if (dd < best) best = dd;
-        }
+    unsigned long d = irq_save();
+    if (sleep_head) {
+        unsigned long now = proc_now_us();
+        unsigned long w   = sleep_head->wake_at_us;
+        unsigned long dd  = (w > now) ? (w - now) : 0;
+        if (dd < best) best = dd;
     }
+    irq_restore(d);
     return best < PROC_TICK_MIN_US ? PROC_TICK_MIN_US : best;
 }
 
@@ -359,11 +511,24 @@ void proc_sleep_us(unsigned long us)
     extern void timer_arm_before_us(unsigned long);   /* tickless one-shot */
     unsigned long d = irq_save();
     struct procent *oldp = &proctab[currpid];
-    oldp->wake_at_us = proc_now_us() + us;
-    oldp->state = PR_SLEEP;
-    timer_arm_before_us(us);         /* fire precisely at this deadline if nearer */
+
+    stk_check(oldp);
+
     struct procent *newp = ready_pop();
     if (newp == 0) newp = &proctab[NULLPROC];
+    if (newp == oldp) {
+        /* Cannot happen for a PR_CURR process (it is not on the ready list),
+         * but a NULLPROC caller with an empty ready list would otherwise
+         * ctxsw into its own stale saved SP. */
+        irq_restore(d);
+        return;
+    }
+
+    oldp->wake_at_us = proc_now_us() + us;
+    oldp->state = PR_SLEEP;
+    sleep_insert(oldp);
+    timer_arm_before_us(us);         /* fire precisely at this deadline if nearer */
+
     newp->state = PR_CURR;
     currpid = (int)(newp - proctab);
     g_ctxsw++;
@@ -373,18 +538,21 @@ void proc_sleep_us(unsigned long us)
 
 /* Called from the timer IRQ handler (interrupts already masked): ready any
  * sleeper whose deadline has passed and request a reschedule so a woken
- * high-priority task runs immediately (via proc_preempt after EOI). */
+ * high-priority task runs immediately (via proc_preempt after EOI).
+ * O(number actually woken) — the list is deadline-sorted, so we stop at the
+ * first entry that is not due yet. */
 void proc_timer_tick(void)
 {
     unsigned long now = proc_now_us();
-    int woke = 0, i;
-    for (i = 0; i < NPROC; i++) {
-        if (proctab[i].state == PR_SLEEP && now >= proctab[i].wake_at_us) {
-            proctab[i].state = PR_READY;
-            ready_push(&proctab[i]);
-            g_dbg_tick_wakes++;
-            woke = 1;
-        }
+    int woke = 0;
+    while (sleep_head && now >= sleep_head->wake_at_us) {
+        struct procent *p = sleep_head;
+        sleep_head = p->next;
+        p->next  = 0;
+        p->state = PR_READY;
+        ready_push(p);
+        g_dbg_tick_wakes++;
+        woke = 1;
     }
     if (woke) g_resched_pending = 1;
 }
@@ -413,6 +581,7 @@ void proc_kill(int pid)
     struct procent *p = &proctab[pid];
     if (p->state == PR_FREE) { irq_restore(d); return; }
     ready_remove(p);                /* never leave a freed slot on the ready list */
+    if (p->state == PR_SLEEP) sleep_remove(p);   /* nor on the deadline list */
     /* If we're reaping a process that holds the AIPL heap lock (e.g. an actor
      * killed mid-handler by ap_killall), release it — otherwise the dead owner
      * makes every later vheap user spin-yield forever and the app worker (and
@@ -432,11 +601,20 @@ void proc_block(void)
 {
     unsigned long d = irq_save();
     struct procent *oldp = &proctab[currpid];
-    oldp->state = PR_WAIT;
+
+    stk_check(oldp);
 
     struct procent *newp = ready_pop();
     if (newp == 0) newp = &proctab[NULLPROC];
+    if (newp == oldp) {
+        /* NULLPROC blocking with an empty ready list: there is nothing to
+         * switch to and proc_ready() ignores pid 0, so parking here would be
+         * permanent — and the ctxsw would restore our own stale SP.  Refuse. */
+        irq_restore(d);
+        return;
+    }
 
+    oldp->state = PR_WAIT;
     newp->state = PR_CURR;
     currpid     = (int)(newp - proctab);
 
@@ -539,10 +717,13 @@ void aipl_force_release(void)
  * (or NULLPROC if none), and ctxsw away — never returns. */
 void proc_exit(void)
 {
-    irq_save();                 /* never returns -> no restore (eret in target unmasks) */
+    irq_save();                 /* never returns -> no restore (each resume site
+                                 * restores its own DAIF after ctxsw) */
     int me = currpid;
+    stk_check(&proctab[me]);
+    ready_remove(&proctab[me]); /* in case it was (re)queued — needs the state */
+    if (proctab[me].state == PR_SLEEP) sleep_remove(&proctab[me]);
     proctab[me].state = PR_FREE;
-    ready_remove(&proctab[me]); /* in case it was (re)queued */
 
     struct procent *newp = ready_pop();
     if (newp == 0) newp = &proctab[NULLPROC];
