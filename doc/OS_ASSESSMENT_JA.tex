@@ -622,20 +622,209 @@ N=8 = 1028\,ms} (N=4..7 は 611 / 607 / 622 / 685\,ms)。チェーンロード�
 (こちらはホスト側で新旧のディスパッチ順が同一と実証済み)。
 
 %======================================================================
+\section{第 3 次 --- 3 ボードメッシュと xinu-rpi5 への横展開}
+
+本アセスメントは Pi 4 のツリーに対して書かれたが、指摘の多くは Pi 5 (\texttt{xinu-rpi5},
+BCM2712 / Cortex-A76) にもそのまま残っていた。ここでは 2026-07-21 の作業を記録する。
+実施順は「3 ボードをメッシュに載せる」→「アセスメントに沿って rpi5 を改良する」である。
+
+\subsection{3 ボードメッシュの成立}
+
+メッシュの実体は WiFi ad-hoc (IBSS)、SSID \texttt{MANET}、ch 6、固定 BSSID
+\texttt{02:4d:41:4e:45:54}、静的 \texttt{10.0.0.<n>}、HELLO は UDP:5000 の 2 秒周期
+(\texttt{device/wifi/wifi.c})。開始時点では 3 台とも有線/AP 側では生きていたが、
+\textbf{メッシュには 1 ノードも載っていなかった}。
+
+\begin{center}\small
+\begin{longtable}{@{}l l p{7.4cm}@{}}
+\toprule
+\textbf{ボード} & \textbf{制御アドレス} & \textbf{開始時点の状態}\\ \midrule
+\endhead
+Pi 4 & 192.168.3.100 (有線)      & HELLO は動作 (\texttt{hello\_tx=952}) だが \texttt{rx=0 peers=0}。\texttt{wifi adhoc} 未実行で IBSS セルに入っていない\\
+Pi 3 & 192.168.3.50:8080 (USB eth) & SD 上のカーネルが HELLO 導入前ビルド。\texttt{/manet} が無い\\
+Pi 5 & 192.168.3.101 (RP1 有線)  & 走行中カーネルが古く \texttt{/manet} も \texttt{/shell} も無い\\
+\bottomrule
+\end{longtable}
+\end{center}
+
+Pi 3 は HEAD をビルドして SD に焼き直し (md5 \texttt{6c923e1e})、Pi 5 は USB スティックを
+書き換えた。各ノードで \texttt{wifi adhoc MANET 6 <n>} 相当を実行した結果、まず
+\textbf{Pi 4 --- Pi 3 --- Pi 5 の線形トポロジ}が成立した。Pi 3 は両者を見ていたが、
+Pi 4 と Pi 5 は互いに届かない。実測で裏を取っている:
+
+\begin{code}
+Pi5 -> 10.0.0.3 (Pi3)  ping rc=3   成功
+Pi5 -> 10.0.0.2 (Pi4)  ping rc=-1  失敗
+\end{code}
+
+Pi 3 が両方と通じている以上チャネル/BSSID の不一致ではなく、電波の届き方の問題である。
+その後ボードを再起動して入れ直したところ\textbf{完全メッシュ}になった
+(Pi 4 \texttt{peers=2 ids= 5 3}、Pi 3 \texttt{peers=2 ids= 2 5}、Pi 5 から両者へ ping 3/3)。
+設定は変えていないので、原因は設置・向きだったことになる。
+
+\textbf{記録すべき副作用}。疎通確認のつもりで叩いた \texttt{GET /wifi-adhoc}
+(パラメータ無し) が既定 \texttt{n=2} で\textbf{即座に実行}され、Pi 3 が Pi 4 と同じ
+\texttt{10.0.0.2} に入った。読み取り専用のつもりの URL が副作用を持つ設計だった。
+
+\subsection{Tier 0 の横展開 --- rpi5 にも全て残っていた}
+
+コミット \texttt{08128bf}。ビルド md5 \texttt{2a6a81ce}。
+
+\begin{center}\small
+\begin{longtable}{@{}c p{8.6cm} p{4.2cm}@{}}
+\toprule
+\textbf{項} & \textbf{rpi5 での状況} & \textbf{対応}\\ \midrule
+\endhead
+(1) & \texttt{ROUNDMB} が 8、ヘッダは 16 --- 同型 & \texttt{MEM\_ALIGN} 16 化\\
+(2) & critical section 皆無 & \texttt{irq\_save}/\texttt{irq\_restore}\\
+(3) & \texttt{total\_len} を実受信長と未照合。TCP は \texttt{data\_off} も未検証 & 実受信長 \texttt{len} と照合\\
+(4) & \textbf{Pi 4 より悪い}。接続スロットが単一で、SYN 1 発で HTTP が永久停止 & \texttt{last\_ms} + \texttt{tcp\_conn\_reap()}\\
+(20) & 自動テストゼロ & \texttt{test/host} を移植\\
+\bottomrule
+\end{longtable}
+\end{center}
+
+ホストテストは修正後は全 PASS、\texttt{MEM\_ALIGN} を 8 に戻した修正前の allocator に
+掛けると \textbf{5 件 FAIL} する。歯があることを確認済み。実機検証は ping 5/5、HTTP、
+JIT (0..999 の和 = 499500)、メッシュ復帰まで通った。
+
+\subsection{TCP 分割・再送 (14) と、そこで見つかった 2 つの別バグ}
+
+コミット \texttt{1d436da}。rpi5 の応答は \texttt{http\_resp[1400]} の 1 セグメント固定で、
+\texttt{/fb} には「1 セグメント (≤1464 B) しか送れないのでチャンクに割った」という
+コメントまで残っていた。Pi 4 の実装を単一接続モデルに合わせて移植したが、\textbf{移植した
+だけでは動かなかった}。検証で判明した 2 つは、いずれもアセスメントに載っていない。
+
+\textbf{half-close (CLOSE\_WAIT) が未実装}。相手の FIN は「もう送らない」の意味であって
+「もう受け取らない」ではない。しかし ESTABLISHED ハンドラは、送信途中の応答が残っていても
+即座に自分の FIN を返して接続を畳んでいた。リクエスト送信後に書き込み側を閉じるクライアント
+(\texttt{nc}、および HTTP/1.0 一般) では、転送が \textbf{in-flight 上限ちょうどの 5840 バイト}
+で切れる。さらにその FIN がシーケンス番号を 1 消費するため、相手は 5840 送出に対して 5841 を
+ACK する。結果 \texttt{snd\_una} が \texttt{snd\_nxt} を追い越し、ポンプの in-flight 計算が
+負になり、再送タイマのガードも誤成立して\textbf{両方が黙る}。停止時に \texttt{retrans=0} だった
+のはこのためである。
+
+\textbf{\texttt{FIN\_WAIT\_1} の閉じ条件}。ACK と FIN が同一セグメントに載っている場合しか
+LISTEN へ戻らなかった。実際のクライアントは別々に送るので、単一スロットは 60 秒のリーパーまで
+塞がったまま --- 事実上\textbf{1 分に 1 リクエスト}しか捌けない。両イベントを独立に追跡し、
+自分の FIN が ACK された時点でスロットを解放するようにした。
+
+診断が長引いた一因は自分のミスである。移植時にポンプの送信失敗カウントを落としており、
+\texttt{txfail=0} が「送信は成功している」と読めてしまった。最終的に、接続が閉じた後も
+直前の送信状態を読める \texttt{prev:}／\texttt{calls:} を \texttt{/tcpstat} に足して初めて
+\texttt{una=5841 > nxt=5840} が見え、原因が一意に決まった。
+
+\begin{center}\small
+\begin{longtable}{@{}l r r@{}}
+\toprule
+\textbf{測定} & \textbf{修正前} & \textbf{修正後}\\ \midrule
+\endhead
+1 応答の上限                          & 1400 B          & \textbf{8324 B} (実測、6 セグメント、retrans=0)\\
+サイズ掃引 1532/2132/4132/8324        & 1532 のみ       & \textbf{全て期待値と一致}\\
+8 KB 応答の連続リクエスト             & 1 分に 1 回     & \textbf{10/10 連続成功}\\
+8 KB 応答の所要時間 (curl)            & ---             & \textbf{54 ms}\\
+小応答 20 リクエスト                  & ---             & \textbf{1.2 s} (1 件 60 ms)\\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\subsection{\texttt{/chainload} --- 誤った断定と、その訂正}
+
+第 2 次改良で Pi 4 のチェーンロードを直したので、rpi5 でも同じ経路が使えると考えた。
+staging アドレスが \texttt{0x4000000} 固定で、これが走行中カーネルの \texttt{.bss}
+(\texttt{0x167000}--\texttt{0x43BA680}) の内側にあるという\textbf{同一の欠陥}も見つかり、
+Pi 4 と同じくヒープ確保に直した。
+
+しかしその後、チェーンロードするとボードがネットワークから消える現象が続いた。私はこれを
+「起動に失敗している」と判断し、セカンダリコアが上書きされる \texttt{.text} を実行し続けて
+いるという仮説を立てて \texttt{kernel\_chainload()} にコア退避 (PSCI \texttt{CPU\_OFF}) を
+実装した。外れた。次に EL2/EL1 の入り方を疑った。これも \texttt{boot.S} が
+\texttt{CurrentEL} を見ているので外れだった。
+
+\textbf{この判断が誤りだった}。ユーザに画面を確認してもらったところ、\textbf{HDMI には
+デスクトップが出ていた}。カーネルは正常に起動しており、死んでいたのは
+\textbf{RP1 PCIe / Cadence GEM の暖かい再初期化}だけである。Pi 5 の
+\texttt{192.168.3.101} は WiFi ではなく RP1 経由の有線であり
+(MAC は \texttt{device/genet/rp1eth.c:393} のハードコード)、それが唯一の遠隔経路なので、
+箱は死んだのではなく\textbf{黙っていた}。しかも \texttt{device/genet/rp1pcie.c:198--204} には、
+前のセッションが同じ問題に「skip if link already up」で対処を試み、
+\textit{never made networking survive a chainload} と失敗を記録していた。
+
+コミット \texttt{08128bf} のメッセージには「\texttt{/chainload} はこのボードでは全く動かない」
+「README の主張は誤り」と書いたが、\textbf{どちらも誤りである}。訂正はコミット
+\texttt{1d436da} に記載した。教訓は技術的なものではない --- \textbf{目の前にある観測手段
+(画面) を使わずに、ネットワークの沈黙だけから「死んだ」と結論した}ことである。
+
+\subsection{rpi5 では素直に移植できない項目}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=3pt]
+\item \textbf{(6) W\textasciicircum X}。rpi5 の MMU は低位 4 GB を \textbf{1 GiB ブロック}で
+      マップしている (\texttt{system/mmu.c:112--116})。カーネル \texttt{.text} も
+      \texttt{.data}/\texttt{.bss} もヒープも同一ブロック内で、\textbf{属性を分ける粒度が
+      存在しない}。さらに \texttt{cc/cc.c} の JIT は書いた領域をそのまま実行するため、
+      素朴に W\textasciicircum X を掛けると JIT が死ぬ。Pi 4 のような一行修正では済まない。
+\item \textbf{(13) 1 GB 制限}。Pi 4 と違い低位 4 GB は Normal でマップ済みで、
+      \texttt{HEAP\_END=0x40000000} が保守的に決め打ちされているだけ
+      (\texttt{compile/Makefile:109})。ただしフレームバッファはファームウェアが確保した
+      RAM 上にあり (\texttt{device/video/video.c:93})、拡張には衝突回避が要る。失敗しても
+      静かにメモリが壊れるだけで症状が出るとは限らない。
+\item \textbf{(16) DHCP} は rpi5 では\textbf{解消済み}だった。\texttt{loader/main.c:78--79} が
+      実際に \texttt{tcp\_set\_ip}/\texttt{net\_responder\_set\_ip} を呼んでいる。
+      ただし \texttt{main.c:1808} で固定 IP も書いており二重である。
+\end{itemize}
+
+\subsection{デプロイ経路について}
+
+rpi5 の実機反復は\textbf{全て USB スティックの物理書き換え}で行った。1 回の試行に
+「ビルド → USB を抜いて Mac に挿す → 焼く → 戻す → 電源投入 → 起動待ち」が必要で、
+得られる情報は多くの場合「起動したか否か」の 1 ビットしかない。この条件下で仮説を
+当てずっぽうに潰すのは高くつく。実際、チェーンロードの原因究明では 3 回の往復を
+誤った仮説に費やした。転機は\textbf{修正ではなく計測を焼いた}ときで、
+\texttt{prev:}／\texttt{calls:} を入れた 1 枚が原因を一意に決めた。
+\textbf{シリアルコンソールがあれば、この往復の大半は不要だった}。
+
+%======================================================================
 \section{未解決の課題}
 
 \begin{itemize}[leftmargin=1.4em,itemsep=3pt]
 \item \textbf{\texttt{/microsd} と \texttt{/sd} が空}。SD の FAT32 列挙が成立していない。
       (5) の検証を阻んでおり、FAT32 経路が実機で一切テストできない。\textbf{次の本命}。
-\item \textbf{メッシュ (MANET) でのアクター実行は未測定}。Pi 3・Pi 5 が停止しており、Pi 4 単体では
-      \texttt{/manet} が \texttt{node=0 peers=0}。複数ノードに跨るアクター分散実行の
-      ベンチマークは次回の課題。
+\item \textbf{メッシュ (MANET) でのアクター実行は未測定}。3 ボードの完全メッシュは
+      2026-07-21 に成立した (第 3 次、Pi 4/Pi 3/Pi 5 いずれも \texttt{peers=2}) が、
+      複数ノードに跨るアクター分散実行のベンチマークはまだ取っていない。なお M14 の
+      アプリ層 (\texttt{manet fire}/\texttt{pull}/\texttt{cfg}) は\textbf{rpi5 にしか
+      入っていない}ので、案 B の密度実験には Pi 4・Pi 3 への移植が要る。
 \item \texttt{/preempt} は HTTP 経由では動かない (既存。上記参照)。
 \item \texttt{make qemu} / \texttt{qemu-smoke} がリンクしない (\texttt{sd\_last\_int}、
       \texttt{xhci\_msd\_*} が未定義)。\texttt{ccb6437} 時点で既に破綻していた。
 \item 残る優先課題は表の 9--13 --- W\textasciicircum X、DMA キャッシュ規律 →
       \texttt{DCACHE\_ON}、GENET TX リング、そして EL0 分離。
 \end{itemize}
+
+\subsection{xinu-rpi5 側に残る懸念 --- 17 件}
+
+第 3 次の作業後、rpi5 に残っている懸念を数え上げると 17 件になる。
+
+\textbf{アセスメント由来 (10)}: (6) W\textasciicircum X、(9) タイムベース二重管理
+(\texttt{device/usb/uspi\_glue.c:95} が 100\,Hz 固定仮定、\texttt{cc/cc.c:136} は
+\texttt{CNTFRQ} 由来)、(10) D-cache OFF、(11) 偽セマフォ
+(\texttt{system/xinu\_compat.c:86--101} はカウンタ増減のみ) と \texttt{network/} の残存、
+(13) \texttt{HEAP\_END} 決め打ち、(15) 相当として \texttt{rp1eth\_tx\_frame()} の
+最大 100 万回ポーリング、(17) ユーザ空間なし、(18) FAT32、(19) VFS、(21) 重複と腐敗。
+
+\textbf{今回新たに判明 (5)}:
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+\item RP1 PCIe/GEM が暖かい再初期化に耐えず、\texttt{/chainload} が実用にならない。
+\item 接続スロットが単一で、同時 1 リクエストしか捌けない。検証中も繰り返し詰まった。
+\item \texttt{http\_build()} が \texttt{max} を \texttt{(void)max} で捨てており、
+      \texttt{out} に直接書くルート (\texttt{/fb} 等) に境界検査が無い。
+\item WiFi の再初期化が不安定 (\texttt{op 23 status -17} の反復、\texttt{IBSS cell up} が出ない)。
+\item \texttt{/tcpstat} の \texttt{prev:}／\texttt{calls:} は診断のために入れた足場で、暫定。
+\end{enumerate}
+
+\textbf{未検証 (2)}: リーパーの half-open (SYN\_RCVD) 5 秒経路は未実証で、
+確認できたのは ESTABLISHED 60 秒側だけ。アセスメント (5) の \texttt{node->data} NULL 相当が
+rpi5 の \texttt{/fs/cat} 経路にあるかも未確認。
 
 \vfill
 {\small\itshape 本書は \texttt{docs/OS\_ASSESSMENT\_JA.md} の LaTeX 清書版である。
