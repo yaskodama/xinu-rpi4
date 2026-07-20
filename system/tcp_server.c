@@ -523,8 +523,16 @@ static void tcp_pump(struct tcp_conn *c)
      * some other path doesn't carry a mid-stream sequence number. */
     if (c->snd_len > 0) c->my_seq = c->snd_seq0 + (unsigned long)c->snd_nxt;
 
-    /* Everything sent AND acknowledged: it is finally safe to close. */
-    if (c->snd_fin_pending && c->snd_una >= c->snd_len && c->snd_nxt >= c->snd_len) {
+    /* FIN goes out in the same flight as the last data segment, exactly as a
+     * normal stack does — it simply occupies the next sequence number, and the
+     * retransmit timer covers it along with the data.
+     *
+     * An earlier version held the FIN until every byte was ACKED.  That is
+     * wrong twice over: it adds a full round trip to every response (30-60 ms
+     * to this board), and it made the whole HTTP-driven actor workload ~1.8x
+     * slower — the N-Queens actor benchmark went from finishing N=8 in 1.3 s to
+     * not finishing inside 30 s at all.  Measured, not theorised. */
+    if (c->snd_fin_pending && c->snd_nxt >= c->snd_len) {
         c->my_seq = c->snd_seq0 + (unsigned long)c->snd_len;
         if (tcp_send(c, TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0) == 0) {
             c->my_seq += 1;

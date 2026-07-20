@@ -267,12 +267,21 @@ void proc_init(void)
     currpid    = NULLPROC;
 }
 
+/* Claim a free slot.  Masked, and the slot is marked non-free before we let
+ * go, so two concurrent creators cannot be handed the same pid.  PR_TERM is
+ * used as the "claimed but not yet runnable" marker: alloc_slot skips it,
+ * proc_ready() refuses it, and it is never on a queue. */
 static int alloc_slot(void)
 {
-    int i;
-    for (i = 1; i < NPROC; i++) {
-        if (proctab[i].state == PR_FREE) return i;
+    unsigned long d = irq_save();
+    for (int i = 1; i < NPROC; i++) {
+        if (proctab[i].state == PR_FREE) {
+            proctab[i].state = PR_TERM;
+            irq_restore(d);
+            return i;
+        }
     }
+    irq_restore(d);
     return -1;
 }
 
@@ -300,14 +309,14 @@ int proc_create_arg(proc_entry_t entry, unsigned long stksize, const char *name,
      * otherwise long-lived spawn-and-suicide patterns leak ~stksize bytes
      * per cycle and exhaust the heap.  proctab[pid].stkbase==0 after
      * proc_kill() so this is a no-op for kill-reaped slots. */
-    if (proctab[pid].stkbase) {
-        freemem(proctab[pid].stkbase, proctab[pid].stklen);
-        proctab[pid].stkbase = 0;
-        proctab[pid].stklen  = 0;
-    }
+    void         *old_stk = proctab[pid].stkbase;
+    unsigned long old_len = proctab[pid].stklen;
+    proctab[pid].stkbase  = 0;
+    proctab[pid].stklen   = 0;
+    if (old_stk) freemem(old_stk, old_len);
 
     void *stk = getmem(stksize);
-    if (stk == 0) return -1;
+    if (stk == 0) { proctab[pid].state = PR_FREE; return -1; }   /* release the claim */
 
     struct procent *p = &proctab[pid];
     p->state   = PR_READY;
@@ -355,7 +364,16 @@ int proc_create_arg(proc_entry_t entry, unsigned long stksize, const char *name,
     sp[19] = 0;                          /* x20                 */
     p->sp = (void *)sp;
 
+    /* Masked: the timer ISR pushes woken sleepers onto the same queue from
+     * proc_timer_tick(), and it runs even while preemption is disabled.  An
+     * unprotected push here raced it — with the actor workload spawning
+     * constantly at up to 5 kHz of timer IRQs, a torn insert dropped the new
+     * process off the run queue and it never ran again.  (The old single
+     * linked list had the same race; the doubly-linked FIFO + bitmap simply
+     * has more invariants to tear.) */
+    unsigned long d = irq_save();
     ready_push(p);
+    irq_restore(d);
     return pid;
 }
 
