@@ -1371,6 +1371,84 @@ static int wifi_ip_eq(const u8 *p)
  * or relay a transit packet per the route table.  Returns 1 if consumed. */
 static int aodv_ip_in(u8 *e, int elen);
 
+/* ================================================================== *
+ *  MANET HELLO (M14, rpi4 port) — periodic self-announce for auto     *
+ *  neighbour discovery.  Every node broadcasts a HELLO on UDP/5000    *
+ *  every ~2s; on receipt the src node id is recorded.  This makes the *
+ *  mesh self-populate its peer table without any driven traffic —     *
+ *  mirrors the rpi5 (A76) implementation so the two boards discover    *
+ *  each other on the shared fixed-BSSID cell.                          *
+ * ================================================================== */
+#define MN_PORT    5000
+#define MN_HELLO   6
+#define MN_HDR     16
+#define MN_MAXNBR  64
+static u8   g_mn_node = 0;              /* self id = 10.0.0.<n> の n */
+static u8   g_mn_peers[MN_MAXNBR];      /* distinct src nodes heard from */
+static int  g_mn_peersn = 0;
+static u32  g_mn_hello_tx = 0, g_mn_hello_last = 0, g_mn_rx = 0;
+static u16  g_mn_seq = 0;
+
+static void mn_peer_seen(u8 src)
+{
+    int i;
+    if (!src || src == g_mn_node) return;
+    for (i = 0; i < g_mn_peersn; i++) if (g_mn_peers[i] == src) return;
+    if (g_mn_peersn < MN_MAXNBR) g_mn_peers[g_mn_peersn++] = src;
+}
+
+/* Broadcast one HELLO: Ethernet(bcast) + IPv4 + UDP/5000 + 16-byte header. */
+static void mn_bcast_hello(void)
+{
+    static u8 f[64];
+    int i, plen = MN_HDR, tot = 14 + 20 + 8 + plen;
+    u8 *ip, *udp, *p; u16 c;
+    for (i = 0; i < tot; i++) f[i] = 0;
+    for (i = 0; i < 6; i++) f[i] = 0xff;                 /* dst = broadcast */
+    for (i = 0; i < 6; i++) f[6 + i] = wifi_mac[i];      /* src MAC */
+    f[12] = 0x08; f[13] = 0x00;                          /* EtherType IPv4 */
+    ip = f + 14;
+    ip[0] = 0x45; ip[2] = (u8)((20 + 8 + plen) >> 8); ip[3] = (u8)(20 + 8 + plen);
+    ip[8] = 64;   ip[9] = 17;                            /* TTL, proto=UDP */
+    for (i = 0; i < 4; i++) ip[12 + i] = wifi_ip[i];     /* src IP */
+    for (i = 0; i < 4; i++) ip[16 + i] = 255;            /* dst = 255.255.255.255 */
+    c = ip_cksum(ip, 20, 0); ip[10] = c >> 8; ip[11] = c & 0xFF;
+    udp = ip + 20;
+    udp[0] = (u8)(MN_PORT >> 8); udp[1] = (u8)MN_PORT;   /* src port */
+    udp[2] = (u8)(MN_PORT >> 8); udp[3] = (u8)MN_PORT;   /* dst port */
+    udp[4] = (u8)((8 + plen) >> 8); udp[5] = (u8)(8 + plen);
+    /* udp checksum 0 = not computed (allowed for IPv4) */
+    p = udp + 8;
+    p[0] = MN_HELLO; p[1] = g_mn_node;
+    p[2] = (u8)g_mn_seq; p[3] = (u8)(g_mn_seq >> 8); g_mn_seq++;
+    wifi_data_tx(f, tot);
+    g_mn_hello_tx++;
+}
+
+/* Called every wifi_net_poll tick; self-rate-limits to ~2s. */
+static void mn_hello_tick(void)
+{
+    u32 now;
+    if (!wifi_have_ip) return;
+    if (!g_mn_node) g_mn_node = wifi_ip[3];
+    now = SYSTIMER_CLO;
+    if (g_mn_hello_last && (u32)(now - g_mn_hello_last) < 2000000u) return;
+    g_mn_hello_last = now;
+    mn_bcast_hello();
+}
+
+/* Status accessor for the /manet HTTP route (system/tcp_server.c). */
+void wifi_manet_get(int *node, unsigned *rx, unsigned *htx, int *np, unsigned char *peers)
+{
+    int i;
+    if (!g_mn_node) g_mn_node = wifi_ip[3];
+    if (node) *node = g_mn_node;
+    if (rx)   *rx   = g_mn_rx;
+    if (htx)  *htx  = g_mn_hello_tx;
+    if (np)   *np   = g_mn_peersn;
+    if (peers) for (i = 0; i < g_mn_peersn && i < MN_MAXNBR; i++) peers[i] = g_mn_peers[i];
+}
+
 /* Answer one received 802.3 frame: ARP-who-has-us -> ARP reply, ICMP echo
  * request -> echo reply.  All over the WLAN data channel. */
 static void wifi_handle_frame(u8 *fr, int len, int doff)
@@ -1402,6 +1480,15 @@ static void wifi_handle_frame(u8 *fr, int len, int doff)
         u8 *ip = e + 14;
         int ihl = (ip[0] & 0x0F) * 4;
         if (aodv_ip_in(e, elen)) return;             /* AODV control / relay */
+        if (ip[9] == 17) {                           /* UDP */
+            u8 *udp = ip + ihl;
+            int dport = (udp[2] << 8) | udp[3];
+            if (dport == MN_PORT && 14 + ihl + 8 + 2 <= elen) {  /* MANET HELLO */
+                u8 src = (udp + 8)[1];
+                if (src && src != g_mn_node) { g_mn_rx++; mn_peer_seen(src); }
+                return;
+            }
+        }
         if (ip[9] == 1 && wifi_ip_eq(ip + 16)) {     /* ICMP to us */
             u8 *ic = ip + ihl;
             int iptot = (ip[2] << 8) | ip[3];
@@ -1448,6 +1535,7 @@ void wifi_net_poll(void)
 {
     static u8 fr[2048]; int chan, doff, n, budget;
     if (!wifi_have_ip) return;
+    mn_hello_tick();                 /* periodic MANET HELLO (self-throttled to 2s) */
     /* Drain all queued RX frames this tick (bounded so we never monopolize the
      * wm frame loop) — at the wm frame rate a single frame/tick dropped pings;
      * draining the FIFO each tick keeps the responder reliable. */

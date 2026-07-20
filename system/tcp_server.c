@@ -914,6 +914,24 @@ static int http_build(const char *req, char *out, int max)
         return p;
     }
 
+    if (starts_with(req, "GET /manet")) {
+        /* MANET HELLO peer view: auto-discovered mesh neighbours (device/wifi). */
+        extern void wifi_manet_get(int *, unsigned *, unsigned *, int *, unsigned char *);
+        int node = 0, np = 0, i; unsigned rx = 0, htx = 0; unsigned char peers[64];
+        wifi_manet_get(&node, &rx, &htx, &np, peers);
+        int p = 0;
+        p = s_put(out, p, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n"
+                          "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
+        p = s_put(out, p, "manet node=");   p = s_putdec(out, p, (long)node);
+        p = s_put(out, p, " rx=");          p = s_putdec(out, p, (long)rx);
+        p = s_put(out, p, " hello_tx=");    p = s_putdec(out, p, (long)htx);
+        p = s_put(out, p, " peers=");       p = s_putdec(out, p, (long)np);
+        p = s_put(out, p, " ids=");
+        for (i = 0; i < np; i++) { p = s_put(out, p, " "); p = s_putdec(out, p, (long)peers[i]); }
+        p = s_put(out, p, "\n");
+        return p;
+    }
+
     /* ---- /fb : remote screen mirror -------------------------------------
      * This minimal TCP stack sends a response in ONE segment (<=~1400 B), so
      * the 1024x768 framebuffer can't go in one reply.  Instead serve a small
