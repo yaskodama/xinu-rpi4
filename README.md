@@ -19,6 +19,54 @@ BASIC window drawing a Koch-snowflake fractal.](doc/pi4-basic-koch.jpg)
 monitor, UART shell, live-actor and system-status panels, and the on-screen
 **BASIC** window running its `koch` sample to draw a Koch snowflake.*
 
+## Multi-core SMP, D-cache & self-forming Wi-Fi mesh (2026 experiments)
+
+This port is one of three siblings — **xinu-rpi3 (A53)**, **xinu-rpi4 (A72,
+this one)**, **xinu-rpi5 (A76)** — joined into a single self-forming cluster and
+benchmarked together. Full write-ups are in the companion `smp_report`
+(per-board SMP + D-cache) and `mesh_report` (mesh + distributed) PDFs.
+
+**4-core worker-pool SMP.** Core 0 runs the OS; cores 1–3 are compute workers
+(`system/smp.c`) that wait in `wfe` for a job posted to a lock-free mailbox, run
+a `[lo,hi)` range function, and signal done. `boot.S` releases the secondaries
+(smp_release[] + the Pi 4 armstub spin-table) into `_smp_start`, and
+`mmu_enable_secondary()` brings each worker up on core 0's page tables with
+**MMU + I-cache on, D-cache off**. Measured (`agree=yes`):
+
+| Benchmark            | 1-core | 4-core | Speedup |
+|----------------------|-------:|-------:|:-------:|
+| dining (philosophers)| 273097 µs | 68278 µs | **3.99×** |
+| primes (count)       | 158330 µs | 52633 µs | **3.00×** |
+| n-queens (n=12, block split)     | 307814 µs | 154188 µs | 1.99× |
+| n-queens (n=12, interleave `il=2`)| 308026 µs | 157383 µs | 1.95× |
+
+**D-cache experiment.** The default build runs every core with the D-cache
+**off**, so the mailbox is coherent for free. A `DCACHE_ON` build turns the
+D-cache on and keeps the mailbox coherent with **explicit maintenance**
+(`dc cvac` / `dc ivac`) instead. On this A72, writing `CPUECTLR_EL1.SMPEN` from
+EL1 traps under the stock firmware, so the workers run `C=1` *without* hardware
+cross-core coherency — the benchmark's `agree=` column then shows whether the
+explicit clean/invalidate discipline is sufficient (it is). This established
+that multi-core D-cache is workable on all three microarchitectures via explicit
+cache maintenance.
+
+**Self-forming Wi-Fi ad-hoc mesh.** All three boards join one IBSS cell with no
+access point: SSID `MANET`, channel 6, fixed BSSID `02:4d:41:4e:45:54`, static
+`10.0.0.n/24` (this board is **node 2 = 10.0.0.2**). A periodic **HELLO beacon**
+(UDP/5000, every 2 s, `device/wifi/wifi.c`) announces the node id; each board
+records the senders it hears, so neighbour tables fill automatically — power-on
+and join is all it takes. Inspect convergence with `GET /manet`
+(`node`, `rx`, `hello_tx`, `peers ids=`).
+
+**Distributed benchmark routes.**
+- `GET /bench?kind=nqueens|dining|primes[&n=N][&il=1|2][&cores=K]` — the SMP
+  benchmark above (1-core vs 4-core, µs, speedup, `agree=`).
+- `GET /nqpart?n=N&c0=A&c1=B` — count N-Queens solutions for first-queen columns
+  `[c0,c1)`, split across this board's 4 cores. A Mac orchestrator hands each
+  board a disjoint range and sums the partials, so the mesh solves one problem as
+  a **12-core (3×4) distributed computer**: N=14 (365 596 solutions) in
+  **1 458 ms — 1.87× the fastest single board**, sum verified.
+
 ## What works
 
 **Boot & core kernel**
