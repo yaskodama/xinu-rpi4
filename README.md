@@ -40,6 +40,14 @@ a `[lo,hi)` range function, and signal done. `boot.S` releases the secondaries
 | n-queens (n=12, block split)     | 307814 µs | 154188 µs | 1.99× |
 | n-queens (n=12, interleave `il=2`)| 308026 µs | 157383 µs | 1.95× |
 
+```mermaid
+xychart-beta
+    title "Pi 4 (A72) — 4-core SMP speedup (x over 1 core)"
+    x-axis [dining, primes, "n-queens"]
+    y-axis "speedup" 0 --> 4.2
+    bar [3.99, 3.00, 1.99]
+```
+
 **D-cache experiment.** The default build runs every core with the D-cache
 **off**, so the mailbox is coherent for free. A `DCACHE_ON` build turns the
 D-cache on and keeps the mailbox coherent with **explicit maintenance**
@@ -66,6 +74,14 @@ and join is all it takes. Inspect convergence with `GET /manet`
   board a disjoint range and sums the partials, so the mesh solves one problem as
   a **12-core (3×4) distributed computer**: N=14 (365 596 solutions) in
   **1 458 ms — 1.87× the fastest single board**, sum verified.
+
+```mermaid
+xychart-beta
+    title "Distributed N-Queens (N=14, 365596 solutions) — wall-clock ms"
+    x-axis ["Pi4 4c", "Pi5 4c", "8-core", "9-core", "12-core"]
+    y-axis "ms (lower is better)" 0 --> 5400
+    bar [5216, 2722, 2088, 1585, 1458]
+```
 
 ## What works
 
