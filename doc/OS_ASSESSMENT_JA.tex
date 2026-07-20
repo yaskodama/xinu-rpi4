@@ -543,6 +543,70 @@ prio-5 の hog に叩き落とされ、実機と同じ挙動になる。
 \textbf{実測: 2,008,152 バイトを 23.1 秒で転送、全 123 チャンク ACK、ステージした
 カーネルが起動。}これで実機検証が SD カードの往復なしで回せるようになった。
 
+\subsection{アクター実機ベンチマーク --- と、そこで見つかった自作の欠陥}
+
+改良の効果を測るため、アクター版 N-Queens (\texttt{examples/nqueens\_with\_gc\_eval.py}) を
+実機で走らせた。N=8 で約 1500 回の spawn、同時生存約 1300 アクターという、\texttt{NPROC=2048}
+の根拠そのものの負荷である。
+
+\textbf{結果は最初、惨憺たるものだった。N=8 が 30 秒で完走せず、1695 アクターが全員
+ブロックし、スロットが枯渇した} (\texttt{spawn\_fails=1058}、\texttt{send\_to\_neg=2116}、
+\texttt{lheap\_overflows=2946})。
+
+修理したチェーンロードで\textbf{カーネルを 6 種類 RAM 起動して二分探索}した。1 回 25 秒で
+載せ替えられるので、これがなければ成立しなかった調査である。
+
+\begin{center}\small
+\begin{tabular}{@{}p{7.4cm} c p{5.0cm}@{}}
+\toprule
+\textbf{検証したカーネル} & \textbf{N=8} & \textbf{結論}\\ \midrule
+旧 \texttt{ccb6437} (全変更前)                      & ✅ 2171\,ms & 基準\\
+HEAD $-$ スケジューラ (旧 \texttt{proc.c})          & 停止        & \textbf{スケジューラは無罪}\\
+HEAD $-$ ヒープ (旧 \texttt{memory.c})              & 停止        & ヒープも無罪\\
+HEAD $-$ ネットワーク (旧 \texttt{tcp\_server.c} 他)& ✅ 1326\,ms & \textbf{ネットワークが原因}\\
+HEAD $-$ 周期呼び出し (旧 \texttt{loader/main.c})   & 停止        & reaper / tick は無罪\\
+HEAD $-$ 受信長検証                                 & 停止        & 長さ検証も無罪\\
+\textbf{HEAD $-$ 分割送信}                          & \textbf{✅ 1331\,ms} & \textbf{分割送信が原因}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+真因は \texttt{tcp\_pump()} が\textbf{ FIN を「全バイトが ACK されるまで」保留していた}こと。
+この Pi 4 への RTT は 30--60\,ms なので、HTTP 応答ごとに丸 1 往復が上乗せされる。
+ベンチマークは 50\,ms ごとに 3 回ポーリングするため全体が約 1.8 倍遅くなり、N=8 は 30 秒の
+制限を超えて崩壊していた。正しい TCP は FIN を最後のデータと同じフライトで送る (FIN は次の
+シーケンス番号を占めるだけで、再送タイマがデータごと面倒を見る)。条件を 1 つ外すだけの
+修正 (\texttt{f07f0a6})。
+
+\textbf{修正後の実測} (elapsed ms、いずれも解は全て正解):
+
+\begin{center}\small
+\begin{tabular}{@{}c c r r r@{}}
+\toprule
+\textbf{N} & \textbf{期待解} & \textbf{旧 \texttt{ccb6437}} & \textbf{欠陥版} & \textbf{修正後 HEAD}\\ \midrule
+4 & 2  &  856 & 1301 & \textbf{746}\\
+5 & 10 &  909 & 1313 & \textbf{751}\\
+6 & 4  &  956 & 1353 & \textbf{772}\\
+7 & 40 & 1044 & 1530 & \textbf{864}\\
+\textbf{8} & \textbf{92} & \textbf{2171} & \textbf{30\,s タイムアウト} & \textbf{1332}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{測定条件の注記。}上表はすべて\textbf{チェーンロード起動}での測定である (旧カーネルを
+RAM 起動して A/B するため条件を揃えた)。\textbf{SD から起動した同じ修正版はさらに速く、
+N=8 = 1028\,ms} (N=4..7 は 611 / 607 / 622 / 685\,ms)。チェーンロード起動が一貫して遅いのは、
+4\,MB のステージングバッファがヒープに残ることと再配置後のヒープ断片化によるものと思われる。
+公平な比較 (同条件同士) は 2171 → 1332\,ms の\textbf{ 1.63 倍}である。
+
+\textbf{N=8 で旧比 1.63 倍高速。} ready キューの O(1) 化とヒープ修正の効果は、この TCP の
+欠陥を取り除いて初めて可視化された。ピークアクター数は全 N で 2 --- ソルバが即座に自殺して
+スロットが回るので、50\,ms 間隔のサンプラには 2 個しか見えない (崩壊時は 1695 個が滞留していた)。
+
+\textbf{教訓として記録しておく。}最初、症状の見た目から「スケジューラ刷新の回帰」と断定して
+報告したが、\textbf{誤りだった}。当時の A/B は「全変更前」対「全変更後」で、間に 3 コミットが
+挟まっていた。二分探索して初めて結論が反転した。分割統治を最初に行うべきだった。
+
 \subsection{決着した懸案 --- \texttt{/preempt} は既存の壊れ}
 
 \texttt{/preempt} が空ログを返し \texttt{cpuA}/\texttt{cpuB} が居残る件は、修理した
@@ -563,6 +627,10 @@ prio-5 の hog に叩き落とされ、実機と同じ挙動になる。
 \begin{itemize}[leftmargin=1.4em,itemsep=3pt]
 \item \textbf{\texttt{/microsd} と \texttt{/sd} が空}。SD の FAT32 列挙が成立していない。
       (5) の検証を阻んでおり、FAT32 経路が実機で一切テストできない。\textbf{次の本命}。
+\item \textbf{メッシュ (MANET) でのアクター実行は未測定}。Pi 3・Pi 5 が停止しており、Pi 4 単体では
+      \texttt{/manet} が \texttt{node=0 peers=0}。複数ノードに跨るアクター分散実行の
+      ベンチマークは次回の課題。
+\item \texttt{/preempt} は HTTP 経由では動かない (既存。上記参照)。
 \item \texttt{make qemu} / \texttt{qemu-smoke} がリンクしない (\texttt{sd\_last\_int}、
       \texttt{xhci\_msd\_*} が未定義)。\texttt{ccb6437} 時点で既に破綻していた。
 \item 残る優先課題は表の 9--13 --- W\textasciicircum X、DMA キャッシュ規律 →
