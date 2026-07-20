@@ -70,6 +70,114 @@ static unsigned long normal_attr(int ro, int xn)
     return a;
 }
 
+#ifdef DCACHE_ON
+/* Invalidate the entire D-cache by set/way to the Point of Coherency, AArch64.
+ * MUST run before enabling SCTLR.C: the cache holds garbage out of reset, and
+ * enabling it without invalidating tells the core that garbage is valid data
+ * (this bricked a Pi 3 once).  Standard CLIDR/CCSIDR walk (ARM ARM). */
+static void dcache_invalidate_all(void)
+{
+    unsigned long clidr;
+    __asm__ volatile ("mrs %0, clidr_el1" : "=r"(clidr));
+    unsigned long loc = (clidr >> 24) & 7;
+    for (unsigned long level = 0; level < loc; level++) {
+        unsigned long type = (clidr >> (level * 3)) & 7;
+        if (type < 2) continue;                       /* no D-side at this level */
+        __asm__ volatile ("msr csselr_el1, %0\n isb\n" :: "r"(level << 1));
+        unsigned long ccsidr;
+        __asm__ volatile ("mrs %0, ccsidr_el1" : "=r"(ccsidr));
+        unsigned int linesh = (unsigned int)(ccsidr & 7) + 4;      /* log2(line bytes) */
+        unsigned int ways   = (unsigned int)((ccsidr >> 3)  & 0x3FF);
+        unsigned int sets   = (unsigned int)((ccsidr >> 13) & 0x7FFF);
+        unsigned int wayshift = (unsigned int)__builtin_clz(ways); /* ways at top */
+        for (int w = (int)ways; w >= 0; w--)
+            for (int s = (int)sets; s >= 0; s--) {
+                unsigned long val = (level << 1)
+                    | ((unsigned long)s << linesh)
+                    | ((unsigned long)(unsigned int)w << wayshift);
+                __asm__ volatile ("dc isw, %0" :: "r"(val));
+            }
+    }
+    __asm__ volatile ("msr csselr_el1, xzr\n dsb sy\n isb\n" ::: "memory");
+}
+
+/* Clean (write back) the entire D-cache by set/way to the Point of Coherency,
+ * AArch64.  Same CLIDR/CCSIDR walk as the invalidate above, but issues
+ * `dc cisw` (clean + invalidate) so every dirty line is flushed to RAM.  Used
+ * by the D-cache experiment to make CPU-written framebuffer pixels visible to
+ * the GPU/HDMI scan-out (the GPU does not snoop the CPU cache): with C=1 the
+ * bench text sits in the D-cache until this write-back reaches RAM.  Exposed
+ * (non-static) so smpbench_serial_run() can flush the screen before halting. */
+void dcache_clean_all(void)
+{
+    unsigned long clidr;
+    __asm__ volatile ("mrs %0, clidr_el1" : "=r"(clidr));
+    unsigned long loc = (clidr >> 24) & 7;
+    for (unsigned long level = 0; level < loc; level++) {
+        unsigned long type = (clidr >> (level * 3)) & 7;
+        if (type < 2) continue;                       /* no D-side at this level */
+        __asm__ volatile ("msr csselr_el1, %0\n isb\n" :: "r"(level << 1));
+        unsigned long ccsidr;
+        __asm__ volatile ("mrs %0, ccsidr_el1" : "=r"(ccsidr));
+        unsigned int linesh = (unsigned int)(ccsidr & 7) + 4;      /* log2(line bytes) */
+        unsigned int ways   = (unsigned int)((ccsidr >> 3)  & 0x3FF);
+        unsigned int sets   = (unsigned int)((ccsidr >> 13) & 0x7FFF);
+        unsigned int wayshift = (unsigned int)__builtin_clz(ways); /* ways at top */
+        for (int w = (int)ways; w >= 0; w--)
+            for (int s = (int)sets; s >= 0; s--) {
+                unsigned long val = (level << 1)
+                    | ((unsigned long)s << linesh)
+                    | ((unsigned long)(unsigned int)w << wayshift);
+                __asm__ volatile ("dc cisw, %0" :: "r"(val));
+            }
+    }
+    __asm__ volatile ("msr csselr_el1, xzr\n dsb sy\n isb\n" ::: "memory");
+}
+
+/* Clean (write back) a VA range to the Point of Coherency, 64-byte lines
+ * (Cortex-A72 L1/L2 cache line = 64 B).  Used before handing a RAM buffer to a
+ * non-snooping agent (the VideoCore GPU via the property mailbox): with the
+ * D-cache ON the CPU's writes sit in cache, so the GPU would read stale RAM. */
+void dcache_clean_range(void *va, unsigned long size)
+{
+    unsigned long a   = (unsigned long)va & ~63UL;
+    unsigned long end = (unsigned long)va + size;
+    for (; a < end; a += 64)
+        __asm__ volatile ("dc cvac, %0" :: "r"(a));
+    __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/* Invalidate a VA range so the next read misses and refetches from RAM.  Used
+ * after the GPU has written its mailbox response: the CPU holds a stale cached
+ * copy and must drop it to see the firmware's reply.  Pure invalidate (not
+ * clean+invalidate) — a write-back here would clobber the GPU's response with
+ * the CPU's stale copy.  Safe against neighbours sharing the boundary lines:
+ * mbox_call() cleans the same range first (writing any neighbour bytes to RAM),
+ * and nothing writes those bytes between the clean and this invalidate. */
+void dcache_inval_range(void *va, unsigned long size)
+{
+    unsigned long a   = (unsigned long)va & ~63UL;
+    unsigned long end = (unsigned long)va + size;
+    for (; a < end; a += 64)
+        __asm__ volatile ("dc ivac, %0" :: "r"(a));
+    __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/* Enable the Cortex-A72 SMP/coherency bit.  Unlike the A76 (rpi5), whose DSU
+ * keeps shareable WB memory coherent with no software enable, the A72 needs
+ * CPUECTLR_EL1.SMPEN (bit 6) set before its data cache participates in inner-
+ * shareable coherency.  Without it, C=1 makes the lock-free worker-pool
+ * mailbox non-coherent between cores (the classic x1.0 no-speedup symptom).
+ * CPUECTLR_EL1 is S3_1_C15_C2_1 on the A72. */
+static void __attribute__((unused)) a72_smp_enable(void)
+{
+    unsigned long ectlr;
+    __asm__ volatile ("mrs %0, S3_1_C15_C2_1" : "=r"(ectlr));
+    ectlr |= (1UL << 6);                    /* SMPEN */
+    __asm__ volatile ("msr S3_1_C15_C2_1, %0\n isb\n" :: "r"(ectlr) : "memory");
+}
+#endif /* DCACHE_ON */
+
 void mmu_init(void)
 {
     /* Enable EL1 FP/SIMD access (CPACR_EL1.FPEN=0b11).  The kernel is built
@@ -160,6 +268,13 @@ void mmu_init(void)
      * (translation + W^X) is safe to run on real hardware.  The page table
      * already marks RAM Normal-cacheable, so a future DMA-coherent design
      * can flip C on without re-tabling. */
+#ifdef DCACHE_ON
+    /* ★ Experiment: the D-cache (C=1) is enabled LATER, by mmu_enable_dcache()
+     * called from main() AFTER video_init().  Enabling C here (before the FB
+     * mailbox handshake) made the VideoCore read a stale, cached request and
+     * HDMI never came up.  Bringing HDMI up with C=0 first, then flipping C=1,
+     * keeps the mailbox coherent and lets the bench results reach the screen. */
+#endif
     __asm__ volatile (
         "msr sctlr_el1, %0\n"
         "isb\n"
@@ -169,6 +284,44 @@ void mmu_init(void)
 
     vm_demand_init();      /* arm the demand-paged virtual window (no backing yet) */
 }
+
+#ifdef DCACHE_ON
+/* Enable the D-cache (SCTLR.C=1) on core 0, deferred until AFTER video_init()
+ * so the framebuffer mailbox handshake ran coherently with C=0.  Order is
+ * critical: turn on A72 SMP coherency (SMPEN) and invalidate the D-cache by
+ * set/way BEFORE setting C=1 (the cache holds reset garbage; enabling C without
+ * invalidating tells the core the garbage is valid — this bricked a Pi 3 once).
+ * The secondary cores enable their own C=1 the same way in mmu_enable_secondary,
+ * brought up by smp_init() which main() calls right after this. */
+void mmu_enable_dcache(void)
+{
+    extern void screen_puts(const char *);
+    extern void video_flush(void);
+    unsigned long sctlr;
+
+    /* NB: a72_smp_enable() (writing CPUECTLR_EL1.SMPEN) is deliberately NOT
+     * called here.  This kernel runs at EL1 (boot.S drops EL2->EL1), and on the
+     * Cortex-A72 the CPUECTLR_EL1 (S3_1_C15_C2_1) IMP-DEF register is not
+     * accessible from EL1 unless ACTLR_EL2/EL3.CPUECTLR was set by higher ELs —
+     * which the Pi 4 firmware does not do.  The MRS therefore traps to EL2
+     * (VBAR_EL2 = 0) and the core dead-jumps to address 0.  Without SMPEN the
+     * D-cache still works for single-core; cross-core coherency of the
+     * lock-free job mailbox may break (bench will report agree=NO / no speedup),
+     * which is itself the observation.  Markers print each step so a fault is
+     * localised on screen (serial is dead, net is incoherent with C=1). */
+
+    screen_puts("  [dcache] invalidate D$ by set/way ...\n"); video_flush();
+    dcache_invalidate_all();
+
+    screen_puts("  [dcache] set SCTLR.C=1 ...\n"); video_flush();
+    __asm__ volatile ("mrs %0, sctlr_el1" : "=r"(sctlr));
+    sctlr |= (1UL << 2);    /* C — D-cache enable */
+    __asm__ volatile ("msr sctlr_el1, %0\n isb\n" :: "r"(sctlr) : "memory");
+
+    /* C=1 now: this screen write is cached, so flush it to RAM for the GPU. */
+    screen_puts("  [dcache] C=1 live.\n"); video_flush();
+}
+#endif /* DCACHE_ON */
 
 /* Bring a secondary core's MMU up to the SAME configuration core 0 uses, so
  * all four cores execute identically (fair benchmarking): identity map via the
@@ -197,6 +350,16 @@ void mmu_enable_secondary(void)
     __asm__ volatile ("ic iallu\n dsb sy\n isb\n mrs %0, sctlr_el1\n" : "=r"(sctlr));
     sctlr |= (1UL << 0);    /* M — MMU enable    */
     sctlr |= (1UL << 12);   /* I — I-cache enable (D-cache C stays OFF) */
+#ifdef DCACHE_ON
+    /* Each worker core set/way-invalidates its own D-cache (it also holds reset
+     * garbage) before enabling C=1.  SMPEN is NOT set here: like core 0
+     * (mmu_enable_dcache), writing CPUECTLR_EL1 from EL1 traps on the A72 with
+     * this firmware.  So the workers run C=1 WITHOUT hardware cross-core
+     * coherency — the bench's agree= column will reveal whether the lock-free
+     * mailbox survives (expected: coherency breaks, mirroring the A76/Pi 5). */
+    dcache_invalidate_all();
+    sctlr |= (1UL << 2);    /* C — D-cache enable (DCACHE_ON) */
+#endif
     __asm__ volatile ("msr sctlr_el1, %0\n isb\n" :: "r"(sctlr) : "memory");
 }
 

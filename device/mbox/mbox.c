@@ -42,6 +42,17 @@ int mbox_call(volatile unsigned int *buf)
     unsigned long t;
     unsigned int msg;
 
+#ifdef DCACHE_ON
+    /* With the D-cache ON the request we just built is still in the CPU cache;
+     * the VideoCore GPU reads the buffer from RAM and does not snoop the cache.
+     * Clean it to RAM so the GPU sees the real request (buf[0] = total bytes,
+     * patched by the caller).  Without this the GPU reads stale RAM and the FB
+     * allocation fails -> no HDMI output. */
+    { extern void dcache_clean_range(void *, unsigned long);
+      unsigned long sz = buf[0]; if (sz < 16 || sz > 512) sz = 512;
+      dcache_clean_range((void *)buf, sz); }
+#endif
+
     /* Build the message: low 4 bits = channel, rest = buf phys addr.
      * Buffer must be 16-byte aligned so the low bits are free. */
     msg = ((unsigned int)(unsigned long)buf & ~0xFu) | MBOX_CHANNEL_PROP;
@@ -67,6 +78,14 @@ int mbox_call(volatile unsigned int *buf)
 
         unsigned int reply = MBOX_READ;
         if ((reply & 0xF) == MBOX_CHANNEL_PROP) {
+#ifdef DCACHE_ON
+            /* The GPU wrote its response (and the allocated FB address) straight
+             * to RAM; our cached copy of the buffer is now stale.  Invalidate it
+             * so the response code below and the caller's reads see fresh data. */
+            { extern void dcache_inval_range(void *, unsigned long);
+              unsigned long sz = buf[0]; if (sz < 16 || sz > 512) sz = 512;
+              dcache_inval_range((void *)buf, sz); }
+#endif
             /* Tag protocol: buf[1] contains response code; bit 31
              * set = success.  Caller cares about the rest. */
             return (buf[1] == 0x80000000) ? 0 : -1;

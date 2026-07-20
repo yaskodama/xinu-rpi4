@@ -236,6 +236,20 @@ void video_present(void)
     for (unsigned int i = 0; i < n; i++) dst[i] = src[i];
 }
 
+/* Write the visible framebuffer back from the D-cache to RAM so the GPU (which
+ * does not snoop the CPU cache) scans out what the CPU just drew.  A no-op when
+ * the D-cache is off (production): with C=0 every store already lands in RAM.
+ * Used by the DCACHE_ON experiment after each screen update, since there is no
+ * window-manager present loop running to flush the frame. */
+void video_flush(void)
+{
+#ifdef DCACHE_ON
+    extern void dcache_clean_range(void *, unsigned long);
+    if (fb_ready)
+        dcache_clean_range((void *)fb_base, (unsigned long)fb_height * fb_pitch);
+#endif
+}
+
 /* Direct VISIBLE-framebuffer access (bypasses the backbuffer/viewport) so the
  * wm loop can move the mouse cursor between full-frame flips with a save/restore
  * backing store — the pointer then tracks the mouse far above the 20 fps scene

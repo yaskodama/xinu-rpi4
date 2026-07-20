@@ -1679,6 +1679,33 @@ void kernel_main(void)
     uart_puts("gic+timer: 100 Hz PPI 30 armed; unmasking DAIF.I\n");
     irq_enable_all();
 
+#ifdef DCACHE_EXPERIMENT
+    /* HDMI is up now, brought up with the D-cache OFF so the framebuffer mailbox
+     * handshake was coherent.  Flip the D-cache ON *here* (late), just before we
+     * start the SMP workers, and drop progress markers to the screen — each one
+     * flushed to RAM — so that if the board freezes under C=1 the last visible
+     * line tells us exactly how far it got (video vs D-cache-enable vs SMP vs
+     * bench).  screen_puts + video_flush are the only capture path: serial is
+     * dead (PL2303) and the network is incoherent with C=1. */
+    { extern void screen_puts(const char *); extern void video_flush(void);
+      extern void smpbench_serial_run(void);
+      /* Measure the D-cache OFF baseline FIRST, at this boot's clock, so OFF and
+       * ON are directly comparable without cross-boot clock drift.  The bench
+       * auto-labels itself from SCTLR.C (prints "C=0 OFF" here). */
+      screen_puts("\n[dcache-exp] measuring D-cache OFF baseline (C=0) ...\n");
+      video_flush();
+      smpbench_serial_run();
+      /* Now flip the D-cache ON and measure again (the second table prints
+       * "C=1 ON").  HDMI came up with C=0 so the FB mailbox was coherent. */
+      screen_puts("\n[dcache-exp] enabling D-cache C=1, then re-measuring ...\n");
+      video_flush();
+#ifdef DCACHE_ON
+      { extern void mmu_enable_dcache(void); mmu_enable_dcache(); }
+#endif
+      screen_puts("[dcache-exp] D-cache enabled. starting SMP workers ...\n");
+      video_flush(); }
+#endif
+
     /* Bring up the other 3 Cortex-A72 cores as compute workers (worker-pool
      * SMP; see system/smp.c + docs/SMP_REPORT_JA.md).  Core 0 keeps running the
      * whole single-core OS unchanged.  Safe if the cores never respond — they
@@ -1686,6 +1713,27 @@ void kernel_main(void)
     { extern void smp_init(void); extern int smp_cores_online(void);
       smp_init();
       uart_puts("smp: cores online = "); uart_putc((char)('0' + smp_cores_online())); uart_puts("\n"); }
+
+#ifdef DCACHE_EXPERIMENT
+    { extern void screen_puts(const char *); extern void video_flush(void);
+      screen_puts("[dcache-exp] SMP init done. running bench (multi-core, D-cache ON) ...\n");
+      video_flush(); }
+#endif
+
+#ifdef DCACHE_EXPERIMENT
+    /* D-cache ON experiment (Pi 4 A72): run the fill/dining/null sweep to the
+     * serial + HDMI console NOW — after smp_init (workers up, D-cache on, SMPEN
+     * set) but BEFORE any DMA agent (PCIe/USB/net/WM) starts, so the D-cache
+     * never coexists with an incoherent device.  Then halt: with C=1 the
+     * GENET/USB/FB DMA would be incoherent, so we deliberately do not continue
+     * into normal boot.  Results appear on screen too (photographable). */
+    {
+        extern void smpbench_serial_run(void);
+        smpbench_serial_run();
+        uart_puts("DCACHE_EXPERIMENT: halting (no net/USB with D-cache on).\n");
+        for (;;) __asm__ volatile ("wfe");
+    }
+#endif
 
     /* XHCI-A — moved off the boot path.  First flash attempt: all reads
      * returned 0x00000000 (controller is clock-gated, MMIO not faulting

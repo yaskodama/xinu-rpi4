@@ -37,6 +37,22 @@ static volatile int          smp_job_done[SMP_NCORES];   /* == seq when finished
 static inline void dsb_sev(void) { __asm__ volatile("dsb sy\n\tsev" ::: "memory"); }
 static inline void dsb(void)     { __asm__ volatile("dsb sy" ::: "memory"); }
 
+/* ---- D-cache experiment (DCACHE_ON): keep the lock-free mailbox and the
+ * secondary-core bring-up data coherent WITHOUT SMPEN.  On the A72 SMPEN
+ * (CPUECTLR_EL1) is not writable from EL1 with the Pi 4 firmware, so instead of
+ * hardware coherency we clean writes to RAM and invalidate before reads at each
+ * cross-core sync point.  These are `dc cvac`/`dc ivac` by VA (legal at EL1, no
+ * trap).  Compiled out (no-ops) in the normal D-cache-OFF build. */
+#ifdef DCACHE_ON
+extern void dcache_clean_range(void *, unsigned long);
+extern void dcache_inval_range(void *, unsigned long);
+#define MB_CLEAN(p)  dcache_clean_range((void *)(p), sizeof *(p))
+#define MB_INVAL(p)  dcache_inval_range((void *)(p), sizeof *(p))
+#else
+#define MB_CLEAN(p)  ((void)0)
+#define MB_INVAL(p)  ((void)0)
+#endif
+
 int smp_core_id(void)
 {
     unsigned long m;
@@ -47,15 +63,20 @@ int smp_core_id(void)
 /* The worker idle loop: wait (low-power) for a new job, run it, signal done. */
 static void smp_worker_loop(int core)
 {
+    MB_INVAL(&smp_job_seq[core]);
     int last = smp_job_seq[core];
     for (;;) {
-        while (smp_job_seq[core] == last) __asm__ volatile("wfe");
+        MB_INVAL(&smp_job_seq[core]);
+        while (smp_job_seq[core] == last) { __asm__ volatile("wfe"); MB_INVAL(&smp_job_seq[core]); }
         last = smp_job_seq[core];
+        MB_INVAL(&smp_job_fn[core]); MB_INVAL(&smp_job_lo[core]); MB_INVAL(&smp_job_hi[core]);
         smp_range_fn fn = smp_job_fn[core];
         long r = fn ? fn(smp_job_lo[core], smp_job_hi[core], core) : 0;
         smp_job_res[core] = r;
+        MB_CLEAN(&smp_job_res[core]);
         dsb();
         smp_job_done[core] = last;       /* publish completion after the result */
+        MB_CLEAN(&smp_job_done[core]);
         dsb_sev();                       /* wake core 0 out of its wait spin     */
     }
 }
@@ -71,6 +92,7 @@ void smp_secondary_entry(int core)
     exception_init();
     mmu_enable_secondary();
     smp_online[core] = 1;
+    MB_CLEAN(&smp_online[core]);             /* flush so core 0 sees us (no SMPEN) */
     dsb_sev();                              /* tell core 0 we are up */
     smp_worker_loop(core);                  /* never returns */
 }
@@ -82,6 +104,10 @@ void smp_init(void)
         smp_job_seq[c]  = 0;
         smp_job_done[c] = 0;
         smp_stacktop[c] = (unsigned long)(smp_stack[c] + SMP_STACK_BYTES);
+        /* With the D-cache ON these writes sit in core 0's cache; the secondary
+         * reads its stack top in boot.S with the cache OFF and would get stale
+         * RAM (null stack -> dies on first push).  Clean them to RAM first. */
+        MB_CLEAN(&smp_job_seq[c]); MB_CLEAN(&smp_job_done[c]); MB_CLEAN(&smp_stacktop[c]);
     }
     dsb();
 
@@ -99,13 +125,17 @@ void smp_init(void)
     for (int c = 1; c < SMP_NCORES; c++) {
         smp_release[c] = (unsigned long)&_smp_start;
         *spin_mbox[c]  = (unsigned long)&_smp_start;
+        /* The parked secondary / firmware spin-table reads these with the cache
+         * OFF, so flush them to RAM before the SEV or the core never releases. */
+        MB_CLEAN(&smp_release[c]); MB_CLEAN(spin_mbox[c]);
     }
     dsb_sev();
 
     /* Wait (bounded) for each to announce itself online. */
     for (int c = 1; c < SMP_NCORES; c++) {
         unsigned long spins = 0;
-        while (!smp_online[c] && ++spins < SMP_BRINGUP_WAIT) __asm__ volatile("nop");
+        MB_INVAL(&smp_online[c]);
+        while (!smp_online[c] && ++spins < SMP_BRINGUP_WAIT) { __asm__ volatile("nop"); MB_INVAL(&smp_online[c]); }
     }
 }
 
@@ -134,8 +164,12 @@ long smp_parallel_sum(smp_range_fn fn, long n, int ncores)
         smp_job_fn[c] = fn;
         smp_job_lo[c] = lo;
         smp_job_hi[c] = hi;
+        /* Publish the job params to RAM before bumping seq, so the worker (which
+         * invalidates before reading) sees this job's args, not a stale set. */
+        MB_CLEAN(&smp_job_fn[c]); MB_CLEAN(&smp_job_lo[c]); MB_CLEAN(&smp_job_hi[c]);
         dsb();
         smp_job_seq[c]++;        /* arm the job, then wake the worker */
+        MB_CLEAN(&smp_job_seq[c]);
         dsb_sev();
     }
 
@@ -146,6 +180,7 @@ long smp_parallel_sum(smp_range_fn fn, long n, int ncores)
     for (int c = 1; c < ncores; c++) {
         if (!smp_online[c]) continue;          /* already done inline above */
         unsigned long spins = 0;
+        MB_INVAL(&smp_job_done[c]);
         while (smp_job_done[c] != smp_job_seq[c]) {
             if (++spins >= SMP_WAIT_LIMIT) {   /* worker stuck — do it here */
                 long lo = (long)c * chunk;
@@ -154,7 +189,9 @@ long smp_parallel_sum(smp_range_fn fn, long n, int ncores)
                 break;
             }
             __asm__ volatile("nop");
+            MB_INVAL(&smp_job_done[c]);
         }
+        MB_INVAL(&smp_job_res[c]);
         total += smp_job_res[c];
     }
     return total;

@@ -585,6 +585,70 @@ static long bench_nqueens(long lo, long hi, int core)
     return total;
 }
 
+/* ---- Interleave (stride) split, to match the Pi 3's fair cross-board method.
+ * Instead of a contiguous band, each core takes a residue class of the first-
+ * queen column: core with base `lo` handles columns lo, lo+g_bench_nc, ...
+ * This balances the centre-heavy N-Queens cost (contiguous overloads the middle
+ * core) so the speedup reflects the microarchitecture, not the partitioner.
+ * Dispatched as smp_parallel_sum(fn, nc, nc) so each core c gets lo=c; the
+ * 1-core baseline uses smp_parallel_sum(fn, 1, 1) with g_bench_nc=1 (=> all). */
+static int  g_bench_nc  = 1;    /* interleave stride (= #cores in the parallel run) */
+static long g_primes_hi = 0;    /* upper bound for the interleaved primes count    */
+static long bench_nqueens_il(long lo, long hi, int core)
+{
+    (void)hi; (void)core;
+    int n = g_nq_n;
+    unsigned all = (n >= 32) ? 0xFFFFFFFFu : ((1u << n) - 1u);
+    long total = 0;
+    for (long c = lo; c < n; c += g_bench_nc) {
+        unsigned bit = 1u << c;
+        total += nq_solve(1, bit, bit << 1, bit >> 1, all);
+    }
+    return total;
+}
+static long bench_primes_il(long lo, long hi, int core)
+{
+    (void)hi; (void)core;
+    long cnt = 0;
+    for (long x = lo; x < g_primes_hi; x += g_bench_nc) {
+        if (x < 2) continue;
+        int prime = 1;
+        for (long d = 2; d * d <= x; d++) { if (x % d == 0) { prime = 0; break; } }
+        cnt += prime;
+    }
+    return cnt;
+}
+
+/* ---- N-Queens SECOND-ROW interleave — the Pi 3's actual fair method.
+ * First-row stride (bench_nqueens_il) is too coarse: with only n columns and a
+ * centre-heavy cost, no assignment of n items balances 4 cores (measured: no
+ * better than contiguous).  The Pi 3 splits one level deeper — over the legal
+ * (row0, row1) placements (~n*(n-3) items) — and hands each core a residue
+ * class of that finer list.  We reproduce it exactly so nqueens becomes a fair
+ * cross-board comparison.  Each core enumerates all pairs (cheap) but only
+ * solves those with pair-index % g_bench_nc == lo. */
+static long bench_nqueens_l2_il(long lo, long hi, int core)
+{
+    (void)hi; (void)core;
+    int n = g_nq_n;
+    unsigned all = (n >= 32) ? 0xFFFFFFFFu : ((1u << n) - 1u);
+    long total = 0;
+    long idx = 0;
+    for (int c0 = 0; c0 < n; c0++) {
+        unsigned b0 = 1u << c0;
+        unsigned cols0 = b0, d1_0 = b0 << 1, d2_0 = b0 >> 1;
+        unsigned avail1 = ~(cols0 | d1_0 | d2_0) & all;   /* legal row-1 columns */
+        while (avail1) {
+            unsigned b1 = avail1 & (unsigned)(-(long)avail1);
+            avail1 -= b1;
+            if (idx % g_bench_nc == lo)
+                total += nq_solve(2, cols0 | b1, (d1_0 | b1) << 1, (d2_0 | b1) >> 1, all);
+            idx++;
+        }
+    }
+    return total;
+}
+
 /* ---- Dining Philosophers (SMP): run independent dining tables in [lo,hi),
  * each = g_din_n philosophers doing DIN_ROUNDS deadlock-free meal cycles
  * (Dijkstra resource hierarchy) with a little per-meal compute.  Independent
@@ -636,6 +700,70 @@ static long bench_null(long lo, long hi, int core)
 {
     (void)core;
     return hi - lo;
+}
+
+/* ---- D-cache experiment: run the sweep to SERIAL + HDMI console ------------
+ * Used only by the DCACHE_EXPERIMENT build.  With the D-cache ON there is no
+ * network (the GENET DMA rings are coherent only while the cache is off), so
+ * the result cannot be served over HTTP; this prints it over UART AND the HDMI
+ * text console (screen_puts) so it can be captured by serial OR a photo of the
+ * screen.  Called from main() right after smp_init(), BEFORE any DMA agent
+ * (net/USB/WM) starts, so the D-cache never coexists with an incoherent device
+ * — the only memory touched is the private bench_fill_buf and pure compute.
+ * Same workloads and timing (now_us) as the HTTP /bench, so the numbers compare
+ * directly with the Pi 3 / Pi 5 D-cache experiments. */
+extern void uart_puts(const char *);
+extern void screen_puts(const char *);
+static unsigned long now_us(void);   /* defined later in this file */
+static void sb_out(const char *s) { uart_puts(s); screen_puts(s); }
+void smpbench_serial_run(void)
+{
+    static char b[128];
+    static const long fills[] = { 4096, 16384, 65536, 262144 };
+    int online = smp_cores_online();
+    unsigned long sctlr;
+    __asm__ volatile ("mrs %0, sctlr_el1" : "=r"(sctlr));
+
+    sb_out("\r\n===== smpbench (D-cache experiment, Pi 4 A72) =====\r\n");
+    { int n = s_put(b, 0, "cores_online = "); b[n++] = (char)('0'+online);
+      n = s_put(b, n, "  sctlr=0x"); n = s_puthex(b, n, (unsigned long)sctlr);
+      n = s_put(b, n, "  C="); n = s_put(b, n, (sctlr & (1UL<<2)) ? "1 ON" : "0 OFF");
+      n = s_put(b, n, "\r\n"); b[n]=0; sb_out(b); }
+    sb_out("compare speedup RATIOS (clock varies); agree=yes = coherent.\r\n");
+
+    for (int pass = 0; pass < 3 + (int)(sizeof(fills)/sizeof(fills[0])); pass++) {
+        smp_range_fn fn; long units; const char *label;
+        if (pass == 0)      { g_din_n = 5;  units = 200000;   fn = bench_dining;  label = "dining"; }
+        else if (pass == 1) { g_nq_n = 12;  units = g_nq_n;   fn = bench_nqueens; label = "nqueens"; }
+        else if (pass == 2) { units = online; fn = bench_null; label = "null"; }
+        else { units = fills[pass-3]; fn = bench_fill; label = "fill"; }
+
+        unsigned long t0 = now_us();
+        long r1 = smp_parallel_sum(fn, units, 1);
+        unsigned long us1 = now_us() - t0;
+        t0 = now_us();
+        long rN = smp_parallel_sum(fn, units, online);
+        unsigned long usN = now_us() - t0;
+
+        int n = s_put(b, 0, "  "); n = s_put(b, n, label);
+        if (fn == bench_fill || fn == bench_nqueens) { n = s_put(b, n, " n="); n = s_putdec(b, n, units); }
+        n = s_put(b, n, "  1c="); n = s_putdec(b, n, (long)us1);
+        n = s_put(b, n, "us Nc="); n = s_putdec(b, n, (long)usN);
+        n = s_put(b, n, "us  x100=");
+        n = s_putdec(b, n, usN ? (long)((us1 * 100UL) / usN) : 0);
+        n = s_put(b, n, "  agree="); n = s_put(b, n, (r1 == rN) ? "yes" : "NO");
+        n = s_put(b, n, "\r\n"); b[n]=0; sb_out(b);
+    }
+    sb_out("===== end smpbench =====\r\n");
+#ifdef DCACHE_ON
+    /* With the D-cache ON, everything screen_puts() wrote above is still sitting
+     * in the CPU's D-cache; the GPU scans the framebuffer out of RAM and does
+     * not snoop the cache, so HDMI would show a stale/blank frame.  Write the
+     * whole D-cache back to RAM so the bench table becomes visible on screen
+     * (serial capture is impossible with the local PL2303 adapter, so HDMI +
+     * photo is the only capture path for this experiment). */
+    { extern void dcache_clean_all(void); dcache_clean_all(); }
+#endif
 }
 
 /* ---- N-Queens partial (distributed): count solutions for first-queen columns
@@ -1031,18 +1159,36 @@ static int http_build(const char *req, char *out, int max)
             fn = bench_nqueens;  label = "nqueens"; metric = "solutions";
         }
 
+        /* ?il=1 : use the interleave (stride) split for nqueens/primes so the
+         * speedup is comparable to the Pi 3's fair method (see bench_*_il). */
+        int is_nqueens = (!is_dining && !is_primes && !is_fill && !is_null);
+        int il = q_int(req, "il", 0);           /* 1 = first-row stride, 2 = second-row (Pi 3) */
+        int use_il = il && (is_primes || is_nqueens);
+        if (use_il) {
+            if (is_primes)      { g_primes_hi = units; fn = bench_primes_il; }
+            else if (il >= 2)   { fn = bench_nqueens_l2_il; }   /* Pi 3 fair method */
+            else                { fn = bench_nqueens_il; }
+        }
+
         /* Timed with now_us() (generic-timer microseconds), NOT now_ms():
          * fill is sub-millisecond.  Serial (1 core) then parallel (nc cores)
          * back-to-back, so the speedup ratio is robust to clock changes —
          * the same reporting discipline as the Pi 3. */
-        unsigned long t0 = now_us();
-        long r1 = smp_parallel_sum(fn, units, 1);
-        unsigned long us1 = now_us() - t0;
-        t0 = now_us();
-        long rN = smp_parallel_sum(fn, units, nc);
-        unsigned long usN = now_us() - t0;
+        unsigned long t0, us1, usN;
+        long r1, rN;
+        if (use_il) {
+            /* Interleave: 1-core does the whole set (stride 1); N-core gives each
+             * core c the residue base c (n=nc, ncores=nc => lo=c) with stride nc. */
+            g_bench_nc = 1;  t0 = now_us(); r1 = smp_parallel_sum(fn, 1, 1);   us1 = now_us() - t0;
+            g_bench_nc = nc; t0 = now_us(); rN = smp_parallel_sum(fn, nc, nc);  usN = now_us() - t0;
+        } else {
+            t0 = now_us(); r1 = smp_parallel_sum(fn, units, 1);  us1 = now_us() - t0;
+            t0 = now_us(); rN = smp_parallel_sum(fn, units, nc); usN = now_us() - t0;
+        }
 
-        bl = s_put(body, bl, "SMP bench kind="); bl = s_put(body, bl, label); bl = s_put(body, bl, "\n");
+        bl = s_put(body, bl, "SMP bench kind="); bl = s_put(body, bl, label);
+        if (use_il) bl = s_put(body, bl, " split=interleave");
+        bl = s_put(body, bl, "\n");
         bl = s_put(body, bl, "cores_online = "); bl = s_putdec(body, bl, (long)nc); bl = s_put(body, bl, "\n");
         bl = s_put(body, bl, metric); bl = s_put(body, bl, " = "); bl = s_putdec(body, bl, r1); bl = s_put(body, bl, "\n");
         bl = s_put(body, bl, "1-core   us  = "); bl = s_putdec(body, bl, (long)us1); bl = s_put(body, bl, "\n");
