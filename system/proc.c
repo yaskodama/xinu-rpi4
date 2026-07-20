@@ -329,12 +329,34 @@ void proc_setprio(int pid, int prio)
  * a preemptive switch, so a high-priority periodic task wakes on time and (with
  * preemption on) preempts lower-priority compute.  Only callers of this sleep —
  * resident actors never do, so they keep running cooperatively. */
+/* Microseconds until the earliest RT sleeper's deadline, capped to a periodic
+ * floor (round-robin still happens with no sleepers) and a small minimum (a
+ * just-passed deadline can't storm the timer).  Drives the tickless one-shot. */
+#define PROC_TICK_FLOOR_US 1000UL
+#define PROC_TICK_MIN_US     25UL
+unsigned long proc_next_delay_us(void)
+{
+    unsigned long now = proc_now_us();
+    unsigned long best = PROC_TICK_FLOOR_US;
+    int i;
+    for (i = 0; i < NPROC; i++) {
+        if (proctab[i].state == PR_SLEEP) {
+            unsigned long w = proctab[i].wake_at_us;
+            unsigned long dd = (w > now) ? (w - now) : 0;
+            if (dd < best) best = dd;
+        }
+    }
+    return best < PROC_TICK_MIN_US ? PROC_TICK_MIN_US : best;
+}
+
 void proc_sleep_us(unsigned long us)
 {
+    extern void timer_arm_before_us(unsigned long);   /* tickless one-shot */
     unsigned long d = irq_save();
     struct procent *oldp = &proctab[currpid];
     oldp->wake_at_us = proc_now_us() + us;
     oldp->state = PR_SLEEP;
+    timer_arm_before_us(us);         /* fire precisely at this deadline if nearer */
     struct procent *newp = ready_pop();
     if (newp == 0) newp = &proctab[NULLPROC];
     newp->state = PR_CURR;

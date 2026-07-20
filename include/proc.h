@@ -78,6 +78,7 @@ void proc_exit(void);
 void proc_setprio(int pid, int prio);
 void proc_sleep_us(unsigned long us);
 void proc_timer_tick(void);     /* called from the timer IRQ handler */
+unsigned long proc_next_delay_us(void);  /* us to next RT deadline (tickless one-shot) */
 /* Preemptive scheduling (timer-driven round-robin).  proc_set_preempt(1)
  * enables it; proc_resched_request() is called from the timer ISR; and
  * proc_preempt() (after the IRQ is EOI'd) performs the switch. */
