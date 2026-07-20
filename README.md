@@ -92,7 +92,8 @@ xychart-beta
   coherency; I-cache + MMU on.
 - **Scheduler**: cooperative AArch64 `ctxsw` (S0) **and** preemptive 100 Hz
   round-robin off the GIC-400 + generic timer (S1).
-- First-fit kernel heap (`getmem`/`freemem`), 16-byte aligned, coalescing.
+- First-fit kernel heap (`getmem`/`freemem`), 16-byte granular/aligned,
+  coalescing, IRQ-safe. Covered by host unit tests (see *Testing*).
 
 **Devices (BCM2711, on real hardware)**
 - **HDMI framebuffer + window manager** — a 1280×960 virtual desktop with a
@@ -218,6 +219,26 @@ POST /chainload          upload + jump to a new kernel (no SD swap)
 POST /reboot             BCM2711 watchdog reset
 ```
 
+## Testing
+
+```sh
+make -C test/host run     # native unit tests; non-zero exit on failure
+```
+
+Parts of the kernel are pure logic over plain memory and can be compiled and run
+on the build machine, where they are fast and debuggable and need no SD-card
+round trip. `test/host/memtest.c` `#include`s `mem/memory.c` directly, with only
+`critical.h` shadowed by a host stub — everything else resolves to the real
+kernel headers, so tests and kernel share the same definitions.
+
+It covers the first-fit allocator: sub-header split remainders, minimum-size
+frees, split/coalesce round-trips, a 20 000-iteration randomised churn that
+re-checks every free-list invariant, and rejection of bad frees. This is how the
+`freemem` header-overrun bug was found.
+
+`fs/fat32.c` (it already takes read/write callbacks), `fs/vfs.c` and `cc/` are
+the obvious next candidates.
+
 ## QEMU
 
 ```sh
@@ -229,6 +250,10 @@ make qemu-smoke    # canned commands → qemu-smoke.log
 The QEMU `virt` build uses `-cpu cortex-a76` (MIDR `0x414fd0b1`); the same source
 runs on the Pi 4's Cortex-A72 on hardware. No networking / USB / SD / HDMI under
 QEMU (hardware not modelled).
+
+> **Known broken:** the `qemu` variant currently fails to link (`sd_last_int`,
+> `xhci_msd_*` undefined), so `make qemu` / `make qemu-smoke` do not run.
+> Real hardware is the working verification path. See `NEXT_SESSION_PI4.md`.
 
 ## Layout
 
@@ -245,6 +270,8 @@ xinu-rpi4/
 ├── network/        # arp / ipv4 / icmp / net (xinu-raz stack)
 ├── sdcard/         # config_pi4.txt
 ├── tools/          # remote_chainload.py
+├── test/host/      # native unit tests (`make -C test/host run`)
+├── docs/           # engineering reports (SMP, OS assessment)
 └── doc/            # LaTeX user manuals (EN + JA) → PDF
 ```
 
@@ -254,6 +281,11 @@ xinu-rpi4/
   `USERS_MANUAL_JA.md`, plus typeset PDFs under `doc/` (`doc/Makefile`,
   lualatex). They cover build, deploy, the shell, **WiFi connection**, and
   **multi-node mesh networking**.
+- **OS assessment** (JA): `docs/OS_ASSESSMENT_JA.md` — a read-through of the
+  kernel as an operating system (scheduler, memory, network/drivers, FS and
+  engineering practice), with findings tiered by impact and effort. Doubles as
+  the improvement backlog.
+- SMP + D-cache report (JA): `docs/SMP_REPORT_JA.md`.
 - Session handoff / hard-won hardware facts: `NEXT_SESSION_PI4.md`.
 
 ## Known limits
@@ -268,6 +300,18 @@ xinu-rpi4/
   power cycle clears it.
 - WiFi / ad-hoc are not restored after a reboot — re-run `wifi probe` + `wifi up`
   (or `wifi adhoc`) each boot.
+- The TCP server is a subset: no retransmission, no windowing, no reassembly,
+  and **no segmentation** — an HTTP response over ~1.4 KB is dropped and the
+  client sees a clean close with zero bytes. Idle/half-open connections are
+  reaped (5 s / 60 s) so a stalled peer can't hold a slot forever; `tcpstat`
+  reports `reaped=`.
+- The IP address is hardcoded (`192.168.3.100`); the DHCP client reaches BOUND
+  but its lease is never applied.
+- `/microsd` and `/sd` currently enumerate empty — the FAT32 mount does not
+  complete on hardware.
+- No user/kernel separation: everything, including JIT-compiled code, runs at
+  EL1 in one address space. The HTTP control plane is unauthenticated and
+  includes raw MMIO write and kernel chainload — keep it off untrusted networks.
 
 ## License
 

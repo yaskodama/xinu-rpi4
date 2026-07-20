@@ -391,20 +391,25 @@ xinu-pi4$ ticks
 
 ### 7.4 DHCP / TCP の現状
 
-`system/dhcp_client.c` (DHCP クライアント) と `system/tcp_server.c`
-(単一接続 TCP listener) のコードはツリーに含まれているが、現在は
-`rx_tick` からの **dispatch を OFF** にしている:
+**TCP は有効です。** `system/tcp_server.c` が `rx_tick` から dispatch され、
+ポート 80 で HTTP 制御面を提供します (7.7 節)。かつて TCP を有効にすると
+ICMP echo reply が止まった問題は解消済みです。
 
-- **DHCP**: `dhcp_send_discover()` で wire には正しく出るが、家庭用 router
-  の WiFi↔LAN bridge が DHCP broadcast を片方向しか通さないケースが多く、
-  OFFER が戻らない。連続 broadcast TX で GENET TX ring が劣化し ICMP
-  reply が止まる症状もあり、boot-time DISCOVER と 5 秒周期リトライは外した。
-- **TCP**: SYN+ACK / echo / FIN まで実装済み、port 23 SYN は届くことを
-  確認済みだが、`tcp_handle_packet()` を `rx_tick` から呼ぶだけで以降の
-  ICMP echo reply が止まる現象が出る (詳細は `NEXT_SESSION.md`)。
+ただし実装は RFC 793 の部分集合です。利用時は以下を前提にしてください:
 
-つまり「動くコードはあるが既定では呼ばれない」状態。再有効化は今後の
-スプリント (NET-G bisect) で対応予定。
+- 同時接続は **4 本**まで (`NCONN`)。HTTP リクエストの処理自体は一度に 1 本。
+- **再送・ウィンドウ制御・順序外の再組み立てがありません。**
+- **応答の分割がありません。** 約 1.4 KB を超える HTTP 応答は送出されず、
+  クライアントからは「0 バイトで正常終了」に見えます。大きな出力は分割して
+  取得してください。
+- 無通信の接続は自動回収されます (half-open 5 秒 / 確立済み 60 秒)。回収数は
+  `tcpstat` の `reaped=` で確認できます。これにより、応答を返さないクライアント
+  が 4 スロットを占有し続けてサーバが無反応になることはありません。
+
+**DHCP は未適用です。** `system/dhcp_client.c` はリース取得 (BOUND) まで
+到達しますが、取得したアドレスはスタックに反映されません。IP は
+`192.168.3.100` の固定値のままです。家庭用 router の WiFi↔LAN bridge が
+DHCP broadcast を片方向しか通さず OFFER が戻らないケースがある点も従来どおり。
 
 ### 7.5 WiFi (BCM43455)
 
@@ -491,6 +496,12 @@ xinu-pi4$ wifi aodv 10.0.0.3
 
 実行時診断にこれら HTTP カウンタを使うのは、`uart_puts` が HTTP ワーカコンテキストでデッドロックするためです (PCIe/xHCI の bring-up ログはすべてブート時にシリアルへ出力)。
 
+> **【注意】この HTTP 制御面には認証がありません。** `/mmio-write` は任意の
+> ハードウェアレジスタへの書き込みを、`/chainload` は任意コードのロードを、
+> そのまま誰にでも提供します。またカーネル全体が EL1 の単一アドレス空間で
+> 動作し、ユーザ空間による保護はありません。信頼できないネットワークには
+> 接続しないでください。
+
 **SD 交換なしのカーネル更新 (chainload)。** `POST /chainload` は新カーネルをアップロードして RAM 上でそれにジャンプします。アップロードはヘルパスクリプトが包みます:
 
 ```sh
@@ -517,6 +528,34 @@ QEMU 上では:
   実機 Pi 4 では Cortex-A72 が動く)
 - `halt` は PSCI SYSTEM_OFF が `virt` でハンドルされクリーン終了
 - ネットワーク・USB・SD・HDMI 出力は無し (ハード未モデル)
+
+> **【既知の不具合】** 現在 `qemu` ターゲットはリンクに失敗します
+> (`sd_last_int`、`xhci_msd_*` が未定義)。したがって `make qemu` /
+> `make qemu-smoke` は動作しません。動作確認は実機、および次節の
+> ホストテストで行ってください。
+
+----------------------------------------------------------------------
+
+## 8.5 ホスト側ユニットテスト
+
+カーネルの一部はハードウェアに依存しない純粋なロジックなので、ビルド
+マシン上でそのままコンパイルして実行できます。SD カードを往復させる必要が
+なく高速です。
+
+```sh
+make -C test/host run       # 失敗すると非ゼロで終了
+```
+
+`test/host/memtest.c` は `mem/memory.c` を直接 `#include` し、`critical.h`
+だけをホスト用スタブ (`test/host/critical.h`) で差し替えます。インクルード順の
+指定により他のヘッダは実カーネルのものが解決されるので、テストと本番が同じ
+定義を共有します。
+
+現在カバーしているのは first-fit アロケータで、ヘッダ未満の分割余り、最小
+サイズの解放、分割と合体の往復、20000 回のランダム churn (97 回ごとに
+フリーリストの全不変条件を検査)、不正な解放 (NULL / サイズ 0 / ヒープ外 /
+二重解放) の拒否です。`fs/fat32.c` (既に read/write コールバックを受け取る)、
+`fs/vfs.c`、`cc/` が次の候補です。
 
 ----------------------------------------------------------------------
 
@@ -610,6 +649,10 @@ xinu-rpi4/
 │   └── kernel_virt.img     # QEMU 用 (make qemu で生成)
 ├── sdcard/
 │   └── config_pi4.txt      # Pi 4 用 (install_pi4 がコピー)
+├── test/host/              # ホスト側ユニットテスト (make -C test/host run)
+├── docs/
+│   ├── OS_ASSESSMENT_JA.md # OS としての改良余地アセスメント
+│   └── SMP_REPORT_JA.md    # SMP + D-cache レポート
 ├── README.md               # 開発者向けロードマップ + 内部実装
 ├── USERS_MANUAL_JA.md      # 本ファイル
 └── NEXT_SESSION_PI4.md     # 進行中作業のハンドオフメモ

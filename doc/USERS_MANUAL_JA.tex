@@ -387,11 +387,28 @@ RTT は約 900\,ms (ウィンドウマネージャの tick 律速)。シェル�
 \verb|ticks| で状況確認。
 
 \subsection{DHCP / TCP の現状}
-\verb|system/dhcp_client.c| と \verb|system/tcp_server.c| はツリーに含まれるが、
-\verb|rx_tick| からの dispatch を \textbf{OFF} にしている: 連続 broadcast TX で
-GENET TX ring が劣化し ICMP が止まる、また \verb|tcp_handle_packet()| を
-\verb|rx_tick| から呼ぶと以降の ICMP echo reply が止まるため。再有効化は今後の
-スプリント (NET-G bisect) で対応予定。
+\textbf{TCP は有効です}。\verb|system/tcp_server.c| が \verb|rx_tick| から
+dispatch され、ポート 80 で HTTP 制御面を提供します
+(\ref{sec:httpshell} 節)。かつて TCP を有効にすると ICMP が止まった問題は
+解消済みです。
+
+ただし実装は RFC 793 の部分集合であり、利用時は以下を前提にしてください。
+\begin{itemize}
+\item 同時接続は \textbf{4 本}まで (\verb|NCONN|)。HTTP リクエストの処理自体は
+      一度に 1 本です。
+\item \textbf{再送・ウィンドウ制御・順序外の再組み立てがありません}。
+\item \textbf{応答の分割がありません}。約 1.4\,KB を超える HTTP 応答は
+      送出されず、クライアントからは「0 バイトで正常終了」に見えます。
+      大きな出力を取る場合は分割して取得してください。
+\item 無通信の接続は自動回収されます (half-open 5 秒 / 確立済み 60 秒)。
+      回収数は \verb|tcpstat| の \verb|reaped=| で確認できます。これにより、
+      応答を返さないクライアントが 4 スロットを占有し続けてサーバが
+      無反応になる問題は起きません。
+\end{itemize}
+
+\textbf{DHCP は未適用です}。\verb|system/dhcp_client.c| はリース取得
+(BOUND) まで到達しますが、取得したアドレスはスタックに反映されません。
+IP は \verb|192.168.3.100| の固定値のままです。
 
 \subsection{WiFi (BCM43455)}
 Pi 4 はオンボードの BCM43455 WiFi チップを持ちます (上記の有線 GENET とは別系統)。
@@ -464,7 +481,7 @@ xinu-pi4$ wifi aodv 10.0.0.3
 です (AP に繋がっている場合は先に \verb|wifi off|)。再起動後は復元しないので、各
 ノードで \verb|wifi probe| + \verb|wifi adhoc| を再実行してください。
 
-\subsection{HTTP 制御面とリモートシェル}
+\subsection{HTTP 制御面とリモートシェル}\label{sec:httpshell}
 \verb|system/tcp_server.c| は有線インタフェース上で HTTP サーバ (既定ポート 80、
 \verb|192.168.3.100|) を動かし、ボードをネットワーク越しに丸ごと操作できます:
 \begin{center}\footnotesize
@@ -484,6 +501,12 @@ xinu-pi4$ wifi aodv 10.0.0.3
 実行時診断にこれら HTTP カウンタを使うのは、\verb|uart_puts| が HTTP ワーカ
 コンテキストでデッドロックするためです (bring-up ログはブート時にシリアルへ)。
 
+\textbf{【注意】この HTTP 制御面には認証がありません。}\verb|/mmio-write| は
+任意のハードウェアレジスタへの書き込みを、\verb|/chainload| は任意コードの
+ロードを、そのまま誰にでも提供します。またカーネル全体が EL1 の単一アドレス
+空間で動作し、ユーザ空間による保護はありません。信頼できないネットワークには
+接続しないでください。
+
 \textbf{SD 交換なしのカーネル更新 (chainload)。} \verb|POST /chainload| は新カーネル
 をアップロードして RAM 上でジャンプします。アップロードはヘルパスクリプトが包みます:
 \begin{code}
@@ -502,6 +525,29 @@ make qemu-smoke    # 既定のスクリプトを流し込み qemu-smoke.log に�
 QEMU 上では: \verb|MIDR_EL1| が \verb|0x414fd0b1| (QEMU が公開する Cortex-A76 の
 part 番号。実機 Pi 4 では Cortex-A72)、\verb|halt| は PSCI SYSTEM\_OFF が
 \verb|virt| でハンドルされクリーン終了、ネットワーク・USB・SD・HDMI 出力は無し。
+
+\textbf{【既知の不具合】} 現在 \verb|qemu| ターゲットはリンクに失敗します
+(\verb|sd_last_int|、\verb|xhci_msd_*| が未定義)。したがって
+\verb|make qemu| / \verb|make qemu-smoke| は動作しません。動作確認は実機、
+および次節のホストテストで行ってください。
+
+%======================================================================
+\section{ホスト側ユニットテスト}
+カーネルの一部はハードウェアに依存しない純粋なロジックなので、ビルドマシン上で
+そのままコンパイルして実行できます。SD カードを往復させる必要がなく高速です。
+\begin{code}
+make -C test/host run       # 失敗すると非ゼロで終了
+\end{code}
+\verb|test/host/memtest.c| は \verb|mem/memory.c| を直接 \verb|#include| し、
+\verb|critical.h| だけをホスト用スタブ (\verb|test/host/critical.h|) で
+差し替えます。インクルード順の指定により他のヘッダは実カーネルのものが
+解決されるので、テストと本番が同じ定義を共有します。
+
+現在カバーしているのは first-fit アロケータで、ヘッダ未満の分割余り、最小サイズの
+解放、分割と合体の往復、20000 回のランダム churn (97 回ごとにフリーリストの全
+不変条件を検査)、不正な解放 (NULL / サイズ 0 / ヒープ外 / 二重解放) の拒否です。
+\verb|fs/fat32.c| (既に read/write コールバックを受け取る)、\verb|fs/vfs.c|、
+\verb|cc/| が次の候補です。
 
 %======================================================================
 \section{config.txt の主な設定}
@@ -592,6 +638,10 @@ xinu-rpi4/
 │   └── kernel_virt.img     # QEMU 用 (make qemu で生成)
 ├── sdcard/
 │   └── config_pi4.txt      # Pi 4 用 (install_pi4 がコピー)
+├── test/host/              # ホスト側ユニットテスト (make -C test/host run)
+├── docs/
+│   ├── OS_ASSESSMENT_JA.md # OS としての改良余地アセスメント
+│   └── SMP_REPORT_JA.md    # SMP + D-cache レポート
 ├── README.md               # 開発者向けロードマップ + 内部実装
 ├── USERS_MANUAL_JA.md      # 本マニュアルの Markdown 版
 ├── USERS_MANUAL_EN.md      # 英語版

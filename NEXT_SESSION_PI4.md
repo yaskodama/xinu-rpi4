@@ -1,7 +1,104 @@
 # Pi4 (xinu-rpi4) — Next-Session Handoff
 
-Last updated: **2026-06-20** (post-crash recovery + WiFi badge).  Branch
-**`feat/smp-4core-and-basic-graphics`**.  Older notes kept below for reference.
+Last updated: **2026-07-20** (OS assessment + Tier-0 hardening + host tests).
+Older notes kept below for reference.
+
+---
+
+## ★ 2026-07-20 session — OS assessment, Tier-0 fixes, first host test suite
+
+Build **md5 `74d3ff7f`** (was `cfeeb18c`).  Flashed to SD, cold-booted, verified
+on real hardware at `192.168.3.100`.  Card keeps `kernel8.img.prev` =
+`cfeeb18c` as the known-good fallback.
+
+### What this session was
+
+A full read-through of the kernel as an *operating system* — scheduler,
+memory, network/drivers, FS/tooling — written up in
+**`docs/OS_ASSESSMENT_JA.md`** (Tier 0/1/2, file:line, ranked by impact/effort).
+Then the five Tier-0 items were fixed and verified.  **Read that document first
+next session**: it is the backlog.
+
+### Fixed (all five Tier-0 items)
+
+1. **Heap split overran by 8 bytes.**  `getmem()` split whenever the remainder
+   was `> 0`, but writes a 16-byte `struct memblk` header — an 8-byte remainder
+   clobbered the successor and spliced a bogus free node into the list.
+   `freemem()` had the *same* bug (freeing an 8-byte region writes 16 bytes).
+   Root fix: **`MEM_ALIGN` 8 → 16** in `include/memory.h`, so every size is a
+   multiple of `sizeof(struct memblk)` and both cases become impossible.
+   Bonus: process stacks (straight out of `getmem`) are now 16-byte aligned,
+   which is what AArch64 SP actually requires.
+2. **Heap was IRQ/preemption unsafe.**  `getmem`/`freemem`/`mem_largest_block`/
+   `mem_free_block_count` now run under `irq_save`/`irq_restore`.  (`proc_create`
+   called `getmem` outside a critical section while `proc_kill` called `freemem`
+   inside one — the asymmetry was the tell.)
+3. **Remote memory disclosure via ICMP/TCP.**  `net_responder.c` echoed
+   `14 + total_len` bytes with `total_len` taken from the packet and checked only
+   against 1518 — never against the received length.  A 60-byte ping declaring
+   `total_len=1400` got ~1.3 KB of adjacent RX-ring memory (i.e. previous
+   packets) mailed back.  `tcp_server.c` had the same shape plus an unvalidated
+   `data_off`.  Both now validate against the wire length.
+4. **Four SYNs = permanent DoS.**  `struct tcp_conn` had no timestamp and no
+   retransmit timer, so half-open conns never left SYN_RCVD; `NCONN`(=4) bare
+   SYNs killed HTTP until reboot.  Added `tcp_conn_reap()` (half-open 5 s,
+   ESTABLISHED 60 s), called from the RX tick, plus `reaped=` in `tcpstat`.
+5. **`cat /microsd/x` read physical address 0.**  FAT32 nodes are registered
+   with a size but `data == NULL`; `cat`/`cp`/`mv` dereferenced it and, because
+   page 0 is identity-mapped RW, printed low RAM instead of faulting.  Guarded.
+
+### NEW: `test/host/` — native unit tests
+
+```sh
+make -C test/host run        # non-zero exit on failure
+```
+
+Compiles kernel logic *on the build machine*: `memtest.c` `#include`s
+`mem/memory.c` directly, with only `critical.h` shadowed by a host stub
+(`test/host/critical.h`).  Include order puts `test/host` first, so everything
+else resolves to the real kernel headers — tests and kernel share definitions.
+
+**This paid for itself immediately**: the `freemem` half of bug 1 was found by
+the 20 000-iteration random churn test, not by reading.  Sanity check on the
+harness: run it against `ccb6437`'s allocator and it reports **5 failures**;
+against the fixed one, all pass.
+
+`fs/fat32.c` (takes read/write callbacks), `fs/vfs.c` and `cc/` are the obvious
+next candidates — all are pure logic over byte arrays, no new abstraction needed.
+
+### ⚠️ `make qemu-smoke` DOES NOT BUILD (pre-existing, not a regression)
+
+`sd_last_int`, `xhci_msd_bulk_in/out`, `xhci_msd_clear_halt`, `xhci_msd_present`
+are undefined in the `qemu` variant — link fails.  Confirmed by `git stash`-ing
+to `ccb6437` and rebuilding: **already broken before this session**.  So the
+repo's only "test" has not been running, and real hardware was the only
+verification path.  Either stub those symbols for the qemu variant or drop the
+objects that reference them from `COMPONENTS`.
+
+### Hardware verification (cold boot, `192.168.3.100`)
+
+| Check | Result |
+|---|---|
+| `ping` ×5 | 5/5, 0% loss — the ICMP length check does not break valid echoes |
+| `GET /`, `/ticks` | OK, `txfail=0` |
+| Reaper false positives | 10 healthy conns → `reaped=0`, `drop_syn=0` |
+| **Reaper actually frees slots** | idle conns held slots → **`reaped=3`**, all slots back to LISTEN |
+| Heap after `MEM_ALIGN`=16 | `mem`: free 977733 KiB, **free blocks = 1**, largest = whole region |
+| `cat` guard | **NOT verified** — `/microsd` and `/sd` are empty (see below) |
+
+### Still open / next steps
+
+- **`/microsd` and `/sd` enumerate empty** (the old "ls /sd looks EMPTY over
+  HTTP" symptom, line ~123 below).  This blocks verifying fix 5 and makes the
+  FAT32 path untestable on hardware.  Worth chasing first — it also gates the
+  real fix for 5 (store `first_cluster` in `vfs_node_t` and demand-load).
+- **Next Tier-1 item is `proc_resched()`** (`docs/OS_ASSESSMENT_JA.md` §⑦):
+  it pops the best ready process *before* pushing the running one back, so the
+  current task's priority never participates — priority preemption is really
+  round-robin.  A few lines, and it is the P1/RTOS headline.
+- Then: O(1) ready queue + sorted sleep queue (§⑧), W^X + stack canaries
+  (§⑥⑫), DMA cache discipline in genet/xhci → `DCACHE_ON` (§⑩, the single
+  largest performance lever in the tree).
 
 ---
 
