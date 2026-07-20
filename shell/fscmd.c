@@ -124,6 +124,11 @@ int cmd_cat(int argc, char **argv)
     for (int a = 1; a < argc; a++) {
         vfs_node_t *n = vfs_resolve(argv[a]);
         if (!n || n->kind != VFS_FILE) { err2("cat", "not a file", argv[a]); continue; }
+        /* FAT32 entries are registered with a size but no data (see the
+         * /microsd mount in loader/main.c): contents are not loaded.  Without
+         * this guard we'd deref NULL and, because address 0 is identity-mapped
+         * RW, silently print n->size bytes of low physical RAM. */
+        if (!n->data) { err2("cat", "contents not loaded", argv[a]); continue; }
         const char *d = (const char *)n->data;
         for (unsigned long i = 0; i < n->size; i++) uart_putc(d[i]);
         if (n->size && d[n->size - 1] != '\n') uart_putc('\n');
@@ -220,6 +225,7 @@ int cmd_cp(int argc, char **argv)
     if (argc < 3) { uart_puts("usage: cp <src> <dst>\n"); return -1; }
     vfs_node_t *src = vfs_resolve(argv[1]);
     if (!src || src->kind != VFS_FILE) { err2("cp", "src not a file", argv[1]); return -1; }
+    if (!src->data && src->size) { err2("cp", "src contents not loaded", argv[1]); return -1; }
     vfs_node_t *dst = dst_file(argv[2], src->name);
     if (!dst) { err2("cp", "cannot create dst", argv[2]); return -1; }
     if (dst == src) { err2("cp", "source and dest are the same", argv[1]); return -1; }
@@ -232,6 +238,7 @@ int cmd_mv(int argc, char **argv)
     if (argc < 3) { uart_puts("usage: mv <src-file> <dst>\n"); return -1; }
     vfs_node_t *src = vfs_resolve(argv[1]);
     if (!src || src->kind != VFS_FILE) { err2("mv", "src not a file", argv[1]); return -1; }
+    if (!src->data && src->size) { err2("mv", "src contents not loaded", argv[1]); return -1; }
     vfs_node_t *dst = dst_file(argv[2], src->name);
     if (!dst) { err2("mv", "cannot create dst", argv[2]); return -1; }
     if (dst == src) return 0;

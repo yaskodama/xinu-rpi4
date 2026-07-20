@@ -113,6 +113,11 @@ struct tcp_conn {
      * /actor/load bodies (N-Queens + GC + extra) fit headers + body. */
     char httpreq[32768];
     int  httpreqlen;
+    /* Wall-clock stamp of the last segment seen on this conn.  Without it
+     * a connection only ever advances on receive, so four SYNs whose final
+     * ACK never arrives pin all NCONN slots in SYN_RCVD forever and the
+     * server is dead until reboot.  tcp_conn_reap() uses this. */
+    unsigned long last_ms;
 };
 
 static struct tcp_conn g_conns[NCONN];
@@ -794,6 +799,40 @@ static unsigned long now_ms(void)
     __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz));
     if (!hz) return 0;
     return (ct * 1000UL) / hz;
+}
+
+/* ---- Idle-connection reaper -------------------------------------------
+ * Called from the RX tick.  A connection that stops receiving never leaves
+ * its state on its own (there is no retransmit timer), so a peer that
+ * vanishes — or an attacker sending NCONN bare SYNs — otherwise holds a
+ * slot for good.  Recycle slots that have gone quiet.  Half-open states get
+ * a short fuse; ESTABLISHED gets a long one so a slow client isn't cut off
+ * mid-request. */
+#define TCP_HALFOPEN_TIMEOUT_MS  5000UL
+#define TCP_ESTAB_TIMEOUT_MS    60000UL
+
+static unsigned long g_reaped;          /* slots recycled by the reaper */
+
+void tcp_conn_reap(void)
+{
+    unsigned long now = now_ms();
+    for (int i = 0; i < NCONN; i++) {
+        struct tcp_conn *c = &g_conns[i];
+        if (c->state == TCP_CLOSED || c->state == TCP_LISTEN) continue;
+
+        unsigned long limit = (c->state == TCP_ESTABLISHED)
+                            ? TCP_ESTAB_TIMEOUT_MS
+                            : TCP_HALFOPEN_TIMEOUT_MS;
+        /* now_ms() is monotonic here (free-running counter, 64-bit), so a
+         * plain subtraction is safe; guard against a zero stamp anyway. */
+        if (c->last_ms == 0 || now < c->last_ms) { c->last_ms = now; continue; }
+        if (now - c->last_ms < limit) continue;
+
+        c->state      = TCP_LISTEN;
+        c->httpreqlen = 0;
+        c->greeted    = 0;
+        g_reaped++;
+    }
 }
 
 /* Microsecond timer off the same generic counter — the ms version rounds too
@@ -2535,6 +2574,15 @@ int tcp_handle_packet(const unsigned char *frame, int len)
     unsigned char data_off = (tcp[12] >> 4) * 4;
     unsigned char flags    = tcp[13] & 0x3F;
     int total_len = ((unsigned short)ip[2] << 8) | ip[3];
+
+    /* Both total_len and data_off come off the wire.  Validate them
+     * against the frame we actually received before deriving data/data_len:
+     * otherwise `data` can point past the frame (into stale RX-ring bytes,
+     * i.e. previous packets) and the bogus data_len desyncs peer_seq. */
+    if (data_off < 20) return 1;                     /* malformed header */
+    if (total_len < ihl + data_off) return 1;
+    if (total_len > len - 14) return 1;              /* header lies about length */
+
     int data_len  = total_len - ihl - data_off;
     const volatile unsigned char *data = tcp + data_off;
 
@@ -2543,6 +2591,7 @@ int tcp_handle_packet(const unsigned char *frame, int len)
      * fall-through to the SYN-handling branch below covers the truly
      * new-connection case. */
     struct tcp_conn *c = find_conn(ip + 12, sport);
+    if (c != 0) c->last_ms = now_ms();   /* keep-alive for the reaper */
 
     if (c == 0) {
         /* No existing connection.  Only a SYN can open one. */
@@ -2564,6 +2613,7 @@ int tcp_handle_packet(const unsigned char *frame, int len)
         g_isn_seed  += 0x100;
         c->greeted   = 0;
         c->httpreqlen = 0;
+        c->last_ms   = now_ms();
 
         uart_puts("tcp: SYN from "); puts_ip(c->peer_ip);
         uart_puts(":"); puts_u32_dec(sport); uart_puts(" -> SYN+ACK\n");
@@ -2709,6 +2759,7 @@ void tcp_dump_state(void)
     uart_puts(" estab=");   puts_u32_dec(g_estab);
     uart_puts(" txfail=");  puts_u32_dec(g_txfail);
     uart_puts(" drop_syn=");puts_u32_dec(g_dropped_syn);
+    uart_puts(" reaped=");  puts_u32_dec(g_reaped);
     uart_puts("\n");
     for (int i = 0; i < NCONN; i++) {
         struct tcp_conn *c = &g_conns[i];

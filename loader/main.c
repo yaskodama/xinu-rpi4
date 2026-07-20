@@ -52,6 +52,7 @@ extern unsigned long dhcp_discover_count(void);
 extern unsigned long dhcp_offer_count(void);
 extern unsigned long dhcp_ack_count(void);
 extern int  tcp_handle_packet(const unsigned char *frame, int len);
+extern void tcp_conn_reap(void);
 extern void tcp_set_mac(const unsigned char mac[6]);
 extern void tcp_listen(unsigned short port);
 /* TCP listener live counters for the on-screen Network panel (the Pi
@@ -152,6 +153,10 @@ static void genet_rx_tick(void)
         }
         genet_rx_release();
     }
+    /* Recycle TCP slots whose peer went silent (half-open SYN floods and
+     * vanished clients would otherwise pin all NCONN slots permanently). */
+    tcp_conn_reap();
+
     /* Re-arm the RX-done interrupt: the handler self-masked when it fired,
      * so unmask it now that we've drained what was pending. */
     genet_irq_rearm();
