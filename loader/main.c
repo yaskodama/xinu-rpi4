@@ -53,6 +53,7 @@ extern unsigned long dhcp_offer_count(void);
 extern unsigned long dhcp_ack_count(void);
 extern int  tcp_handle_packet(const unsigned char *frame, int len);
 extern void tcp_conn_reap(void);
+extern int  tcp_needs_tick(void);
 extern void tcp_set_mac(const unsigned char mac[6]);
 extern void tcp_listen(unsigned short port);
 /* TCP listener live counters for the on-screen Network panel (the Pi
@@ -294,6 +295,13 @@ static void net_yield_tick(void)
      * bring-up blocks this wm tick ~1 min, but net/app keep serving the
      * Ethernet gateway + /fb mirror, and the HTTP reply already flushed. */
     { extern void wifi_adhoc_poll_pending(void); wifi_adhoc_poll_pending(); }
+    /* TCP retransmit timer.  The net process only wakes on an RX interrupt,
+     * so if the peer goes silent — exactly the case where a lost segment
+     * needs retransmitting — its tick would never run.  Kick it from here
+     * instead of transmitting directly: every TCP send goes through one
+     * shared tx_frame, so doing it from this context would race the net
+     * process mid-frame whenever preemption is on. */
+    if (tcp_needs_tick()) waiter_kick(&g_net_w);
     proc_yield();
 }
 

@@ -25,6 +25,13 @@ extern int llm_run_drain(const char *prompt, int max_new, char *out, int outcap,
 extern int cc_actor_send_str(int actor, const char *method, const char *strarg, char *out, int outcap);
 /* 100 Hz IRQ-driven tick counter (device/timer/timer.c) — for /ticks diag. */
 extern unsigned long timer_ticks(void);
+/* Scheduler health, surfaced by GET /ticks (see include/proc.h). */
+extern int           proc_ready_count(void);
+extern int           proc_ready_top_prio(void);
+extern unsigned long proc_ctxsw_count(void);
+extern unsigned long proc_stk_bad_count(void);
+extern int           proc_stk_bad_pid(void);
+extern const char   *proc_stk_bad_name(void);
 /* Preemptive-scheduling demo (system/actorproc.c): interleave log -> out. */
 extern int preempt_demo(char *out, int outcap);
 
@@ -99,6 +106,25 @@ enum {
  * accumulation continue in parallel and queue when the worker is free. */
 #define NCONN 4
 
+/* --- Send path: segmentation + retransmission ---------------------------
+ *
+ * Previously tcp_send() refused anything over one frame while tcp_app_flush()
+ * handed it the whole response in one call, so any HTTP body over ~1.4 KB was
+ * dropped outright — g_app_served still counted it and the FIN still went out,
+ * so the client saw a clean close with zero bytes.  (`/fb` was hand-chunked to
+ * 1200 B to dodge this; nothing else was.)
+ *
+ * Now each connection owns a send buffer that holds the response until the
+ * peer acknowledges it.  tcp_pump() emits MSS-sized segments up to the
+ * in-flight limit, ACKs slide snd_una forward, and the RX tick retransmits
+ * from snd_una when the RTO expires.  The FIN is only sent once every data
+ * byte has been acknowledged. */
+#define TCP_MSS         1460            /* 1500 MTU - 20 IP - 20 TCP        */
+#define TCP_SND_BUF     16384           /* matches g_app_resp               */
+#define TCP_MAX_INFLIGHT (4 * TCP_MSS)  /* our own cap, on top of peer's win */
+#define TCP_RTO_MS      500UL
+#define TCP_MAX_RETRIES 6
+
 struct tcp_conn {
     int state;
     unsigned char peer_mac[6];
@@ -118,6 +144,19 @@ struct tcp_conn {
      * ACK never arrives pin all NCONN slots in SYN_RCVD forever and the
      * server is dead until reboot.  tcp_conn_reap() uses this. */
     unsigned long last_ms;
+
+    /* Unacknowledged outbound data.  snd_seq0 is the sequence number of
+     * snd[0]; snd_una is how much the peer has acknowledged and snd_nxt how
+     * much we have put on the wire, both as offsets into snd[]. */
+    char          snd[TCP_SND_BUF];
+    int           snd_len;
+    int           snd_una;
+    int           snd_nxt;
+    unsigned long snd_seq0;
+    unsigned long snd_last_tx_ms;
+    int           snd_retries;
+    int           snd_fin_pending;   /* close once everything is acked */
+    unsigned short peer_win;         /* peer's advertised receive window */
 };
 
 static struct tcp_conn g_conns[NCONN];
@@ -195,7 +234,17 @@ static volatile int g_app_state;
 static int          g_app_conn_idx = -1;   /* which g_conns[] slot owns this request */
 static char         g_app_req[32768];   /* matches per-conn httpreq[] */
 static int          g_app_req_len;
-static int          g_chain_len;         /* bytes staged at 0x4000000 by /chainload */
+/* --- /chainload staging -------------------------------------------------
+ *
+ * This used to write straight to a fixed 0x4000000.  That was chosen when the
+ * kernel was ~115 KB; .bss has since grown to end at _end ≈ 0x4233B18, so the
+ * fixed address sat about 2 MB INSIDE the running kernel's own .bss and every
+ * upload overwrote live kernel state — the box wedged partway through, before
+ * the image was ever booted.  Stage into a heap buffer (always above _end)
+ * instead, and refuse anything that would touch the running image. */
+#define CHAIN_STAGE_CAP  (4UL * 1024 * 1024)
+static unsigned char *g_chain_stage;     /* heap staging buffer, above _end */
+static int          g_chain_len;         /* bytes staged so far             */
 static char         g_app_resp[16384];  /* matches http_build's body[] cap */
 static int          g_app_resp_len;
 static unsigned long g_app_served;     /* responses flushed (diagnostic)     */
@@ -432,6 +481,87 @@ static int tcp_send(struct tcp_conn *c,
     }
 
     return genet_tx_frame((const unsigned char *)tx_frame, send_len);
+}
+
+static unsigned long now_ms(void);   /* defined with the other clock helpers */
+
+/* ---- Send pump: emit as much of snd[] as the window allows -------------
+ *
+ * Called after queueing a response, when an ACK opens the window, and from
+ * the retransmit path.  Sends whole MSS segments (the tail may be short),
+ * bounded by both the peer's advertised window and our own in-flight cap so
+ * a large response can't outrun the single-frame TX path in genet.
+ *
+ * The FIN is deliberately held back until snd_una reaches snd_len: closing
+ * with data still unacknowledged is what made truncated responses look like
+ * successful ones. */
+static void tcp_pump(struct tcp_conn *c)
+{
+    if (c->state != TCP_ESTABLISHED && c->state != TCP_FIN_WAIT_1) return;
+
+    int limit = TCP_MAX_INFLIGHT;
+    if (c->peer_win && c->peer_win < limit) limit = c->peer_win;
+    if (limit < TCP_MSS) limit = TCP_MSS;      /* always make progress */
+
+    while (c->snd_nxt < c->snd_len) {
+        int inflight = c->snd_nxt - c->snd_una;
+        if (inflight >= limit) break;
+
+        int n = c->snd_len - c->snd_nxt;
+        if (n > TCP_MSS) n = TCP_MSS;
+
+        c->my_seq = c->snd_seq0 + (unsigned long)c->snd_nxt;
+        if (tcp_send(c, TCP_FLAG_PSH | TCP_FLAG_ACK, c->snd + c->snd_nxt, n) != 0) {
+            g_txfail++;
+            break;                              /* retry on the next tick */
+        }
+        c->snd_nxt += n;
+        c->snd_last_tx_ms = now_ms();
+    }
+
+    /* Leave my_seq pointing at the next NEW byte, so a pure ACK emitted from
+     * some other path doesn't carry a mid-stream sequence number. */
+    if (c->snd_len > 0) c->my_seq = c->snd_seq0 + (unsigned long)c->snd_nxt;
+
+    /* Everything sent AND acknowledged: it is finally safe to close. */
+    if (c->snd_fin_pending && c->snd_una >= c->snd_len && c->snd_nxt >= c->snd_len) {
+        c->my_seq = c->snd_seq0 + (unsigned long)c->snd_len;
+        if (tcp_send(c, TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0) == 0) {
+            c->my_seq += 1;
+            c->snd_fin_pending = 0;
+            c->state = TCP_FIN_WAIT_1;
+            c->snd_last_tx_ms = now_ms();
+        }
+    }
+}
+
+/* Queue a response body on a connection and start sending it. */
+static void tcp_send_response(struct tcp_conn *c, const char *body, int len)
+{
+    if (len < 0) len = 0;
+    if (len > TCP_SND_BUF) len = TCP_SND_BUF;   /* truncate, but honestly */
+    for (int i = 0; i < len; i++) c->snd[i] = body[i];
+    c->snd_len         = len;
+    c->snd_una         = 0;
+    c->snd_nxt         = 0;
+    c->snd_seq0        = c->my_seq;
+    c->snd_retries     = 0;
+    c->snd_fin_pending = 1;
+    c->snd_last_tx_ms  = now_ms();
+    tcp_pump(c);
+}
+
+/* Peer acknowledged up to `ack`: slide the window and send more. */
+static void tcp_on_ack(struct tcp_conn *c, unsigned long ack)
+{
+    if (c->snd_len > 0) {
+        unsigned long acked = ack - c->snd_seq0;      /* wraps correctly */
+        if (acked <= (unsigned long)c->snd_len && (int)acked > c->snd_una) {
+            c->snd_una     = (int)acked;
+            c->snd_retries = 0;
+        }
+    }
+    tcp_pump(c);
 }
 
 /* =====================================================================
@@ -812,6 +942,21 @@ static unsigned long now_ms(void)
 #define TCP_ESTAB_TIMEOUT_MS    60000UL
 
 static unsigned long g_reaped;          /* slots recycled by the reaper */
+static unsigned long g_retrans;         /* segments retransmitted        */
+
+/* Does any connection have work that only a timer can advance (unacked data
+ * or a pending FIN)?  Read-only and racy by design: the wm loop calls it to
+ * decide whether to wake the net process, and a missed or spurious wake just
+ * shifts the retransmit by one tick. */
+int tcp_needs_tick(void)
+{
+    for (int i = 0; i < NCONN; i++) {
+        const struct tcp_conn *c = &g_conns[i];
+        if (c->state == TCP_CLOSED || c->state == TCP_LISTEN) continue;
+        if (c->snd_una < c->snd_nxt || c->snd_fin_pending) return 1;
+    }
+    return 0;
+}
 
 void tcp_conn_reap(void)
 {
@@ -819,6 +964,33 @@ void tcp_conn_reap(void)
     for (int i = 0; i < NCONN; i++) {
         struct tcp_conn *c = &g_conns[i];
         if (c->state == TCP_CLOSED || c->state == TCP_LISTEN) continue;
+
+        /* Retransmit before reaping: an unacknowledged segment means the
+         * peer never got it, and without this the transfer simply stalls
+         * until the idle timer kills the connection. */
+        if (c->snd_una < c->snd_nxt &&
+            now >= c->snd_last_tx_ms &&
+            now - c->snd_last_tx_ms >= TCP_RTO_MS) {
+            if (++c->snd_retries > TCP_MAX_RETRIES) {
+                /* Peer is gone.  Drop the connection rather than resend for
+                 * ever; the slot goes back into service immediately. */
+                c->state = TCP_LISTEN;
+                c->snd_len = c->snd_una = c->snd_nxt = 0;
+                c->snd_fin_pending = 0;
+                c->httpreqlen = 0;
+                g_reaped++;
+                continue;
+            }
+            c->snd_nxt = c->snd_una;          /* go-back-N */
+            g_retrans++;
+            tcp_pump(c);
+            continue;                          /* it is alive; don't reap */
+        }
+        /* A FIN we sent may also need repeating. */
+        if (c->snd_fin_pending && c->snd_una >= c->snd_len &&
+            now >= c->snd_last_tx_ms && now - c->snd_last_tx_ms >= TCP_RTO_MS) {
+            tcp_pump(c);
+        }
 
         unsigned long limit = (c->state == TCP_ESTABLISHED)
                             ? TCP_ESTAB_TIMEOUT_MS
@@ -831,6 +1003,8 @@ void tcp_conn_reap(void)
         c->state      = TCP_LISTEN;
         c->httpreqlen = 0;
         c->greeted    = 0;
+        c->snd_len = c->snd_una = c->snd_nxt = 0;
+        c->snd_fin_pending = 0;
         g_reaped++;
     }
 }
@@ -1017,7 +1191,7 @@ static int http_build(const char *req, char *out, int max)
     int  bl = 0;
     const char *ctype = "application/json";
     const char *extra = "";              /* optional extra response header(s) */
-    (void)max;
+    if (max < 512) return 0;             /* caller gave us nothing usable */
 
     if (starts_with(req, "GET /wifi-adhoc")) {
         char sb[40];
@@ -1227,6 +1401,19 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, " EL=");        bl = s_putdec(body, bl, (long)((el >> 2) & 3));
         bl = s_put(body, bl, " cntp_ctl=");  bl = s_putdec(body, bl, (long)ctl);   /* bit0=EN bit1=IMASK bit2=ISTATUS */
         bl = s_put(body, bl, " daif=");      bl = s_putdec(body, bl, (long)((daif >> 6) & 0xf));
+        bl = s_put(body, bl, "\n");
+        /* Scheduler health: ready-queue depth and the top runnable priority
+         * (both O(1) now that ready is a per-priority FIFO + bitmap), plus the
+         * stack-canary counter.  stkbad>0 means some process ran off the
+         * bottom of its stack into the neighbouring heap block. */
+        bl = s_put(body, bl, "ready=");      bl = s_putdec(body, bl, (long)proc_ready_count());
+        bl = s_put(body, bl, " topprio=");   bl = s_putdec(body, bl, (long)proc_ready_top_prio());
+        bl = s_put(body, bl, " ctxsw=");     bl = s_putdec(body, bl, (long)proc_ctxsw_count());
+        bl = s_put(body, bl, " stkbad=");    bl = s_putdec(body, bl, (long)proc_stk_bad_count());
+        if (proc_stk_bad_count()) {
+            bl = s_put(body, bl, " stkbad_pid=");  bl = s_putdec(body, bl, (long)proc_stk_bad_pid());
+            bl = s_put(body, bl, " stkbad_name="); bl = s_put(body, bl, proc_stk_bad_name());
+        }
         bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "GET /smp-bench") || starts_with(req, "POST /smp-bench")) {
         /* SMP benchmark: count primes in [0,n) on 1 core, then on all online
@@ -2336,27 +2523,47 @@ static int http_build(const char *req, char *out, int max)
          * The Mac client splits kernel8.img into chunks, POSTs each to its
          * offset into staging RAM 0x4000000, then GET ?go. */
         ctype = "text/plain";
-        volatile unsigned char *STAGE = (volatile unsigned char *)0x4000000UL;
+        extern void *kmalloc(unsigned long);
+        extern unsigned char _end[];
         if (req[0] == 'P') {
             int off = q_int(req, "off", -1);
             int cl  = content_length(req);
             int he  = find_header_end(req);
-            if (off == 0) g_chain_len = 0;                 /* new upload */
-            if (off >= 0 && cl > 0 && he >= 0) {
+            if (off == 0) {                                 /* new upload */
+                g_chain_len = 0;
+                if (!g_chain_stage) g_chain_stage = (unsigned char *)kmalloc(CHAIN_STAGE_CAP);
+            }
+            if (!g_chain_stage) {
+                bl = s_put(body, bl, "chainload: no staging memory\n");
+            } else if (off < 0 || cl <= 0 || he < 0) {
+                bl = s_put(body, bl, "usage: POST /chainload?off=<byte>  body=<chunk>\n");
+            } else if ((unsigned long)off + (unsigned long)cl > CHAIN_STAGE_CAP) {
+                /* Refuse rather than run off the end of the buffer — the old
+                 * code had no bound at all. */
+                bl = s_put(body, bl, "chainload: chunk past staging capacity\n");
+            } else {
                 const unsigned char *b = (const unsigned char *)(req + he);
-                for (int i = 0; i < cl; i++) STAGE[off + i] = b[i];   /* binary-safe */
+                unsigned char *stage = g_chain_stage;
+                for (int i = 0; i < cl; i++) stage[off + i] = b[i];   /* binary-safe */
                 if (off + cl > g_chain_len) g_chain_len = off + cl;
                 bl = s_put(body, bl, "ok off="); bl = s_putdec(body, bl, off);
                 bl = s_put(body, bl, " n=");      bl = s_putdec(body, bl, cl);
                 bl = s_put(body, bl, " total=");  bl = s_putdec(body, bl, g_chain_len);
                 bl = s_put(body, bl, "\n");
-            } else {
-                bl = s_put(body, bl, "usage: POST /chainload?off=<byte>  body=<chunk>\n");
             }
         } else if (q_int(req, "go", 0)) {
             int len = q_int(req, "len", g_chain_len);
             extern void kernel_chainload(unsigned long stage, unsigned long len);
-            kernel_chainload(0x4000000UL, (unsigned long)len);   /* never returns */
+            if (!g_chain_stage || len <= 0) {
+                bl = s_put(body, bl, "chainload: nothing staged\n");
+            } else if ((unsigned long)g_chain_stage < (unsigned long)_end) {
+                /* Belt and braces: never boot from a buffer that overlaps the
+                 * running image (the bug this route used to have). */
+                bl = s_put(body, bl, "chainload: staging overlaps the running kernel; refused\n");
+            } else {
+                kernel_chainload((unsigned long)g_chain_stage,
+                                 (unsigned long)len);        /* never returns */
+            }
         } else {
             bl = s_put(body, bl, "staged="); bl = s_putdec(body, bl, g_chain_len);
             bl = s_put(body, bl, " bytes.  GET /chainload?go=1&len=<N> to boot it.\n");
@@ -2425,6 +2632,15 @@ static int http_build(const char *req, char *out, int max)
     } else {
         ctype = "text/plain";
         bl = s_put(body, bl, "404 not found\n");
+    }
+    /* Honour `max`.  body[] and out[] are the same size, so headers alone
+     * pushed the copy below past the end of out[] — a BSS overflow whose
+     * size grew with the response.  Reserve header room and truncate the
+     * body here, BEFORE Content-Length is emitted, so the declared length
+     * still matches what we actually send. */
+    if (bl > max - 256) {
+        bl = max - 256;
+        if (bl < 0) bl = 0;
     }
     body[bl] = 0;
 
@@ -2504,13 +2720,12 @@ void tcp_app_flush(void)
     struct tcp_conn *c = (g_app_conn_idx >= 0 && g_app_conn_idx < NCONN)
                        ? &g_conns[g_app_conn_idx] : 0;
     if (c && c->state == TCP_ESTABLISHED) {
-        tcp_send(c, TCP_FLAG_PSH | TCP_FLAG_ACK, g_app_resp, g_app_resp_len);
-        c->my_seq += g_app_resp_len;
-        tcp_send(c, TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0);
-        c->my_seq += 1;
-        c->state = TCP_FIN_WAIT_1;
+        /* Hand the whole body to the send pump: it segments to the MSS,
+         * retransmits what is lost, and only closes once the peer has
+         * acknowledged every byte. */
+        tcp_send_response(c, g_app_resp, g_app_resp_len);
         g_app_served++;
-        uart_puts("http: served request (worker), FIN sent\n");
+        uart_puts("http: served request (worker), response queued\n");
     } else {
         uart_puts("http: connection gone, dropping worker response\n");
     }
@@ -2591,7 +2806,10 @@ int tcp_handle_packet(const unsigned char *frame, int len)
      * fall-through to the SYN-handling branch below covers the truly
      * new-connection case. */
     struct tcp_conn *c = find_conn(ip + 12, sport);
-    if (c != 0) c->last_ms = now_ms();   /* keep-alive for the reaper */
+    if (c != 0) {
+        c->last_ms  = now_ms();          /* keep-alive for the reaper */
+        c->peer_win = (unsigned short)(((unsigned short)tcp[14] << 8) | tcp[15]);
+    }
 
     if (c == 0) {
         /* No existing connection.  Only a SYN can open one. */
@@ -2614,6 +2832,10 @@ int tcp_handle_packet(const unsigned char *frame, int len)
         c->greeted   = 0;
         c->httpreqlen = 0;
         c->last_ms   = now_ms();
+        c->snd_len = c->snd_una = c->snd_nxt = 0;
+        c->snd_retries = 0;
+        c->snd_fin_pending = 0;
+        c->peer_win = 0;
 
         uart_puts("tcp: SYN from "); puts_ip(c->peer_ip);
         uart_puts(":"); puts_u32_dec(sport); uart_puts(" -> SYN+ACK\n");
@@ -2648,6 +2870,9 @@ int tcp_handle_packet(const unsigned char *frame, int len)
             c->state = TCP_LISTEN;
             return 1;
         }
+        /* Slide the send window before looking at any payload: this is what
+         * lets a multi-segment response keep flowing. */
+        if (flags & TCP_FLAG_ACK) tcp_on_ack(c, ack);
         if (data_len > 0) {
             /* Accumulate the HTTP request across segments (a POST body —
              * e.g. C source for /compile — may not fit one segment).  We
@@ -2760,6 +2985,7 @@ void tcp_dump_state(void)
     uart_puts(" txfail=");  puts_u32_dec(g_txfail);
     uart_puts(" drop_syn=");puts_u32_dec(g_dropped_syn);
     uart_puts(" reaped=");  puts_u32_dec(g_reaped);
+    uart_puts(" retrans="); puts_u32_dec(g_retrans);
     uart_puts("\n");
     for (int i = 0; i < NCONN; i++) {
         struct tcp_conn *c = &g_conns[i];
