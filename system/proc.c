@@ -333,7 +333,12 @@ void proc_setprio(int pid, int prio)
  * floor (round-robin still happens with no sleepers) and a small minimum (a
  * just-passed deadline can't storm the timer).  Drives the tickless one-shot. */
 #define PROC_TICK_FLOOR_US 1000UL
-#define PROC_TICK_MIN_US     25UL
+/* Hard minimum between one-shot fires.  Even if a stale sleeper or an aborted
+ * test somehow keeps the next deadline at ~0, the timer can fire no faster than
+ * this — so the IRQ path (a per-tick proctab scan) can never fully starve the
+ * net/NULL process into a total hang; the worst case is a survivable slowdown.
+ * 200 us = <=5000 IRQ/s; far above the ~150-230 us periods we actually use. */
+#define PROC_TICK_MIN_US    200UL
 unsigned long proc_next_delay_us(void)
 {
     unsigned long now = proc_now_us();
