@@ -613,6 +613,21 @@ static int cmd_rxstat(int argc, char **argv)
     uart_puts("        overruns="); puts_dec((int)genet_rx_overrun_count());
     uart_puts(" recoveries=");      puts_dec((int)genet_rx_recover_count());
     uart_puts(" tx_timeouts=");     puts_dec((int)genet_tx_timeout_count());
+    {
+        extern unsigned long genet_tx_wait_us(void), genet_tx_wait_max_us(void),
+                             genet_tx_frames(void);
+        unsigned long f = genet_tx_frames();
+        uart_puts("\n        tx_frames=");   puts_dec((int)f);
+        uart_puts(" tx_wait_avg_us=");        puts_dec((int)(f ? genet_tx_wait_us()/f : 0));
+        uart_puts(" tx_wait_max_us=");        puts_dec((int)genet_tx_wait_max_us());
+    }
+    {
+        extern unsigned long net_wake_avg_us(void), net_wake_max_us(void),
+                             net_wake_count(void);
+        uart_puts("\n        wake_n=");        puts_dec((int)net_wake_count());
+        uart_puts(" wake_avg_us=");             puts_dec((int)net_wake_avg_us());
+        uart_puts(" wake_max_us=");             puts_dec((int)net_wake_max_us());
+    }
     uart_puts("\n");
     return 0;
 }

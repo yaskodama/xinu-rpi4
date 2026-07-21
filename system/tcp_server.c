@@ -13,6 +13,7 @@
 //  54..    payload    (e.g. greeting bytes)
 
 #include "uart.h"
+#include "critical.h"
 #include "genet.h"
 #include "actor.h"
 #include "cc.h"
@@ -413,6 +414,15 @@ static int tcp_send(struct tcp_conn *c,
     int frame_len = 14 + ip_total;
     if (frame_len > 1518) return -1;
 
+    /* tx_frame is one shared buffer, so building a frame in it must not be
+     * interleaved with another context doing the same.  That race is why
+     * preemption was left off board-wide, which in turn made the RX interrupt
+     * wait for the wm loop to yield — measured at 36 ms average, 2.7 s worst,
+     * and that is where HTTP's ~88 ms per request was going.  The send itself
+     * measures 1-2 us (genet tx_wait_max_us=2), so masking interrupts across
+     * the build and the handoff costs nothing and lets preemption be enabled. */
+    unsigned long daif_tx = irq_save();
+
     /* zero header span */
     for (int i = 0; i < 54; i++) tx_frame[i] = 0;
 
@@ -480,7 +490,11 @@ static int tcp_send(struct tcp_conn *c,
         send_len = 60;
     }
 
-    return genet_tx_frame((const unsigned char *)tx_frame, send_len);
+    {
+        int rc = genet_tx_frame((const unsigned char *)tx_frame, send_len);
+        irq_restore(daif_tx);
+        return rc;
+    }
 }
 
 static unsigned long now_ms(void);   /* defined with the other clock helpers */

@@ -516,6 +516,13 @@ static int           g_rx_inited;
 static unsigned long g_rx_overruns;   /* times HW outran us (ring resync) */
 static unsigned long g_rx_recoveries; /* RBUF flush + ring re-arm count */
 static unsigned long g_tx_timeouts;   /* TX completions that never landed */
+/* How long genet_tx_frame() actually spends in its completion busy-wait.
+ * tx_timeouts=0 says the 50 ms cap is never reached, which says nothing about
+ * whether the wait is 5 us or 40 ms — and HTTP on this board costs ~80 ms per
+ * connect against 2.6 ms of ICMP RTT, so the difference matters. */
+static unsigned long g_tx_wait_us;    /* cumulative busy-wait, microseconds */
+static unsigned long g_tx_wait_max;   /* worst single wait, microseconds    */
+static unsigned long g_tx_frames;     /* frames transmitted                 */
 
 /* TX buffer in DRAM — descriptor itself lives in GENET MMIO,
  * but the packet payload is in main memory and its address is
@@ -879,6 +886,9 @@ unsigned long genet_rx_byte_count(void)    { return g_rx_bytes;      }
 unsigned long genet_rx_overrun_count(void) { return g_rx_overruns;   }
 unsigned long genet_rx_recover_count(void) { return g_rx_recoveries; }
 unsigned long genet_tx_timeout_count(void) { return g_tx_timeouts;   }
+unsigned long genet_tx_wait_us(void)       { return g_tx_wait_us;   }
+unsigned long genet_tx_wait_max_us(void)   { return g_tx_wait_max;  }
+unsigned long genet_tx_frames(void)        { return g_tx_frames;    }
 
 unsigned int genet_phy_bmsr(void)
 {
@@ -934,7 +944,15 @@ int genet_tx_frame(const unsigned char *frame, int length)
     __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(t0));
     while (1) {
         unsigned int cons = GENET_REG(TX_RING_BASE + TDMA_CONS_INDEX) & 0xFFFF;
-        if (cons == (prod & 0xFFFF)) return 0;
+        if (cons == (prod & 0xFFFF)) {
+            unsigned long tend, us;
+            __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(tend));
+            us = ((tend - t0) * 1000000UL) / freq;
+            g_tx_wait_us += us;
+            if (us > g_tx_wait_max) g_tx_wait_max = us;
+            g_tx_frames++;
+            return 0;
+        }
         __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(tn));
         if (tn - t0 >= target) {
             /* TX did not complete in time.  Just report failure — do

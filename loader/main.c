@@ -230,10 +230,31 @@ static void waiter_park(waiter_t *w)          /* from the waiter's own process *
     irq_enable_all();
 }
 
+/* Wake latency: from the RX interrupt asking for the net process, to the net
+ * process actually running.  net_proc only gets the CPU when the wm loop
+ * calls proc_yield() (net_yield_tick below), so this measures the wm loop's
+ * period — and HTTP connect on this board costs ~80 ms against 2.6 ms of ICMP
+ * RTT, with TX measured at 1 us, so the time is going somewhere here. */
+static volatile unsigned long g_wake_t0;
+static volatile unsigned long g_wake_us, g_wake_max, g_wake_n;
+
+unsigned long net_wake_avg_us(void) { return g_wake_n ? g_wake_us / g_wake_n : 0; }
+unsigned long net_wake_max_us(void) { return g_wake_max; }
+unsigned long net_wake_count(void)  { return g_wake_n;   }
+
 static void net_proc_main(void)
 {
     for (;;) {
         irq_enable_all();
+        if (g_wake_t0) {                       /* we were woken by an RX IRQ */
+            unsigned long now, freq, us;
+            __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
+            __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
+            us = ((now - g_wake_t0) * 1000000UL) / freq;
+            g_wake_t0 = 0;
+            g_wake_us += us; g_wake_n++;
+            if (us > g_wake_max) g_wake_max = us;
+        }
         genet_rx_tick();                       /* drain + dispatch (may queue a request) */
         if (tcp_app_req_pending()) waiter_kick(&g_app_w);  /* hand off to worker */
         tcp_app_flush();                       /* send a response the worker finished */
@@ -278,6 +299,8 @@ static void app_proc_main(void)
 static void net_irq_handler(void *arg)
 {
     genet_irq_handler(arg);                    /* driver: count + self-mask + ack */
+    if (!g_wake_t0)
+        __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(g_wake_t0));
     waiter_kick(&g_net_w);                     /* upper half: wake the net process */
 }
 
@@ -302,7 +325,7 @@ static void net_yield_tick(void)
      * shared tx_frame, so doing it from this context would race the net
      * process mid-frame whenever preemption is on. */
     if (tcp_needs_tick()) waiter_kick(&g_net_w);
-    proc_yield();
+    proc_yield();      /* still yield: harmless, and covers the non-IRQ paths */
 }
 
 /* USPi is gone (DWC2 only — Pi 4 USB-A keyboards/mice need xHCI).
@@ -1817,6 +1840,24 @@ void kernel_main(void)
      * IRQ so their waiter pids are valid when it fires.  Preemption stays OFF
      * at boot — enable it at runtime via /netpreempt once verified. */
     g_net_w.pid     = proc_create(net_proc_main,  8192,  "net");
+    /* Preemption stays OFF — see the note below.  This is where it would be
+     * turned on, and doing so is the fix for the latency measured here.
+     *
+     * Without preemption the RX interrupt can only ASK for the net process;
+     * it actually runs when the wm loop next calls proc_yield(), measured at
+     * 36 ms average and 2.7 s worst (rxstat wake_avg_us / wake_max_us).  An
+     * HTTP transaction waits three times, which is where this board's ~88 ms
+     * per request goes, against 2.6 ms of ICMP round trip and a transmit that
+     * measures 1-2 us.
+     *
+     * It was off because tx_frame is one shared buffer and would race.
+     * tcp_send() now masks interrupts across the frame build, which the
+     * measured transmit time makes free — but enabling preemption with only
+     * that guard in place took the board off the network, so something else
+     * on the net path is still preemption-unsafe.  Finding it is the next
+     * step; turning this on before then just breaks the box.
+     *   proc_set_preempt(1);
+     */
     g_app_w.pid     = proc_create(app_proc_main,  16384, "app");
     g_aipl_w.pid    = proc_create(aipl_proc_main, 32768, "aipl");   /* big stack: llm */
     connect_interrupt(189, net_irq_handler, 0);
