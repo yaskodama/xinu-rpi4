@@ -1393,6 +1393,49 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, ltxt);
         bl = s_put(body, bl, "\n");
         app_phase("llm-done");
+    } else if (starts_with(req, "GET /wx")) {
+        /* W^X enforcement test.  Reporting the page-table configuration is
+         * not evidence; these three probes are.  Each runs under the trap
+         * guard in system/exception.c, so a fault is reported, not fatal. */
+        ctype = "text/plain";
+        extern char _start[], _etext[], _data[];
+        extern unsigned char _end[];
+        extern unsigned long g_wx_uncovered;
+        extern int safe_call(unsigned long);
+        extern int safe_mmio_write32(unsigned long, unsigned int);
+        extern void *kmalloc(unsigned long);
+
+        static unsigned int bss_code[16] __attribute__((aligned(64)));
+        bss_code[0] = 0xd65f03c0u;                      /* ret */
+
+        int ro_w  = safe_mmio_write32((unsigned long)_etext + 16, 0);
+        int bss_x = safe_call((unsigned long)bss_code);
+
+        int heap_x = -2;
+        unsigned int *hc = (unsigned int *)kmalloc(64);
+        if (hc) {
+            hc[0] = 0xd65f03c0u;                        /* ret */
+            __asm__ volatile ("dc cvau, %0" :: "r"(hc) : "memory");
+            __asm__ volatile ("dsb ish" ::: "memory");
+            __asm__ volatile ("ic ivau, %0" :: "r"(hc) : "memory");
+            __asm__ volatile ("dsb ish\n isb" ::: "memory");
+            heap_x = safe_call((unsigned long)hc);
+        }
+
+        bl = s_put(body, bl, "_start=0x");   bl = s_puthex(body, bl, (unsigned long)_start);
+        bl = s_put(body, bl, " _etext=0x");  bl = s_puthex(body, bl, (unsigned long)_etext);
+        bl = s_put(body, bl, " _data=0x");   bl = s_puthex(body, bl, (unsigned long)_data);
+        bl = s_put(body, bl, " _end=0x");    bl = s_puthex(body, bl, (unsigned long)_end);
+        bl = s_put(body, bl, "\nuncovered=");  bl = s_putdec(body, bl, (long)g_wx_uncovered);
+        bl = s_put(body, bl, " bytes\n");
+        bl = s_put(body, bl, "write .rodata : ");
+        bl = s_put(body, bl, ro_w  ? "FAULTED (RO enforced)"  : "succeeded (RO NOT enforced)");
+        bl = s_put(body, bl, "\nexec  .bss    : ");
+        bl = s_put(body, bl, bss_x ? "FAULTED (NX enforced)"  : "succeeded (NX NOT enforced)");
+        bl = s_put(body, bl, "\nexec  heap    : ");
+        bl = s_put(body, bl, heap_x == 0 ? "succeeded (JIT still works)"
+                                         : "FAULTED (JIT would be broken)");
+        bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "GET /ticks") || starts_with(req, "POST /ticks")) {
         /* Diagnostic: is the 100 Hz timer IRQ actually firing?  tick_count is
          * advanced only by the timer ISR; cntpct is the free-running hardware

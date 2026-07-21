@@ -100,6 +100,22 @@ int safe_mmio_write32(unsigned long addr, unsigned int val)
     return -1;
 }
 
+/* Branch to `addr` under the same trap guard the MMIO probes use.  Returns 0
+ * if the call returned normally and -1 if it faulted.  Used by the /wx route
+ * to prove that W^X is actually enforced rather than merely configured:
+ * executing from .bss must fault, executing from the heap must not. */
+int safe_call(unsigned long addr)
+{
+    if (__builtin_setjmp(g_probe_jmp) == 0) {
+        g_probe_active = 1;
+        ((void (*)(void))addr)();
+        g_probe_active = 0;
+        return 0;
+    }
+    g_probe_active = 0;
+    return -1;
+}
+
 static void dump_and_halt(const char *kind)
 {
     capture(kind);

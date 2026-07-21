@@ -54,7 +54,21 @@ extern char _end[];
 
 static unsigned long __attribute__((aligned(4096))) l1_table[NENT];
 static unsigned long __attribute__((aligned(4096))) l2_table[NENT];
-static unsigned long __attribute__((aligned(4096))) l3_table[NENT];
+/* 4 KiB pages for the whole kernel image, not just its first 2 MiB.
+ *
+ * There used to be ONE L3 table here, covering the 2 MiB block that holds
+ * _start.  The image outgrew that long ago: with _data at 0x26a000 and _end
+ * at ~0x4234000, everything past 0x200000 — the tail of .rodata and the
+ * entire .data/.bss, which is where the DMA rings, proctab and smp_stack
+ * live — fell back to the L2 2 MiB blocks and was mapped RW+X.  W^X was
+ * silently off for ~65 MB of the address space.
+ *
+ * KIMG_2MB must cover [kern_2mb, heap_start).  Sized with headroom; the
+ * runtime check below reports it if the image ever outgrows the array
+ * instead of quietly degrading the way the single-table version did. */
+#define KIMG_2MB      48                 /* 96 MiB of 4 KiB-page coverage  */
+static unsigned long __attribute__((aligned(4096))) l3_table[KIMG_2MB][NENT];
+unsigned long g_wx_uncovered;            /* bytes left as RW+X 2 MiB blocks */
 static int g_mmu_on;
 
 int mmu_enabled(void) { return g_mmu_on; }
@@ -193,23 +207,38 @@ void mmu_init(void)
     unsigned long data      = (unsigned long)_data;
     unsigned long heap_strt = (((unsigned long)_end) + PAGE - 1) & ~(PAGE - 1);
 
-    /* ---- L3: the 2 MiB block holding the kernel image, 4 KiB pages ---- */
-    for (int p = 0; p < NENT; p++) {
-        unsigned long pa = kern_2mb + (unsigned long)p * PAGE;
-        unsigned long attr;
-        if      (pa <  (unsigned long)_start) attr = normal_attr(0, 1); /* below kernel: RW NX */
-        else if (pa <  etext)                 attr = normal_attr(1, 0); /* .text:   RO  X      */
-        else if (pa <  data)                  attr = normal_attr(1, 1); /* .rodata: RO  NX     */
-        else if (pa <  heap_strt)             attr = normal_attr(0, 1); /* data/bss: RW NX     */
-        else                                  attr = normal_attr(0, 0); /* heap:    RW  X      */
-        l3_table[p] = pa | attr | D_PAGE;
+    /* ---- L3: every 2 MiB block of the kernel image, as 4 KiB pages ----
+     * The heap keeps RW+X on purpose: cc/cc.c JITs into heap memory and then
+     * branches to it, so making the heap NX would break the JIT.  Everything
+     * below heap_start is now covered at page granularity. */
+    int kimg_blocks = (int)((heap_strt - kern_2mb + TWO_MB - 1) / TWO_MB);
+    if (kimg_blocks > KIMG_2MB) {
+        g_wx_uncovered = (heap_strt - kern_2mb) - (unsigned long)KIMG_2MB * TWO_MB;
+        kimg_blocks = KIMG_2MB;
+    }
+    for (int t = 0; t < kimg_blocks; t++) {
+        for (int p = 0; p < NENT; p++) {
+            unsigned long pa = kern_2mb + (unsigned long)t * TWO_MB
+                                        + (unsigned long)p * PAGE;
+            unsigned long attr;
+            if      (pa <  (unsigned long)_start) attr = normal_attr(0, 1); /* below kernel: RW NX */
+            else if (pa <  etext)                 attr = normal_attr(1, 0); /* .text:   RO  X      */
+            /* .rodata stays WRITABLE for now.  Making it RO across the whole
+             * image (rather than only its first 2 MiB, as before) is a second,
+             * independent change; isolate the NX one first. */
+            else if (pa <  data)                  attr = normal_attr(0, 1); /* .rodata: RW  NX     */
+            else if (pa <  heap_strt)             attr = normal_attr(0, 1); /* data/bss: RW NX     */
+            else                                  attr = normal_attr(0, 0); /* heap:    RW  X      */
+            l3_table[t][p] = pa | attr | D_PAGE;
+        }
     }
 
     /* ---- L2: the 1 GiB RAM block, 2 MiB blocks ---- */
     for (int r = 0; r < NENT; r++) {
         unsigned long pa = ram_base + (unsigned long)r * TWO_MB;
-        if (pa == kern_2mb) {
-            l2_table[r] = (unsigned long)l3_table | D_TABLE;          /* -> L3 */
+        if (pa >= kern_2mb && pa < kern_2mb + (unsigned long)kimg_blocks * TWO_MB) {
+            int t = (int)((pa - kern_2mb) / TWO_MB);
+            l2_table[r] = (unsigned long)l3_table[t] | D_TABLE;       /* -> L3 */
         } else if (pa >= ram_base && pa < ram_end) {
             l2_table[r] = pa | normal_attr(0, 0) | D_BLOCK;           /* heap/RAM: RW X */
         } else {
