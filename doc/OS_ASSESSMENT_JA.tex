@@ -402,7 +402,7 @@ Tier 0 の (1)(5)(6)(12) が全て「EL0 がないことの緩和策」である
 6  & (12) スタックカナリア                               & サイレント破壊の封じ込め& 半日    & ✅\\
 7  & (14) TCP 分割・再送・ウィンドウ                     & HTTP が 1.4\,KB で壊れない & 1 日 & ✅\\
 8  & ホストテスト基盤 + CI                               & 以降の全変更の安全網    & 半日    & ◐\\
-9  & (6) W\textasciicircum X 修正                        & \texttt{.data}/\texttt{.bss} が RWX & 半日 & ---\\
+9  & (6) W\textasciicircum X 修正                        & \texttt{.data}/\texttt{.bss} が RWX & 半日 & ✅$^{\dagger}$\\
 10 & (10) genet/xhci の DMA 規律 → \texttt{DCACHE\_ON}   & \textbf{最大の性能改善} & 2--3 日 & ---\\
 11 & (15) GENET TX リング、50\,ms スピン除去             & スループット / レイテンシ & 1--2 日 & ---\\
 12 & (9) タイムベース、(13)(16) 2\,GB 開放・DHCP 適用、(11) \texttt{network/} の去就 & 中期 & 数日 & ---\\
@@ -412,7 +412,8 @@ Tier 0 の (1)(5)(6)(12) が全て「EL0 がないことの緩和策」である
 \end{center}
 
 \vspace{-0.6em}
-{\small $^{*}$ \texttt{/microsd} が空でマウント未成立のため実機未検証。}
+{\small $^{*}$ \texttt{/microsd} が空でマウント未成立のため実機未検証（第 4 次時点では解消）。\\
+$^{\dagger}$ NX のみ。\texttt{.rodata} の RO 化は未了（第 4 次 参照）。}
 
 %======================================================================
 \section{第 1 次改良 --- Tier 0 の 5 件}
@@ -784,11 +785,193 @@ rpi5 の実機反復は\textbf{全て USB スティックの物理書き換え}�
 \textbf{シリアルコンソールがあれば、この往復の大半は不要だった}。
 
 %======================================================================
+\section{第 4 次 --- 3 ボードすべての改良と、外した仮説の記録}
+
+第 3 次に続く同日の作業。3 ボードそれぞれに実測で裏付けた改良が入り、
+併せて\textbf{外した仮説を 5 つ}記録する。外れの記録が本節の主眼である ---
+どれも「確認すれば分かることを確認しなかった」型で、実機往復の費用を直接押し上げた。
+
+\subsection{Pi 4 --- W\textasciicircum X をイメージ全域へ (項目 6)}
+
+コミット \texttt{118d5ff}。L3 テーブルが 1 枚しかなく、覆うのは \texttt{\_start} を含む
+2\,MiB ブロックだけだった。イメージはとうに超過しており、\texttt{\_data = 0x26a000}、
+\texttt{\_end = 0x4263b18} に対し \textbf{0x200000 より先は L2 の 2\,MiB ブロックに落ちて
+RW+X} --- \texttt{.rodata} の末尾と \texttt{.data}/\texttt{.bss} 全部、約 65\,MB である。
+DMA リング・\texttt{proctab}・\texttt{smp\_stack} がそこに載っている。
+
+\texttt{KIMG\_2MB} 枚の L3 で \texttt{[kern\_2mb, heap\_start)} を覆い、
+イメージが配列を超えたら \texttt{g\_wx\_uncovered} で報告する（従来は黙って劣化した）。
+ヒープは意図的に RW+X のまま --- \texttt{cc/cc.c} の JIT はヒープに書いて分岐する。
+
+\textbf{設定ではなく強制を測る} \texttt{/wx} を追加した。既存のトラップガード
+(\texttt{safe\_call()}) の下で 3 つ試験するので、フォールトしても箱は落ちない。
+SD からのコールドブート:
+
+\begin{code}
+uncovered=0 bytes
+write .rodata : succeeded (RO NOT enforced)
+exec  .bss    : FAULTED (NX enforced)
+exec  heap    : succeeded (JIT still works)
+\end{code}
+
+SMP 4 コア・N-Queens N=8 で 1.79 倍、ping 5/5、ヒープ完全合体を確認。
+
+\textbf{\texttt{.rodata} の RO 化は入れていない。} 一度試すとネットワークが落ちたが、
+何が書いているかを特定できていない（該当範囲は組込み LLM の \texttt{model\_data} が大半）。
+フォールトすると \texttt{/fault} を読む経路自体が死ぬので、リモートでは追えない。
+\textbf{検証できた半分だけを出し、推測の半分は出さない}という判断である。
+
+\subsection{Pi 3 --- HTTP 失敗率 14\,\% $\rightarrow$ 0\,\% (項目 3、4、9)}
+
+コミット \texttt{2bb076a}、\texttt{7e15393}。
+
+\textbf{項目 3 の最も重い形}。\texttt{tcpRecv()} が \texttt{tcp->offset} を一切検証しておらず、
+\texttt{offset2octets()} は 0--60 を返す一方ヘッダのみのセグメントは 20 バイト。
+\texttt{tcpSeglen()} は \texttt{ushort} での素の減算なので、過大な offset で
+\textbf{セグメント長が約 64\,KB に巻き上がり}、\texttt{tcp->data} もフレーム外を指す。
+歯止めは \texttt{TCP\_IBLEN}(65528) との窓クランプだけ＝実質無し。
+\textbf{リモートからの約 64\,KB 範囲外読み出し}である。入口 1 箇所の検証で
+\texttt{tcpRecvOpts()} の経路も同時に塞がる。
+
+\textbf{項目 9}。\texttt{clkticks} はミリ秒でも単調でもない ---
+\texttt{clkhandler()} が \texttt{CLKTICKS\_PER\_SEC} で 0 に戻し \texttt{clktime} を進める、
+秒内カウンタである。アクターランタイムはこれを生で読み、さらに「100\,Hz だから」と
+10 倍していた。実際は 1000\,Hz なので\textbf{経過時間が 10 倍ずれ、毎秒の境界で破綻}し、
+GC の掃引周期はさらに \texttt{/10} していた。\texttt{abcl\_now\_ms()} を導入して
+14 箇所の \texttt{clkticks * 10} 等を置換。
+\textbf{このランタイムから取った過去のベンチマーク値はすべて無効であり、取り直しが要る。}
+
+\textbf{そして失敗率の真因}。詳細は次節。\texttt{NTCP} 7 $\rightarrow$ 16、
+\texttt{TCP\_TWOMSL} 5\,s $\rightarrow$ 1\,s。
+
+\begin{center}
+\begin{tabular}{@{}l r r@{}}
+\toprule
+\textbf{200 要求 / 10\,ms 間隔} & \textbf{修正前} & \textbf{修正後}\\
+\midrule
+失敗率 & 28/200 (14\,\%) & \textbf{0/200 (0\,\%)}\\
+中央値 & 14.6\,ms & 12.5\,ms\\
+p95    & 1020\,ms & 1014\,ms\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{約 1 秒の裾は残る}。これは \texttt{TIME\_WAIT} の値そのもので、要求間隔 200\,ms では
+消える (p95 17\,ms)。負荷時に消すには HTTP keep-alive が要る。
+
+\subsection{外した仮説 --- 5 件}
+
+\begin{center}\small
+\begin{longtable}{@{}l p{5.4cm} p{5.6cm}@{}}
+\toprule
+\textbf{対象} & \textbf{仮説} & \textbf{実測と結末}\\ \midrule
+\endhead
+Pi 3 & 半開き接続の再送が長い (約160秒) ので詰まる &
+  短縮しても\textbf{失敗率は不変} (28/200)。p99 は 3\,s→1\,s に改善\\
+Pi 3 & passive open が枯渇し SYN に RST が返る &
+  リスナを 3 スレッド化しても\textbf{まったく不変} (28/200)\\
+Pi 3 & \texttt{conf.h} の \texttt{NTCP} を書き換えれば増える &
+  \textbf{ボードがクラッシュ}。1 行目に \texttt{GENERATED FILE; DO NOT EDIT}\\
+Pi 4 & WiFi/MANET がレイテンシを食っている &
+  無効化しても\textbf{79--84\,ms のまま}\\
+Pi 4 & GENET TX の 50\,ms ビジーループ (項目 15) &
+  計測すると \textbf{tx\_wait\_avg 1\,$\mu$s / max 2\,$\mu$s}。送信は無実\\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\textbf{Pi 3 の真因は失敗インデックスを出した瞬間に分かった。}
+失敗は 6, 14, 21, 28, \dots と\textbf{周期がちょうど 7}、そして \texttt{NTCP} は 7。
+1 接続が \texttt{TIME\_WAIT} 満了までデバイスを保持するので持続レートは
+\texttt{NTCP/TWOMSL} = 1.4/s に制限され、8 本目が確保できずタイムアウトしていた。
+要求間隔を 400\,ms に広げると失敗が消えることでも裏が取れた。
+
+\textbf{3 つのカーネルで失敗数がちょうど 28 と一致していたのに、私は「何回失敗したか」だけを
+3 回続けて見ていた。} どの要求がなぜ失敗したかを最初に見ていれば、SD 物理往復 2 回と
+クラッシュ 1 回は不要だった。
+
+\subsection{Pi 4 のレイテンシ --- 原因未特定、結論を撤回}
+
+コミット \texttt{f61c710}、\texttt{4d9c2b5}。ICMP 2.6\,ms に対し HTTP は connect だけで
+54--90\,ms。送信 1\,$\mu$s・WiFi 無関係と潰した上で、RX 割り込みから \texttt{net\_proc} が
+走るまでを計測し\textbf{平均 36\,ms}を得て「これが原因」と報告した。
+
+\textbf{その結論は誤りである。} 平均の正体は 130 件中 1 件の 2.67 秒だった。
+同じ測定をバケットに直すと:
+
+\begin{code}
+wake_hist(ms) <1:91  <2:29  <4:12  <8:4  <16:0  <32:38  <64:7  >=64:1
+\end{code}
+
+\textbf{4 分の 3 は 4\,ms 未満}。16--32\,ms に第二の山は実在するが、1 トランザクション
+3--4 交換で期待値は約 19\,ms にとどまり、ICMP との 77\,ms の差を説明しない。
+誤った平均を根拠に wm へ入れた譲り処理 3 箇所は\textbf{すべて取り消した}
+（36→27\,ms の「改善」も外れ値が動いただけだった）。
+
+\textbf{次の仮説（未検証）}: genet の ISR は自己マスクするので、パケットが RX リングに
+届いても割り込み再有効化まで通知されない。\textbf{現在の計測は「割り込みが上がった時刻」を
+起点にしているため、この待ちが構造上まったく見えない} --- 平均で分布を隠したのと同じ形である。
+
+\textbf{同日 2 度目の同型の誤りだった。} Pi 3 は失敗回数、Pi 4 は平均。
+どちらも集計値が答えを隠していた。\textbf{まずインデックスかヒストグラム、平均は後}。
+
+\subsection{デプロイ経路が調査の質を決める}
+
+同じ日の 2 つの調査が、経路の差でこれだけ違った。
+
+\begin{center}\small
+\begin{tabular}{@{}l l l l@{}}
+\toprule
+\textbf{対象} & \textbf{経路} & \textbf{1 試行の費用} & \textbf{結果}\\
+\midrule
+Pi 4 & \textbf{\texttt{/chainload} が動く} & 数十秒、SD を抜かない & 仮説 3 つを数分で潰した\\
+Pi 3 & SD 物理焼き & 抜く→焼く→戻す→電源 & 仮説 4 つに往復 4 回、3 つ外れ\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Pi 5 のチェーンロードは起動する}が RP1 Ethernet が暖かい再初期化に耐えないため
+遠隔では使えない（第 3 次の訂正どおり）。
+
+\subsection{設計側 --- \texttt{act} 効果の分離}
+
+aios-claude \texttt{25b7c02} / aipl-line-simulator \texttt{bad8ab9}。
+\texttt{ServoMotor} と \texttt{ShelfActor} がどちらも \texttt{!\{mut, net\}} で、
+一方は実機サーボを回し他方は自分の在庫表を書くだけなのに\textbf{効果集合から区別できなかった}。
+\texttt{mut}（自分の状態を書く）と \textbf{\texttt{act}}（外部世界へ作用する）を分けると、
+配置と複製の規則が効果から機械的に導ける ---
+\texttt{act} を持つものは\textbf{その機器に繋がったノードで、同時に厳密に 1 つだけ}。
+フェイルオーバは \texttt{act} の排他移譲として定義できる。
+
+型検査は\textbf{実際に駆動する 3 メソッドだけ}を検出した
+(\texttt{ServoMotor.write} / \texttt{ConveyorActor.feed} / \texttt{ConveyorActor.eject})。
+\texttt{[type] no issues}、\texttt{test/aipl\_sync.mjs} も申告漏れ 0 件。
+
+\textbf{ここでも型検査が私の誤りを捕まえた。} \texttt{dofbot\_servo\_writes} を名前から
+「6 軸まとめ書き」と推測して \texttt{act} を付けたところ、\texttt{Coordinator.run} が
+\texttt{act} を持つという不自然な結果が出た。実装は \texttt{return backend().writes} ---
+\textbf{発行済み指令数を返すカウンタ}であった（``servo を write'' ではなく
+``servo write の回数''）。
+
+\subsection{\texttt{/actor/load} の実測}
+
+Pi 5 中央値 \textbf{37.9\,ms} / Pi 4 \textbf{114.8\,ms}（各 20 回、1743\,B の
+\texttt{ServoMotor} を投入し \texttt{1 actor live} を確認）。
+その大半は JIT ではなく HTTP 自体の遅延で、各ボードの通常 HTTP とほぼ一致する。
+\textbf{アクター移動の費用は無視できる} --- メッシュのフェイルオーバ見積りは
+4--8 秒から 3--5 秒に下がり、支配するのはリース期限である。
+
+\textbf{最初の測定は無効だった。} トップレベル文の無い \texttt{.abcl} を使ったため
+\texttt{main()} が空になり、\texttt{0 actor(s) live} が返っていた。時間はもっともらしく
+見え、そのまま報告すれば「アクター投入の費用」として通っていた。
+\textbf{経過時間だけでなく応答本文を見た}のが救いである。
+
+%======================================================================
 \section{未解決の課題}
 
 \begin{itemize}[leftmargin=1.4em,itemsep=3pt]
-\item \textbf{\texttt{/microsd} と \texttt{/sd} が空}。SD の FAT32 列挙が成立していない。
-      (5) の検証を阻んでおり、FAT32 経路が実機で一切テストできない。\textbf{次の本命}。
+\item \textbf{\texttt{/microsd} は解消した}。第 4 次時点で実機が \texttt{OVERLAYS/}・DTB 群・
+      \texttt{WIFI.CFG} を列挙する。FAT32 経路が実機でテスト可能になった。
 \item \textbf{メッシュ (MANET) でのアクター実行は未測定}。3 ボードの完全メッシュは
       2026-07-21 に成立した (第 3 次、Pi 4/Pi 3/Pi 5 いずれも \texttt{peers=2}) が、
       複数ノードに跨るアクター分散実行のベンチマークはまだ取っていない。なお M14 の
@@ -800,6 +983,22 @@ rpi5 の実機反復は\textbf{全て USB スティックの物理書き換え}�
 \item 残る優先課題は表の 9--13 --- W\textasciicircum X、DMA キャッシュ規律 →
       \texttt{DCACHE\_ON}、GENET TX リング、そして EL0 分離。
 \end{itemize}
+
+\subsection{3 ボードの残懸念 --- rpi5 17 件 / rpi4 11 件 / rpi3 5 件}
+
+第 4 次時点の数え上げ。\textbf{rpi4 は (6) W\textasciicircum X が解消して 12 → 11 件}、
+\textbf{rpi3 は upstream Embedded Xinu をそのまま使っているため素性が良く 5 件}
+（+ 部分該当 4 件）で、ヒープ・スケジューラ・セマフォ・TCP スタックはいずれも本物である。
+TCP に至っては rpi5 より真っ当で、rpi5 で修正した half-close と
+\texttt{FIN\_WAIT\_1} の欠陥はこちらには存在しない。
+
+\textbf{rpi4 に残る 11 件}: (9) タイムベース、(10) D-cache OFF、(11) 偽セマフォと
+\texttt{network/}、(13) 1\,GB 制限、(15) GENET TX リング、(16) DHCP 未適用
+（rpi5 では解消済）、(17) ユーザ空間、(18) FAT32、(19) VFS、(21) 重複、
+そして \textbf{Pi 4 のレイテンシ（原因未特定）}。
+
+\textbf{rpi3 に残る 5 件}: (4) 単一 accept（失敗率は解消、裾は残る）、
+(6) W\textasciicircum X、(10) D-cache OFF、(17) ユーザ空間、(18) FAT32、(21) 重複。
 
 \subsection{xinu-rpi5 側に残る懸念 --- 17 件}
 
