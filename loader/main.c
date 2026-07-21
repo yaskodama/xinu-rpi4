@@ -238,6 +238,12 @@ static void waiter_park(waiter_t *w)          /* from the waiter's own process *
 static volatile unsigned long g_wake_t0;
 static volatile unsigned long g_wake_us, g_wake_max, g_wake_n;
 
+/* Buckets, because the mean was useless: one 2.67 s outlier out of 130
+ * samples carried the average from ~7 ms to 28 ms, and I read that average as
+ * "the wake latency is 36 ms" and spent three chainloads adding yields to the
+ * window manager on the strength of it. */
+static volatile unsigned long g_wake_b[8];   /* <1,<2,<4,<8,<16,<32,<64,>=64 ms */
+unsigned long net_wake_bucket(int i) { return (i >= 0 && i < 8) ? g_wake_b[i] : 0; }
 unsigned long net_wake_avg_us(void) { return g_wake_n ? g_wake_us / g_wake_n : 0; }
 unsigned long net_wake_max_us(void) { return g_wake_max; }
 unsigned long net_wake_count(void)  { return g_wake_n;   }
@@ -254,6 +260,9 @@ static void net_proc_main(void)
             g_wake_t0 = 0;
             g_wake_us += us; g_wake_n++;
             if (us > g_wake_max) g_wake_max = us;
+            { unsigned long ms = us / 1000; int b = 0;
+              while (b < 7 && ms) { ms >>= 1; b++; }
+              g_wake_b[b]++; }
         }
         genet_rx_tick();                       /* drain + dispatch (may queue a request) */
         if (tcp_app_req_pending()) waiter_kick(&g_app_w);  /* hand off to worker */

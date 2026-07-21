@@ -627,6 +627,9 @@ static int cmd_rxstat(int argc, char **argv)
         uart_puts("\n        wake_n=");        puts_dec((int)net_wake_count());
         uart_puts(" wake_avg_us=");             puts_dec((int)net_wake_avg_us());
         uart_puts(" wake_max_us=");             puts_dec((int)net_wake_max_us());
+        { extern unsigned long net_wake_bucket(int);
+          int b; uart_puts("\n        wake_hist(ms <1,<2,<4,<8,<16,<32,<64,>=64)=");
+          for (b = 0; b < 8; b++) { puts_dec((int)net_wake_bucket(b)); uart_puts(b<7?",":""); } }
     }
     uart_puts("\n");
     return 0;
