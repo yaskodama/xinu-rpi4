@@ -1342,7 +1342,118 @@ static int http_build(const char *req, char *out, int max)
         pm_reset();              /* never returns */
         /* unreachable */
     }
-    if (starts_with(req, "POST /compile") || starts_with(req, "GET /compile")) {
+    if (starts_with(req, "POST /cc") || starts_with(req, "GET /cc")) {
+        /* POST /cc — 本文が AIPL なら機内の abcl2c で C に直してから JIT する。
+         * Pi 5 と同じ口（2026-09-04 に移植）。判定の前に空白と行コメント・
+         * ブロックコメントを読み飛ばしてから class を見る
+         * ―― 正典のガイド標本は先頭がコメントで始まる。
+         * abcl2c には本文をそのまま渡す（字句解析器がコメントを扱う）。
+         * この経路はアプリ・ワーカー（実プロセス）で走るので wait(ms) も通る。 */
+        ctype = "text/plain";
+        static char csrc[8192];
+        int slen = 0;
+        if (req[0] == 'P') {
+            int he = find_header_end(req);
+            if (he >= 0) { const char *b = req + he;
+                while (b[slen] && slen < (int)sizeof(csrc) - 1) { csrc[slen] = b[slen]; slen++; } }
+            csrc[slen] = 0;
+        } else {
+            static char enc[8192];
+            if (q_param(req, "src", enc, sizeof enc)) slen = url_decode(enc, csrc, sizeof csrc);
+        }
+        if (slen <= 0) {
+            bl = s_put(body, bl, "usage: curl --data-binary @prog.aipl http://<ip>/cc\n"
+                                 "AIPL（class で始まる）なら abcl2c を通す。それ以外は C として JIT する。\n");
+        } else {
+            const char *runsrc = csrc; int runlen = slen; int ok = 1;
+            const char *hd = csrc;
+            for (;;) {
+                while (*hd==' '||*hd=='\t'||*hd=='\r'||*hd=='\n') hd++;
+                if (hd[0]=='/'&&hd[1]=='/') { hd+=2; while (*hd && *hd!='\n') hd++; continue; }
+                if (hd[0]=='/'&&hd[1]=='*') { hd+=2; while (*hd && !(hd[0]=='*'&&hd[1]=='/')) hd++; if(*hd) hd+=2; continue; }
+                break;
+            }
+            if (hd[0]=='c'&&hd[1]=='l'&&hd[2]=='a'&&hd[3]=='s'&&hd[4]=='s'&&
+                (hd[5]==' '||hd[5]=='\t'||hd[5]=='\r'||hd[5]=='\n')) {
+                extern int         abcl2c(const char *, int, char *, int);
+                extern const char *abcl2c_error(void);
+                static char xlat[32768];
+                int xr = abcl2c(csrc, slen, xlat, (int)sizeof xlat);
+                if (xr < 0) {
+                    bl = s_put(body, bl, "abcl2c: ");
+                    bl = s_put(body, bl, abcl2c_error());
+                    bl = s_put(body, bl, "\n");
+                    ok = 0;
+                } else { runsrc = xlat; runlen = xr; }
+            }
+            if (ok) {
+                extern void cc_web_reset(void);
+                extern void cc_future_reset(void);
+                extern int  cc_actor_load(const char *, int, char *, int);
+                /* 段階を選べるようにしてある。既定は cc_run_source ―― 常駐ロード
+                 * （?resident=1）は、翻訳結果が同じでも g2 で板を止めることが
+                 * 分かっているため（/compile では同じ C が正しく走る）。
+                 *   ?stage=xlat   翻訳した C を返すだけ（実行しない）
+                 *   ?resident=1   常駐ロード（web_expose した先へ /api/x/ で届く）
+                 * 既定       cc_run_source（/compile と同じ）
+                 * 観測できないものは直せないので、まず分けて見えるようにする。 */
+                char stg[16];
+                int want_xlat = (q_param(req, "stage", stg, sizeof stg) &&
+                                 stg[0]=='x' && stg[1]=='l');
+                char rsd[8];
+                int want_res  = q_param(req, "resident", rsd, sizeof rsd) && rsd[0] == '1';
+                if (want_xlat) {
+                    bl = s_put(body, bl, runsrc);
+                } else if (want_res) {
+                    cc_web_reset(); cc_future_reset();
+                    static char prog[1400];
+                    cc_actor_load(runsrc, runlen, prog, sizeof prog);
+                    bl = s_put(body, bl, prog);
+                } else {
+                    cc_web_reset(); cc_future_reset();
+                    long rv = 0;
+                    static char prog[1400];
+                    int rc = cc_run_source(runsrc, runlen, prog, sizeof prog, &rv);
+                    bl = s_put(body, bl, prog);
+                    if (rc == 0) { bl = s_put(body, bl, "=> "); bl = s_putdec(body, bl, rv); bl = s_put(body, bl, "\n"); }
+                    else         { bl = s_put(body, bl, "\n"); }
+                }
+            }
+        }
+    } else if (starts_with(req, "GET /api/x/") || starts_with(req, "POST /api/x/")) {
+        /* web_expose で公開したアクタを叩く。Pi 3・Pi 5 と同じ形:
+         *   GET /api/x/<path>?method=<名前>&args=<値> */
+        extern int  cc_web_lookup(const char *);
+        extern int  cc_web_count(void);
+        extern const char *cc_web_path_at(int);
+        extern int  cc_web_actor_at(int);
+        extern int  cc_actor_send_str(int id, const char *meth, const char *arg,
+                                      char *out, int outcap);
+        ctype = "text/plain";
+        char wpath[48], wmeth[32], warg[96];
+        { const char *sp = req; while (*sp && *sp != ' ') sp++; if (*sp) sp++;
+          sp += 7;                          /* "/api/x" の次から */
+          int o = 0; wpath[o++] = '/';
+          while (*sp && *sp != '?' && *sp != ' ' && o < (int)sizeof wpath - 1) wpath[o++] = *sp++;
+          wpath[o] = 0; }
+        if (!q_param(req, "method", wmeth, sizeof wmeth)) wmeth[0] = 0;
+        if (!q_param(req, "args",   warg,  sizeof warg))  warg[0]  = 0;
+        int id = cc_web_lookup(wpath);
+        if (id < 0) {
+            bl = s_put(body, bl, "no such exposed path: "); bl = s_put(body, bl, wpath);
+            bl = s_put(body, bl, "\n公開中: ");
+            for (int i = 0; i < cc_web_count(); i++) {
+                bl = s_put(body, bl, cc_web_path_at(i)); bl = s_put(body, bl, " ");
+            }
+            bl = s_put(body, bl, "\n");
+        } else {
+            static char wout[512];
+            wout[0] = 0;
+            cc_actor_send_str(id, wmeth, warg, wout, (int)sizeof wout);
+            bl = s_put(body, bl, wout);
+            bl = s_put(body, bl, "\n");
+        }
+    } else if (starts_with(req, "POST /compile") || starts_with(req, "GET /compile")) {
         /* Dynamic compilation: the request carries C source, which we
          * compile and JIT-run in place; the reply is the program output
          * plus "=> <return value>".  Source is the POST body, or the

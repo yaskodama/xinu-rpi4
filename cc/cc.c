@@ -169,18 +169,29 @@ static char *vheap_alloc(int n)
  * the low 48 bits, so the tag is free and is masked off before deref. */
 #define V_FLOAT_TAG  (1UL << 60)
 #define V_LIST_TAG   (1UL << 61)        /* tags a pointer into the list heap */
+/* 真偽値。ビット 62 を立て、最下位ビットは 0（＝整数ではない）にして、値は
+   ビット 1 に持つ。こうしないと `b = 1` としか印字できなかった（正典は
+   `b = true`）。整数の側にタグを載せる案は負の数と衝突する ―― `v_int(-1)` は
+   上位ビットが全部立つので、上位ビットを印にすると負の数が真偽値に化ける。
+   Pi 3 の VM（0x20000000）・Pi 5 と同じ役割。 */
+#define V_BOOL_TAG   (1UL << 62)
 #define V_PTR_MASK   ((1UL << 48) - 1)
 
 static long   v_int(long n)        { return (n << 1) | 1L; }
 static long   v_str(const char *p) { return (long)p; }
 static int    v_is_int(long w)     { return (w & 1L) != 0; }
+static int    v_is_bool(long w)    { return !(w & 1L) && (((unsigned long)w >> 62) & 1UL); }
+static long   v_bool(long b)       { return (long)(V_BOOL_TAG | (b ? 2UL : 0UL)); }
 static int    v_is_float(long w)   { return !(w & 1L) && (((unsigned long)w >> 60) & 1UL); }
 static int    v_is_list(long w)    { return !(w & 1L) && (((unsigned long)w >> 61) & 1UL); }
-static int    v_is_str(long w)     { return !(w & 1L) && w != 0 && !v_is_float(w) && !v_is_list(w); }
-static long   v_int_of(long w)     { return v_is_int(w) ? (w >> 1) : 0; }
+static int    v_is_str(long w)     { return !(w & 1L) && w != 0 && !v_is_float(w) && !v_is_list(w) && !v_is_bool(w); }
+/* 真偽値は算術と比較では 0/1 の整数として振る舞う（印字のときだけ true/false）。 */
+static long   v_int_of(long w)     { return v_is_int(w) ? (w >> 1)
+                                          : (v_is_bool(w) ? ((w >> 1) & 1L) : 0); }
 static double v_to_float(long w)
 {
     if (v_is_int(w))   return (double)(w >> 1);
+    if (v_is_bool(w))  return (double)((w >> 1) & 1L);
     if (v_is_float(w)) return *(double *)((unsigned long)w & V_PTR_MASK);
     return 0.0;
 }
@@ -282,6 +293,7 @@ static int v_truthy(long w)
 {
     if (w == 0) return 0;
     if (v_is_int(w))   return (w >> 1) != 0;
+    if (v_is_bool(w))  return (w & 2L) != 0;   /* false は 0 ではないので先に見る */
     if (v_is_float(w)) return v_to_float(w) != 0.0;
     if (v_is_list(w))  return v_list_ptr(w)[0] != 0;   /* non-empty */
     return ((const char *)w)[0] != 0;
@@ -303,6 +315,7 @@ static const char *v_render(long w, char *buf, int cap)
         buf[i] = 0;
         return buf;
     }
+    if (v_is_bool(w)) return (w & 2L) ? "true" : "false";
     if (v_is_str(w)) return (const char *)w;
     if (v_is_float(w)) {
         double d = v_to_float(w);
@@ -359,8 +372,8 @@ static long v_div(long a, long b)
     if (v_is_float(a) || v_is_float(b)) { double d = v_to_float(b); return v_floatval(d != 0.0 ? v_to_float(a)/d : 0.0); }
     long d = v_int_of(b); return v_int(d ? v_int_of(a)/d : 0);
 }
-static long v_lt(long a, long b) { if (v_is_float(a)||v_is_float(b)) return v_int(v_to_float(a) <  v_to_float(b)); return v_int(v_int_of(a) <  v_int_of(b)); }
-static long v_le(long a, long b) { if (v_is_float(a)||v_is_float(b)) return v_int(v_to_float(a) <= v_to_float(b)); return v_int(v_int_of(a) <= v_int_of(b)); }
+static long v_lt(long a, long b) { if (v_is_float(a)||v_is_float(b)) return v_bool(v_to_float(a) <  v_to_float(b)); return v_bool(v_int_of(a) <  v_int_of(b)); }
+static long v_le(long a, long b) { if (v_is_float(a)||v_is_float(b)) return v_bool(v_to_float(a) <= v_to_float(b)); return v_bool(v_int_of(a) <= v_int_of(b)); }
 static int  v_streq(long a, long b)
 {
     const char *x = (const char *)a, *y = (const char *)b;
@@ -370,15 +383,15 @@ static int  v_streq(long a, long b)
 }
 static long v_eq(long a, long b)
 {
-    if (v_is_str(a) && v_is_str(b)) return v_int(v_streq(a, b));
-    if (v_is_str(a) || v_is_str(b)) return v_int(0);
-    if (v_is_float(a) || v_is_float(b)) return v_int(v_to_float(a) == v_to_float(b));
-    return v_int(v_int_of(a) == v_int_of(b));
+    if (v_is_str(a) && v_is_str(b)) return v_bool(v_streq(a, b));
+    if (v_is_str(a) || v_is_str(b)) return v_bool(0);
+    if (v_is_float(a) || v_is_float(b)) return v_bool(v_to_float(a) == v_to_float(b));
+    return v_bool(v_int_of(a) == v_int_of(b));
 }
-static long v_ne(long a, long b)  { return v_int(!v_int_of(v_eq(a, b))); }
-static long v_and(long a, long b) { return v_int(v_truthy(a) && v_truthy(b)); }
-static long v_or(long a, long b)  { return v_int(v_truthy(a) || v_truthy(b)); }
-static long v_not(long a)         { return v_int(!v_truthy(a)); }
+static long v_ne(long a, long b)  { return v_bool(!v_truthy(v_eq(a, b))); }
+static long v_and(long a, long b) { return v_bool(v_truthy(a) && v_truthy(b)); }
+static long v_or(long a, long b)  { return v_bool(v_truthy(a) || v_truthy(b)); }
+static long v_not(long a)         { return v_bool(!v_truthy(a)); }
 static void v_print(long w)
 {
     if (v_is_list(w)) {                 /* print arbitrarily long lists directly */
@@ -581,6 +594,159 @@ static long cc_select(long self, long n, long m0, long m1, long m2, long m3)
 }
 static long cc_sel_arg(long i) { return (i >= 0 && i < 4) ? g_sel[i] : v_int(0); }
 
+/* ===== 2026-09-04: 最新 AIPL のための追加（Pi 3 / Pi 5 と揃える）==========
+ * 機内前段 cc/abcl2c.c が出す C が呼ぶ実行時。Pi 5 から移した。
+ * Pi 4 のアクタは実プロセス（system/actorproc.c）なので、Pi 5 の
+ * 単一 FIFO ＋協調ポンプとは実現が違うところがある。 */
+
+/* トップレベルの send の直後に配る。Pi 5 は cc_pump() で FIFO を捌くが、
+ * Pi 4 は ap_run() で「全アクタが待ちに落ちる」まで譲る。役割は同じ ――
+ * 続きの now が相手のメソッドへ入る前に、送ったメッセージを届けきる。
+ * これが無いと select の横取りが効かない（g4）。 */
+static long cc_pump_now(void)
+{
+    extern void ap_run(void);
+    /* ★ 値ヒープの錠を握ったまま ap_run() を呼んではいけない。
+     * ap_run はアクタ・プロセスへ譲るが、アクタは自分のハンドラの前に
+     * aipl_lock() を取る。その錠を我々が握っていると、アクタは proc_yield で
+     * 回り続け（aipl_lock はスピンロック）、ap_run から見て「まだ待ちに
+     * 落ちていない」ので永久に回る。プリエンプションも切ってあるので
+     * ネットワークごと止まる（実機で板が落ちた）。
+     * 限界を超えると aipl_lock は錠を横取りするので、小さな例だけは
+     * たまたま動いてしまう ―― g1 が通って g2 で落ちたのはそれ。
+     * actorproc.c の ap_recv と同じ作法で、外して呼んで戻す。 */
+    int held = aipl_unlock_all();
+    ap_run();
+    aipl_relock(held);
+    return v_int(0);
+}
+
+/* ai_call(prompt) — 機内の小型モデル（llm/llm.c）で続きを生成し、結果を
+ * 文字列値として返す。外へは一切出ない。Pi 3・Pi 5 と同じモデル・同じ出力。 */
+static long v_ai_call(long prompt)
+{
+    extern int llm_run(const char *, int, char *, int, int);
+    char pb[192];
+    const char *p = v_render(prompt, pb, sizeof pb);
+    char out[256];
+    out[0] = 0;
+    llm_run(p, 24, out, (int)sizeof out - 1, 0);
+    int n = 0; while (out[n]) n++;
+    char *r = vheap_alloc(n + 1);
+    if (!r) return v_str("");
+    for (int i = 0; i <= n; i++) r[i] = out[i];
+    return v_str(r);
+}
+
+/* ---- wait(ms) --------------------------------------------------------
+ * Pi 4 では JIT の入口がすべて実プロセスである ―― HTTP は net_proc とは別の
+ * アプリ・ワーカー、シェルはシェルのプロセス（loader/main.c を見よ）。
+ * したがってここで眠っても受信は止まらない。既定で許可する。
+ * （Pi 5 は HTTP の処理が窓管理ループから入ることがあり、そこで眠れないので
+ *   専用プロセスを立てる形にしてある。器の違い。） */
+static int g_on_proc = 1;
+void cc_set_on_proc(int on) { g_on_proc = on; }
+/* 1 回の run で眠ってよい合計。際限なく眠らせない歯止め。 */
+#define CC_SLEEP_BUDGET_MS 10000UL
+static unsigned long g_sleep_left_ms = CC_SLEEP_BUDGET_MS;
+static long cc_wait(long ms)
+{
+    extern void proc_sleep_us(unsigned long us);
+    long v = v_int_of(ms);
+    if (v <= 0) return v_int(0);
+    if (!g_on_proc) {
+        emit_str("\ncc: wait() はこの経路では使えません。ここで打ち切ります。\n");
+        g_aborted = 1; g_deadline = 0;
+        return v_int(0);
+    }
+    if ((unsigned long)v > g_sleep_left_ms) {
+        emit_str("\ncc: wait() の合計がこの実行の上限（10 秒）を超えました。ここで打ち切ります。\n");
+        g_aborted = 1; g_deadline = 0;
+        return v_int(0);
+    }
+    g_sleep_left_ms -= (unsigned long)v;
+    {   /* 眠った分は「暴走」ではないので、期限を同じだけ後ろへずらす。
+         * 錠は外してから眠る ―― 握ったまま眠ると、その間アクタが
+         * スピンし続ける（cc_pump_now の注記を見よ）。 */
+        unsigned long frq;
+        __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(frq));
+        if (frq < 1000UL) frq = 1000UL;
+        int held = aipl_unlock_all();
+        proc_sleep_us((unsigned long)v * 1000UL);
+        aipl_relock(held);
+        g_deadline += (frq / 1000UL) * (unsigned long)v;
+    }
+    return v_int(0);
+}
+
+/* ---- future / await --------------------------------------------------
+ * **この装置でも並行ではない。** future はその場で dispatch を呼び、値を
+ * スロットに置いてハンドルを返す。await はそのスロットを読む。
+ * Pi 3 も継続分割で並行には走らないので、三機の性格が揃う。 */
+#define FUT_MAX 8
+static struct { int used; long val; } g_fut[FUT_MAX];
+void cc_future_reset(void) { for (int i = 0; i < FUT_MAX; i++) g_fut[i].used = 0; }
+static long cc_future(long to, long meth, long a0, long a1, long a2, long a3)
+{
+    int i = -1;
+    for (int k = 0; k < FUT_MAX; k++) if (!g_fut[k].used) { i = k; break; }
+    if (i < 0) { emit_str("\ncc: future が多すぎます（同時に 8 本まで）\n"); return v_int(-1); }
+    g_fut[i].used = 1;
+    g_fut[i].val  = g_active_dispatch ? g_active_dispatch(to, meth, a0, a1, a2, a3) : v_int(0);
+    return v_int(i);
+}
+static long fut_get(int i)
+{
+    if (i < 0 || i >= FUT_MAX || !g_fut[i].used) return v_int(0);
+    return g_fut[i].val;
+}
+static long cc_await(long h) { return fut_get((int)v_int_of(h)); }
+/* 期限つきの await。値は既に出ているので期限は切れない。 */
+static long cc_await_dl(long h, long ms, long elsev) { (void)ms; (void)elsev; return fut_get((int)v_int_of(h)); }
+
+/* ---- web_listen / web_expose ----------------------------------------
+ * web_expose("/echo", "echo") で公開したアクタへ GET /api/x/<path> から届く。
+ * ポート指定は無視し、既存の 80 番に載る（web_listen はその印）。
+ * 公開はプログラムと寿命を共にする（次のプログラムで作り直される）。 */
+#define WX_MAX  8
+#define WX_PATH 40
+static char g_wx_path[WX_MAX][WX_PATH];
+static int  g_wx_actor[WX_MAX];
+static int  g_nwx;
+static int  g_wx_port;
+void cc_web_reset(void) { g_nwx = 0; g_wx_port = 0; }
+static long cc_web_listen(long port) { g_wx_port = (int)v_int_of(port); return v_int(0); }
+static long cc_web_expose(long path, long actor)
+{
+    char pb[WX_PATH]; const char *ps = v_render(path, pb, sizeof pb);
+    int id = (int)v_int_of(actor);
+    if (id < 0) return v_int(0);
+    int slot = -1;
+    for (int i = 0; i < g_nwx; i++) {          /* 同じパスなら上書き */
+        int k = 0; while (g_wx_path[i][k] && g_wx_path[i][k] == ps[k]) k++;
+        if (!g_wx_path[i][k] && !ps[k]) { slot = i; break; }
+    }
+    if (slot < 0) { if (g_nwx >= WX_MAX) return v_int(0); slot = g_nwx++; }
+    int k = 0; for (; ps[k] && k < WX_PATH - 1; k++) g_wx_path[slot][k] = ps[k];
+    g_wx_path[slot][k] = 0;
+    g_wx_actor[slot] = id;
+    return v_int(1);
+}
+/* tcp_server.c から引く。見つからなければ -1。 */
+int cc_web_lookup(const char *path)
+{
+    for (int i = 0; i < g_nwx; i++) {
+        int k = 0; while (g_wx_path[i][k] && g_wx_path[i][k] == path[k]) k++;
+        if (!g_wx_path[i][k] && !path[k]) return g_wx_actor[i];
+    }
+    return -1;
+}
+int cc_web_port(void)  { return g_wx_port; }
+int cc_web_count(void) { return g_nwx; }
+const char *cc_web_path_at(int i) { return (i >= 0 && i < g_nwx) ? g_wx_path[i] : 0; }
+int cc_web_actor_at(int i) { return (i >= 0 && i < g_nwx) ? g_wx_actor[i] : -1; }
+
+
 /* `saga { step {..} compensate {..} ... }` runtime.  AIPL signals a step
  * failure by raising; this int-only backend has no exceptions, so the AIPL
  * step body calls `fail()` instead.  The translator emits a driver that runs
@@ -678,6 +844,15 @@ unsigned long cc_resolve_extern(const char *name)
         { "cc_gfx_circle",(void *)&cc_gfx_circle},
         { "cc_call",    (void *)&cc_call      },
         { "cc_select",  (void *)&cc_select    },
+        { "cc_pump_now",(void *)&cc_pump_now  },
+        { "v_bool",     (void *)&v_bool       },
+        { "v_ai_call",  (void *)&v_ai_call    },
+        { "cc_wait",    (void *)&cc_wait      },
+        { "cc_future",  (void *)&cc_future    },
+        { "cc_await",   (void *)&cc_await     },
+        { "cc_await_dl",(void *)&cc_await_dl  },
+        { "cc_web_listen",(void *)&cc_web_listen},
+        { "cc_web_expose",(void *)&cc_web_expose},
         { "cc_sel_arg", (void *)&cc_sel_arg   },
         { "cc_saga_reset",  (void *)&cc_saga_reset  },
         { "cc_saga_fail",   (void *)&cc_saga_fail   },
