@@ -1867,7 +1867,11 @@ void kernel_main(void)
      * step; turning this on before then just breaks the box.
      *   proc_set_preempt(1);
      */
-    g_app_w.pid     = proc_create(app_proc_main,  16384, "app");
+    /* 16384 -> 65536: http_build はこのスタックで走る。/cc は本文を abcl2c で
+     * 翻訳してから JIT を回すので、再帰下降が二段重なる。16 KB では
+     * 足りていない疑いがあった（スタックの番人は最下端にしか無いので、
+     * 中途半端なはみ出しは stkbad に出ない）。 */
+    g_app_w.pid     = proc_create(app_proc_main,  65536, "app");
     g_aipl_w.pid    = proc_create(aipl_proc_main, 32768, "aipl");   /* big stack: llm */
     connect_interrupt(189, net_irq_handler, 0);
     gic_enable_irq(189);

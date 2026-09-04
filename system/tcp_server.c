@@ -1397,10 +1397,10 @@ static int http_build(const char *req, char *out, int max)
                  *   ?resident=1   常駐ロード（web_expose した先へ /api/x/ で届く）
                  * 既定       cc_run_source（/compile と同じ）
                  * 観測できないものは直せないので、まず分けて見えるようにする。 */
-                char stg[16];
+                static char stg[16];
                 int want_xlat = (q_param(req, "stage", stg, sizeof stg) &&
                                  stg[0]=='x' && stg[1]=='l');
-                char rsd[8];
+                static char rsd[8];
                 int want_res  = q_param(req, "resident", rsd, sizeof rsd) && rsd[0] == '1';
                 if (want_xlat) {
                     bl = s_put(body, bl, runsrc);
@@ -1442,7 +1442,7 @@ static int http_build(const char *req, char *out, int max)
         extern int  cc_actor_send_str(int id, const char *meth, const char *arg,
                                       char *out, int outcap);
         ctype = "text/plain";
-        char wpath[48], wmeth[32], warg[96];
+        static char wpath[48], wmeth[32], warg[96];
         { const char *sp = req; while (*sp && *sp != ' ') sp++; if (*sp) sp++;
           sp += 7;                          /* "/api/x" の次から */
           int o = 0; wpath[o++] = '/';
