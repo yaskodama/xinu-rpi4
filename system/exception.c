@@ -61,6 +61,11 @@ static void capture(const char *kind)
 static void recover_spin(void)
 {
     aipl_force_release();                          /* don't leave the heap locked */
+    /* ★ アクタの協調実行（proc_actor_pump_enter）の中で落ちると、この旗が
+     * 立ったままなので proc_preempt() が何もしない。下で IRQ を開けて wfi で
+     * 回っても他のプロセスが走らず、板ごと死んで /fault さえ読めなくなる。
+     * 実際、/cc の実行中の停止はこれで「ping ごと消える」形になっていた。 */
+    { extern void proc_actor_pump_force_clear(void); proc_actor_pump_force_clear(); }
     proc_set_preempt(1);                           /* let the timer preempt this context */
     __asm__ volatile ("msr daifclr, #2" ::: "memory");   /* unmask IRQs */
     for (;;) __asm__ volatile ("wfi");             /* timer preempts us -> other procs run */

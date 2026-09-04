@@ -248,6 +248,35 @@ unsigned long net_wake_avg_us(void) { return g_wake_n ? g_wake_us / g_wake_n : 0
 unsigned long net_wake_max_us(void) { return g_wake_max; }
 unsigned long net_wake_count(void)  { return g_wake_n;   }
 
+/* ---- アプリ・ワーカーの番犬 --------------------------------------------
+ * ワーカーが要求の処理中に落ちると（例外なら recover_spin の wfi に取り残される）、
+ * ping は通るのに HTTP だけ死ぬ。しかも /fault を読むにも HTTP が要るので、
+ * いちばん知りたいときに何も分からない ―― 実際そうなった。
+ * 一定時間 APP_WORKING のままなら、単一枠を空に戻して代わりを立てる。
+ * 落ちた方は wfi で回るだけ（プリエンプションは効く）なので放っておいてよい。 */
+static void app_proc_main(void);            /* 下で定義 */
+static unsigned long g_appwd_t0;
+static int           g_appwd_replacements;
+int app_watchdog_replacements(void) { return g_appwd_replacements; }
+
+static void app_watchdog(void)
+{
+    extern int  tcp_app_stuck(void);
+    extern void tcp_app_force_idle(void);
+    unsigned long now, hz;
+    if (!tcp_app_stuck()) { g_appwd_t0 = 0; return; }
+    __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz)); if (hz < 1000) hz = 1000;
+    __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(now));
+    if (g_appwd_t0 == 0) { g_appwd_t0 = now; return; }
+    if (now - g_appwd_t0 < hz * 25UL) return;          /* 25 秒待つ */
+    g_appwd_t0 = 0;
+    tcp_app_force_idle();
+    { int np = proc_create(app_proc_main, 65536, "app");
+      if (np > 0) { g_app_w.pid = np; g_app_w.parked = 0; g_app_w.pending = 0;
+                    g_appwd_replacements++;
+                    uart_puts("\n[appwd] アプリ・ワーカーが戻らないので立て直した\n"); } }
+}
+
 static void net_proc_main(void)
 {
     for (;;) {
@@ -267,6 +296,7 @@ static void net_proc_main(void)
         genet_rx_tick();                       /* drain + dispatch (may queue a request) */
         if (tcp_app_req_pending()) waiter_kick(&g_app_w);  /* hand off to worker */
         tcp_app_flush();                       /* send a response the worker finished */
+        app_watchdog();                        /* 戻らないワーカーの代わりを立てる */
         waiter_park(&g_net_w);                 /* sleep until RX IRQ or worker kick */
     }
 }

@@ -54,6 +54,10 @@ void proc_resched_request(void)    { g_resched_pending = 1; }
 static volatile int g_actor_pump;
 void proc_actor_pump_enter(void) { g_actor_pump++; }
 void proc_actor_pump_leave(void) { if (g_actor_pump > 0) g_actor_pump--; }
+/* 例外からの復帰でだけ使う。アクタの協調実行中に落ちると、この旗が立ったままで
+   proc_preempt() が何もしないので、recover_spin が wfi で回っても他のプロセスが
+   走らない ―― 板ごと死んで /fault さえ読めなくなる。強制的に落とす。 */
+void proc_actor_pump_force_clear(void) { g_actor_pump = 0; }
 
 /* Live runtime accessors for the HDMI monitor (drawn by the wm in NULLPROC,
  * so they stay visible even when the app worker / HTTP path wedges). */

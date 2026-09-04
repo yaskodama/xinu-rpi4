@@ -1431,6 +1431,8 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, "  state = ");              bl = s_putdec(body, bl, ap_run_stuck_state());
         bl = s_put(body, bl, "  待ち行列に残り = ");      bl = s_putdec(body, bl, ap_run_stuck_q());
         bl = s_put(body, bl, "\n生きているアクタ = ");   bl = s_putdec(body, bl, ap_live_count());
+        { extern int app_watchdog_replacements(void);
+          bl = s_put(body, bl, "\nワーカー立て直し = "); bl = s_putdec(body, bl, app_watchdog_replacements()); }
         bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "GET /api/x/") || starts_with(req, "POST /api/x/")) {
         /* web_expose で公開したアクタを叩く。Pi 3・Pi 5 と同じ形:
@@ -2848,6 +2850,12 @@ static int http_build(const char *req, char *out, int max)
 /* True when a complete request is queued for the worker (net process polls
  * this after draining, to wake the worker). */
 int tcp_app_req_pending(void) { return g_app_state == APP_QUEUED; }
+/* アプリ・ワーカーが要求の処理中に落ちた（または戻らなくなった）とき、
+   その要求は永久に APP_WORKING のまま残り、以後どの要求も受け付けられない。
+   代わりのワーカーを立てるときに、この単一枠を空に戻す。
+   応答は返らないが、クライアントは既に諦めている。 */
+void tcp_app_force_idle(void) { g_app_state = APP_IDLE; }
+int  tcp_app_stuck(void)      { return g_app_state == APP_WORKING; }
 
 /* Run the queued request's app processing (http_build -> cc/llm).  Called
  * ONLY from the app-worker process, off the net process's stack, so a long

@@ -118,6 +118,7 @@ void proc_preempt(void);
  * compute keeps full preemption. */
 void proc_actor_pump_enter(void);
 void proc_actor_pump_leave(void);
+void proc_actor_pump_force_clear(void);   /* 例外からの復帰専用 */
 /* Live runtime accessors (read by the HDMI runtime monitor). */
 int           proc_preempt_on(void);
 unsigned long proc_ctxsw_count(void);
