@@ -1446,6 +1446,8 @@ static int http_build(const char *req, char *out, int max)
           extern int tcp_app_state_now(void);
           extern const char *rt_phase(void);
           bl = s_put(body, bl, "\nワーカー立て直し = "); bl = s_putdec(body, bl, app_watchdog_replacements());
+          { extern int ap_forced_kills(void);
+            bl = s_put(body, bl, "\n強制 kill = "); bl = s_putdec(body, bl, ap_forced_kills()); }
           bl = s_put(body, bl, "\napp_state = ");        bl = s_putdec(body, bl, tcp_app_state_now());
           bl = s_put(body, bl, " (0=idle 1=queued 2=working 3=done)  phase = ");
           bl = s_put(body, bl, rt_phase()); }

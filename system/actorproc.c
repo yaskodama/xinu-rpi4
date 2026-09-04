@@ -66,8 +66,7 @@ void ap_reset(void)
      * runtime then uses as a g_obj[] index — corrupting memory and wedging
      * the box.  /compile and a resident set therefore do not coexist: the
      * first /compile reaps the residents. */
-    for (int i = 0; i < g_nact; i++)
-        if (g_act[i].pid > 0) proc_kill(g_act[i].pid);
+    ap_killall();                    /* 協調的に畳む（kill は最後の手段） */
     aipl_force_release();   /* a fresh run starts with the heap lock clear,
                              * defending against any stale owner left behind */
     for (int i = 0; i < AP_NACT; i++) {
@@ -80,10 +79,41 @@ void ap_reset(void)
     g_nact = 0;
 }
 
+/* ★ アクタを kill() で叩き落としてはいけない。
+ * アクタは vheap_alloc / ap_post の irq_save 区間や aipl_lock の中に居ることが
+ * あり、その最中に殺すと割り込みが止まったまま、あるいは錠を握ったままになって
+ * **板ごと死ぬ**（ping も消える）。実機でこれを何度も踏んだ。
+ * Pi 3 の VM でも同じ穴を踏んでいる（apps/abcl_program.c の abcl_vm_kill_prev）。
+ * 印をつけて起こし、自分でループを抜けさせる。残ったものだけ最後に kill する。 */
+static int g_ap_forced_kills;
+int ap_forced_kills(void) { return g_ap_forced_kills; }
+
 void ap_killall(void)
 {
-    for (int i = 0; i < g_nact; i++)
-        if (g_act[i].pid > 0) { proc_kill(g_act[i].pid); g_act[i].pid = -1; }
+    int i;
+    for (i = 0; i < g_nact; i++)
+        if (g_act[i].pid > 0) g_dead[i] = 1;
+    for (i = 0; i < g_nact; i++)
+        if (g_act[i].pid > 0 && g_act[i].waiting) {
+            g_act[i].waiting = 0; proc_ready(g_act[i].pid);
+        }
+    /* 抜けるまで譲る。壁時計で上限を置く（プリエンプションが切ってあっても
+       proc_yield は効く）。 */
+    { unsigned long t0, hz, ct;
+      __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz)); if (hz < 1000) hz = 1000;
+      __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(t0));
+      unsigned long lim = t0 + hz * 3UL;
+      for (;;) {
+          int live = 0;
+          for (i = 0; i < g_nact; i++) if (g_act[i].pid > 0) live = 1;
+          if (!live) break;
+          __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(ct));
+          if (ct >= lim) break;
+          proc_yield();
+      } }
+    /* それでも残ったものだけ、やむを得ず落とす */
+    for (i = 0; i < g_nact; i++)
+        if (g_act[i].pid > 0) { g_ap_forced_kills++; proc_kill(g_act[i].pid); g_act[i].pid = -1; }
     g_nact = 0;
 }
 
@@ -147,7 +177,11 @@ static void ap_recv(int self, struct ap_msg *out)
      * message that arrived between the test and the block. */
     extern unsigned long timer_ticks(void);
     unsigned long d = irq_save();
-    while (q_empty(self)) { g_act[self].waiting = 1; proc_block(); }
+    /* 死ぬ印が立っていたら待たない。以前は ap_recv でメッセージを待っている
+       アクタが g_dead を見ず、起こしても待ちに戻るだけで永久に抜けなかった
+       ―― それで ap_killall が kill に頼るしかなくなっていた。 */
+    while (q_empty(self) && !g_dead[self]) { g_act[self].waiting = 1; proc_block(); }
+    if (g_dead[self]) { out->method = -1; out->reply_to = -1; irq_restore(d); return; }
     *out = g_act[self].q[g_act[self].head];
     g_act[self].head = (g_act[self].head + 1) % AP_QLEN;
     g_act[self].nmsg++;
@@ -207,6 +241,10 @@ static void actor_proc_main(void)
     struct ap_msg m;
     for (;;) {
         ap_recv(self, &m);                  /* idle wait: no vheap lock held */
+        if (g_dead[self]) {                 /* 畳まれた: ハンドラに入らず抜ける */
+            g_act[self].pid = -1;
+            proc_exit();                    /* never returns */
+        }
         g_cur_reply[self] = m.reply_to;     /* read in the crash path (m may be clobbered) */
         /* Hold the vheap lock for the duration of the handler so a preemption
          * can't interleave another vheap user (it spin-yields to us).  The
