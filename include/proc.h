@@ -91,6 +91,10 @@ int  proc_create(proc_entry_t entry, unsigned long stksize, const char *name);
 /* Like proc_create but stashes `arg` in proctab[pid].arg so the new
  * process can recover it (e.g. which actor it is) on first run. */
 int  proc_create_arg(proc_entry_t entry, unsigned long stksize, const char *name, void *arg);
+/* スタックを呼び出し側が渡す版（getmem を使わない）。渡したスタックは
+   呼び出し側の持ち物なので proc_kill は解放しない。 */
+int  proc_create_static_arg(proc_entry_t entry, void *stk, unsigned long stksize,
+                            const char *name, void *arg);
 void proc_ready(int pid);
 void proc_resched(void);
 void proc_yield(void);

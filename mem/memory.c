@@ -9,6 +9,18 @@
  * cheap update for a faster `mem` command. */
 static struct memblk memlist_head;
 
+/* 空きの合計・最大ブロック・断片の数を返す（診断用。/api/mem）。
+   実行のたびにアクタのスタックやアリーナを取り直しているので、
+   断片化していないかを外から見られるようにする。 */
+void mem_stats(unsigned long *total, unsigned long *largest, int *blocks)
+{
+    unsigned long t = 0, mx = 0; int n = 0;
+    struct memblk *c = memlist_head.mnext;
+    while (c) { t += c->mlength; if (c->mlength > mx) mx = c->mlength; n++;
+                if (n > 100000) break; c = c->mnext; }
+    if (total) *total = t; if (largest) *largest = mx; if (blocks) *blocks = n;
+}
+
 static unsigned long heap_lo;   /* inclusive */
 static unsigned long heap_hi;   /* exclusive */
 static unsigned long heap_total;

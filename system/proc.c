@@ -381,6 +381,95 @@ int proc_create_arg(proc_entry_t entry, unsigned long stksize, const char *name,
     return pid;
 }
 
+/* proc_create_arg と同じだが、スタックを呼び出し側が渡す（getmem を使わない）。
+   アクタのように何度も作り直すものは、毎回 getmem/freemem すると空き領域を
+   刻み続ける。静的な池から配れば churn が消える。
+   ★ 渡したスタックは呼び出し側の持ち物。proc_kill が freemem しないよう
+     stkbase は 0 のままにし、canary だけ置く。 */
+int proc_create_static_arg(proc_entry_t entry, void *stk, unsigned long stksize,
+                           const char *name, void *arg)
+{
+    int pid = alloc_slot();
+    if (pid < 0) return -1;
+
+    /* Minimum stack: the IRQ entry frame alone is 768 bytes (31 GPRs + all
+     * 32 q-registers, see exception_vectors.S), pushed onto whichever
+     * process was interrupted.  A 1 KB stack could not survive one IRQ plus
+     * a nested resched, so the floor is 2 KB and there is a canary at the
+     * base to catch what still overflows. */
+    if (stksize < 2048) stksize = 2048;
+    stksize = ROUNDMB(stksize);
+
+    /* If a previous occupant of this slot died via proc_exit (self-exit),
+     * its stack memory was never freed (proc_exit cannot freemem its own
+     * live stack).  Free it now, before allocating the new slot's stack —
+     * otherwise long-lived spawn-and-suicide patterns leak ~stksize bytes
+     * per cycle and exhaust the heap.  proctab[pid].stkbase==0 after
+     * proc_kill() so this is a no-op for kill-reaped slots. */
+    { void *old_stk = proctab[pid].stkbase; unsigned long old_len = proctab[pid].stklen;
+      proctab[pid].stkbase = 0; proctab[pid].stklen = 0;
+      if (old_stk) freemem(old_stk, old_len); }
+    if (stk == 0) { proctab[pid].state = PR_FREE; return -1; }
+
+    struct procent *p = &proctab[pid];
+    p->state   = PR_READY;
+    p->prio    = PROC_DEFAULT_PRIO;
+    p->stkbase = 0;             /* 池の持ち物。proc_kill に freemem させない */
+    p->stklen  = stksize;
+    p->arg     = arg;
+    copy_name(p->name, name);
+    p->next    = 0;
+    p->prev    = 0;
+
+    /* Canary at the lowest address of the stack — the end SP grows toward. */
+    *(volatile unsigned long *)stk = PROC_STK_CANARY;
+
+    /* Lay out an initial saved-register frame at the top of the
+     * stack, in the exact order ctxsw.S restores them:
+     *   [sp +   0] x29 (FP)
+     *   [sp +   8] x30 (LR)   <-- where `ret` jumps; we put `entry` here
+     *   [sp +  16] d14, d15   <-- AAPCS64 callee-saved FP (low 64 bits)
+     *   [sp +  32] d12, d13
+     *   [sp +  48] d10, d11
+     *   [sp +  64] d8,  d9
+     *   [sp +  80] x27, x28
+     *   [sp +  96] x25, x26
+     *   [sp + 112] x23, x24
+     *   [sp + 128] x21, x22
+     *   [sp + 144] x19, x20
+     * 20 quadwords = 160 bytes, keeping the 16-byte SP alignment.
+     * Initial FP regs are zeroed — fresh process has no meaningful
+     * FP state. */
+    extern void proc_entry_trampoline(void);   /* ctxsw.S: enables IRQs then br x19 */
+    unsigned long *sp_top = (unsigned long *)((unsigned char *)stk + stksize);
+    unsigned long *sp     = sp_top - 20;
+    sp[0]  = 0;                          /* x29 (FP)                                */
+    sp[1]  = (unsigned long)proc_entry_trampoline;  /* x30 (LR): enable IRQs, br x19 */
+    sp[2]  = 0; sp[3]  = 0;              /* d14, d15            */
+    sp[4]  = 0; sp[5]  = 0;              /* d12, d13            */
+    sp[6]  = 0; sp[7]  = 0;              /* d10, d11            */
+    sp[8]  = 0; sp[9]  = 0;              /* d8,  d9             */
+    sp[10] = 0; sp[11] = 0;              /* x27, x28            */
+    sp[12] = 0; sp[13] = 0;              /* x25, x26            */
+    sp[14] = 0; sp[15] = 0;              /* x23, x24            */
+    sp[16] = 0; sp[17] = 0;              /* x21, x22            */
+    sp[18] = (unsigned long)entry;       /* x19 -> trampoline br target (entry) */
+    sp[19] = 0;                          /* x20                 */
+    p->sp = (void *)sp;
+
+    /* Masked: the timer ISR pushes woken sleepers onto the same queue from
+     * proc_timer_tick(), and it runs even while preemption is disabled.  An
+     * unprotected push here raced it — with the actor workload spawning
+     * constantly at up to 5 kHz of timer IRQs, a torn insert dropped the new
+     * process off the run queue and it never ran again.  (The old single
+     * linked list had the same race; the doubly-linked FIFO + bitmap simply
+     * has more invariants to tear.) */
+    unsigned long d = irq_save();
+    ready_push(p);
+    irq_restore(d);
+    return pid;
+}
+
 void proc_ready(int pid)
 {
     if (pid <= 0 || pid >= NPROC) return;

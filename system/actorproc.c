@@ -17,6 +17,10 @@
 #include "irq.h"
 
 #define AP_NACT  (NPROC - 1)        /* one Xinu process per actor       */
+/* アクタのスタックの静的な池（先頭 AP_STK_POOL 体ぶん）。 */
+#define AP_STK_POOL 16
+#define AP_STK_SZ   8192
+static unsigned char g_ap_stk[AP_STK_POOL][AP_STK_SZ] __attribute__((aligned(16)));
 #define AP_QLEN  64        /* 2026-05-31: tested 256 (defense-in-depth) but
                             * the real N-Queens N=6 bug was g_obj[64] BSS
                             * overflow in aipl2c, not mailbox saturation —
@@ -284,7 +288,18 @@ int ap_spawn(void)
         g_act[id].last_active_ms = now_ms;       /* spawn counts as activity */
         g_act[id].protected_from_gc = 0;
     }
-    int pid = proc_create_arg(actor_proc_main, 8192, "actor", (void *)(long)id);
+    /* アクタのスタックは静的な池から配る。以前は毎回 getmem/freemem していたので、
+     * プログラムを載せ替えるたびに 8 KB の確保と解放を繰り返していた。
+     * 実機では「何本か走らせたあと」に板ごと死ぬ（ping も消える）状態依存の
+     * 停止が出ており、この churn が疑わしい。池を使い切ったら従来どおり
+     * getmem に落ちる（正典ガイドは 4 体も使わない）。 */
+    int pid;
+    if (id < AP_STK_POOL) {
+        pid = proc_create_static_arg(actor_proc_main, g_ap_stk[id], AP_STK_SZ,
+                                     "actor", (void *)(long)id);
+    } else {
+        pid = proc_create_arg(actor_proc_main, AP_STK_SZ, "actor", (void *)(long)id);
+    }
     if (pid < 0) { g_act[id].pid = -1; return -1; }
     g_act[id].pid = pid;
     return id;

@@ -1420,6 +1420,17 @@ static int http_build(const char *req, char *out, int max)
                 }
             }
         }
+    } else if (starts_with(req, "GET /api/mem")) {
+        /* 空きの合計・最大ブロック・断片の数。実行のたびの getmem/freemem で
+           刻まれていないかを外から見る。 */
+        extern void mem_stats(unsigned long *, unsigned long *, int *);
+        unsigned long tot = 0, mx = 0; int nb = 0;
+        mem_stats(&tot, &mx, &nb);
+        ctype = "text/plain";
+        bl = s_put(body, bl, "free_total="); bl = s_putdec(body, bl, (long)tot);
+        bl = s_put(body, bl, " largest=");   bl = s_putdec(body, bl, (long)mx);
+        bl = s_put(body, bl, " blocks=");    bl = s_putdec(body, bl, (long)nb);
+        bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "GET /api/aprun")) {
         /* ap_run が打ち切られた記録。板が死ぬ代わりにここを読む。 */
         extern int ap_run_timeouts(void), ap_run_stuck_actor(void),
@@ -1432,7 +1443,12 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, "  待ち行列に残り = ");      bl = s_putdec(body, bl, ap_run_stuck_q());
         bl = s_put(body, bl, "\n生きているアクタ = ");   bl = s_putdec(body, bl, ap_live_count());
         { extern int app_watchdog_replacements(void);
-          bl = s_put(body, bl, "\nワーカー立て直し = "); bl = s_putdec(body, bl, app_watchdog_replacements()); }
+          extern int tcp_app_state_now(void);
+          extern const char *rt_phase(void);
+          bl = s_put(body, bl, "\nワーカー立て直し = "); bl = s_putdec(body, bl, app_watchdog_replacements());
+          bl = s_put(body, bl, "\napp_state = ");        bl = s_putdec(body, bl, tcp_app_state_now());
+          bl = s_put(body, bl, " (0=idle 1=queued 2=working 3=done)  phase = ");
+          bl = s_put(body, bl, rt_phase()); }
         bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "GET /api/x/") || starts_with(req, "POST /api/x/")) {
         /* web_expose で公開したアクタを叩く。Pi 3・Pi 5 と同じ形:
@@ -2855,7 +2871,10 @@ int tcp_app_req_pending(void) { return g_app_state == APP_QUEUED; }
    代わりのワーカーを立てるときに、この単一枠を空に戻す。
    応答は返らないが、クライアントは既に諦めている。 */
 void tcp_app_force_idle(void) { g_app_state = APP_IDLE; }
-int  tcp_app_stuck(void)      { return g_app_state == APP_WORKING; }
+/* IDLE 以外で止まっていれば「戻っていない」。以前は APP_WORKING だけを見ていて、
+   要求が APP_QUEUED のまま取り残された場合を拾えず、番犬が発火しなかった。 */
+int  tcp_app_stuck(void)      { return g_app_state != APP_IDLE; }
+int  tcp_app_state_now(void)  { return g_app_state; }
 
 /* Run the queued request's app processing (http_build -> cc/llm).  Called
  * ONLY from the app-worker process, off the net process's stack, so a long
