@@ -376,11 +376,46 @@ int ap_gc_sweep(long threshold_ms, int dry_run, int *out_scanned)
  * a heartbeat to UART so a long run is visible in the serial console,
  * and an obvious break point on truly stuck systems. */
 extern void uart_puts(const char *);
+/* ap_run が打ち切られたときの記録。板が死ぬ代わりに、ここを読めば
+ * 「どのアクタが待ちに落ちなかったか」が分かる（/api/aprun）。 */
+static int  g_aprun_timeouts;
+static int  g_aprun_stuck;         /* 落ち着かなかったアクタ番号（最後の1つ）*/
+static int  g_aprun_stuck_state;
+static int  g_aprun_stuck_q;       /* そのアクタの待ち行列が空でないか      */
+int ap_run_timeouts(void)    { return g_aprun_timeouts; }
+int ap_run_stuck_actor(void) { return g_aprun_stuck; }
+int ap_run_stuck_state(void) { return g_aprun_stuck_state; }
+int ap_run_stuck_q(void)     { return g_aprun_stuck_q; }
+
 void ap_run(void)
 {
     int hb_counter = 0;
+    /* ★ 壁時計で打ち切る。以前は 200,000,000 回の proc_yield が唯一の歯止めで、
+     * プリエンプションを切ったまま回るので事実上の無限ループ ＝ 板の死だった
+     * （ping ごと落ちる）。落ちると何も分からないので、まず観測できる形にする。 */
+    unsigned long t0, hz, ct;
+    __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz)); if (hz < 1000) hz = 1000;
+    __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(t0));
+    unsigned long limit = t0 + hz * 5UL;          /* 5 秒 */
     for (long guard = 0; guard < 200000000L; guard++) {
         int busy = 0;
+        if ((guard & 0xFFF) == 0) {               /* 4096 回ごとに時計を見る */
+            __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(ct));
+            if (ct >= limit) {
+                g_aprun_timeouts++;
+                for (int i = 0; i < g_nact; i++) {
+                    if (g_act[i].pid <= 0) continue;
+                    if (proctab[g_act[i].pid].state != PR_WAIT ||
+                        (!g_act[i].waiting && !q_empty(i))) {
+                        g_aprun_stuck       = i;
+                        g_aprun_stuck_state = (int)proctab[g_act[i].pid].state;
+                        g_aprun_stuck_q     = q_empty(i) ? 0 : 1;
+                    }
+                }
+                uart_puts("\n[ap_run] 5 秒で落ち着かなかったので打ち切る\n");
+                return;
+            }
+        }
         for (int i = 0; i < g_nact; i++) {
             if (g_act[i].pid <= 0) continue;
             /* An actor still needs the pump if it has a deliverable message, OR

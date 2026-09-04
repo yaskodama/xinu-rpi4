@@ -1420,6 +1420,18 @@ static int http_build(const char *req, char *out, int max)
                 }
             }
         }
+    } else if (starts_with(req, "GET /api/aprun")) {
+        /* ap_run が打ち切られた記録。板が死ぬ代わりにここを読む。 */
+        extern int ap_run_timeouts(void), ap_run_stuck_actor(void),
+                   ap_run_stuck_state(void), ap_run_stuck_q(void);
+        extern int ap_live_count(void);
+        ctype = "text/plain";
+        bl = s_put(body, bl, "ap_run 打ち切り回数 = "); bl = s_putdec(body, bl, ap_run_timeouts());
+        bl = s_put(body, bl, "\n落ち着かなかったアクタ = "); bl = s_putdec(body, bl, ap_run_stuck_actor());
+        bl = s_put(body, bl, "  state = ");              bl = s_putdec(body, bl, ap_run_stuck_state());
+        bl = s_put(body, bl, "  待ち行列に残り = ");      bl = s_putdec(body, bl, ap_run_stuck_q());
+        bl = s_put(body, bl, "\n生きているアクタ = ");   bl = s_putdec(body, bl, ap_live_count());
+        bl = s_put(body, bl, "\n");
     } else if (starts_with(req, "GET /api/x/") || starts_with(req, "POST /api/x/")) {
         /* web_expose で公開したアクタを叩く。Pi 3・Pi 5 と同じ形:
          *   GET /api/x/<path>?method=<名前>&args=<値> */
