@@ -501,6 +501,22 @@ int ap_live_count(void) { return g_nact; }
 /* Fill stats for live actor `i` (0..ap_live_count()-1): its Xinu pid, the
  * number of messages queued in its mailbox, and whether it is blocked waiting
  * on an empty mailbox.  Returns 0 on success, -1 if `i` is out of range. */
+/* アクタ表の生の姿。g4 の直後に何が残っているかを外から見るために足した
+   （/api/aptab）。dead の印と、そのプロセスの state（proctab）も返す。 */
+int ap_actor_stat2(int i, int *pid, int *qlen, int *waiting, unsigned int *nmsg,
+                   int *dead, int *pstate)
+{
+    if (i < 0 || i >= g_nact) return -1;
+    if (pid)     *pid     = g_act[i].pid;
+    if (qlen)    *qlen    = (g_act[i].tail - g_act[i].head + AP_QLEN) % AP_QLEN;
+    if (waiting) *waiting = g_act[i].waiting;
+    if (nmsg)    *nmsg    = g_act[i].nmsg;
+    if (dead)    *dead    = g_dead[i];
+    if (pstate)  *pstate  = (g_act[i].pid > 0 && g_act[i].pid < NPROC)
+                            ? (int)proctab[g_act[i].pid].state : -1;
+    return 0;
+}
+
 int ap_actor_stat(int i, int *pid, int *qlen, int *waiting, unsigned int *nmsg)
 {
     if (i < 0 || i >= g_nact) return -1;

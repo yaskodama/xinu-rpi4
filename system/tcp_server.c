@@ -1420,6 +1420,26 @@ static int http_build(const char *req, char *out, int max)
                 }
             }
         }
+    } else if (starts_with(req, "GET /api/aptab")) {
+        /* アクタ表の生の姿。g4 の直後に何が残っているかを見る。
+           pstate: 0=FREE 1=READY 2=CURR 3=WAIT 4=SLEEP */
+        extern int ap_live_count(void);
+        extern int ap_actor_stat2(int, int *, int *, int *, unsigned int *, int *, int *);
+        ctype = "text/plain";
+        bl = s_put(body, bl, "nact="); bl = s_putdec(body, bl, ap_live_count());
+        bl = s_put(body, bl, "\n");
+        for (int i = 0; i < ap_live_count() && i < 24; i++) {
+            int pid = 0, qlen = 0, waiting = 0, dead = 0, pst = 0; unsigned int nmsg = 0;
+            if (ap_actor_stat2(i, &pid, &qlen, &waiting, &nmsg, &dead, &pst) < 0) break;
+            bl = s_put(body, bl, "a");      bl = s_putdec(body, bl, i);
+            bl = s_put(body, bl, " pid=");  bl = s_putdec(body, bl, pid);
+            bl = s_put(body, bl, " pstate=");bl = s_putdec(body, bl, pst);
+            bl = s_put(body, bl, " q=");    bl = s_putdec(body, bl, qlen);
+            bl = s_put(body, bl, " wait="); bl = s_putdec(body, bl, waiting);
+            bl = s_put(body, bl, " dead="); bl = s_putdec(body, bl, dead);
+            bl = s_put(body, bl, " nmsg="); bl = s_putdec(body, bl, (long)nmsg);
+            bl = s_put(body, bl, "\n");
+        }
     } else if (starts_with(req, "GET /api/mem")) {
         /* 空きの合計・最大ブロック・断片の数。実行のたびの getmem/freemem で
            刻まれていないかを外から見る。 */
