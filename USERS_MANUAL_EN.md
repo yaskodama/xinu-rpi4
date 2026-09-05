@@ -606,7 +606,7 @@ the Mac reference implementation.
 #### How much of AIPL runs here
 
 The canonical language is split into 25 features, each checked on this board
-(only programs that pass the canonical checker `tc` are posted). **25 of 25 run.**
+(only programs that pass the canonical checker `tc` are posted). **All 25 run, `spawn` included.**
 
 | Feature | Runs | Notes |
 |---|---|---|
@@ -628,6 +628,7 @@ The canonical language is split into 25 features, each checked on this board
 | `replyto` / `answer` / parameter type `reply` | yes | see the limits below |
 | `acquire` / `release` | yes | see the limits below |
 | Type / effect / level annotations | accepted, discarded | checked on the canonical side (`tc`) |
+| `spawn("Class","name")` | yes | goes into the published table under that name; reachable by `remote` |
 | `remote("host:port","actor")` | yes | see below; carried over UDP/9010 |
 
 **`remote(...)`.** Send to, or call, an actor another node has published with
