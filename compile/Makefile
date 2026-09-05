@@ -131,6 +131,12 @@ obj/qemu/basic.o: basic.c | obj/qemu ; $(CC) $(QEMU_FP_CFLAGS) -c $< -o $@
 obj/pi4/basicwin.o:  basicwin.c | obj/pi4  ; $(CC) $(PI4_FP_CFLAGS)  -c $< -o $@
 obj/qemu/basicwin.o: basicwin.c | obj/qemu ; $(CC) $(QEMU_FP_CFLAGS) -c $< -o $@
 
+# 版を名乗るファイルだけは毎回コンパイルし直す。そうしないと
+# __DATE__ / __TIME__ が古いままになり、GET /version が嘘をつく。
+.PHONY: FORCE
+FORCE:
+obj/pi4/kversion.o obj/qemu/kversion.o: FORCE
+
 obj/pi4/%.o: %.c  | obj/pi4  ; $(CC) $(PI4_CFLAGS)  -c $< -o $@
 obj/pi4/%.o: %.S  | obj/pi4  ; $(CC) $(PI4_CFLAGS)  -c $< -o $@
 obj/qemu/%.o: %.c | obj/qemu ; $(CC) $(QEMU_CFLAGS) -c $< -o $@

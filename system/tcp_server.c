@@ -1451,6 +1451,16 @@ static int http_build(const char *req, char *out, int max)
         bl = s_put(body, bl, " largest=");   bl = s_putdec(body, bl, (long)mx);
         bl = s_put(body, bl, " blocks=");    bl = s_putdec(body, bl, (long)nb);
         bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "GET /version")) {
+        /* いま走っているカーネルの版を名乗る。
+           ★ 焼いたあと「HTTP が応答した」を「再起動した」と取り違えて、
+              古いカーネルに向かって実験を続けたことがある。板が生きている
+              ことと、焼いたものが走っていることは別である。焼いたら必ず
+              ここを読んで、手元のビルドと突き合わせること。 */
+        { extern const char *kernel_build_id(void);
+          bl = s_put(body, bl, "build ");
+          bl = s_put(body, bl, kernel_build_id());
+          bl = s_put(body, bl, "\n"); }
     } else if (starts_with(req, "GET /api/aprun")) {
         /* ap_run が打ち切られた記録。板が死ぬ代わりにここを読む。 */
         extern int ap_run_timeouts(void), ap_run_stuck_actor(void),

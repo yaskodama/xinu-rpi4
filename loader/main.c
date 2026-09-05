@@ -165,6 +165,14 @@ static void genet_rx_tick(void)
     genet_irq_rearm();
 }
 
+/* AIPL の remote(...) が応答を待つあいだ、待ち側から受信を回すための口。
+   /cc のプログラムが走っているあいだ、このループは回らない（連投した HTTP が
+   詰まるのと同じ理由）。待つ側が自分で回さないと、相手の応答は届いていても
+   誰も拾わず、必ず期限切れになる ―― 実機でそうなった。
+   g_rx_busy の番人が中にあるので、割り込みと重なっても安全に空振りする。 */
+void net_rx_pump(void) { genet_rx_tick(); }
+
+
 /* ---------- IRQ-woken network process + app worker (preemptive net) ----------
  * Two cooperating processes decouple networking from both the wm-loop and
  * the non-reentrant AIPL runtime:
