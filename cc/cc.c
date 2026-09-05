@@ -973,11 +973,18 @@ static int compile_run_core(const char *src, unsigned long n, long *retval)
     ap_run();                   /* drive actor processes until quiescent */
     ap_killall();               /* one-shot: reap the actor processes */
     proc_actor_pump_leave();
-    /* ★ この run のコードを指しているポインタを全部落としてから kfree する。
+    /* ★★ この run のコードを指しているポインタを全部落としてから kfree する。
      * g_active_dispatch だけ 0 にして ap_set_dispatch と cc_set_apply を
      * そのままにしていたので、actorproc の g_actor_dispatch と v_list_map の
-     * g_apply が**解放済みのコード**を指したまま残っていた。誰かが呼べば
-     * 野良ジャンプになる。 */
+     * g_apply が**解放済みのコード**を指したまま残っていた。
+     *
+     * これが Pi 4 で長く追っていた「select を含む実行の次に何を投げても
+     * 板が死ぬ」の原因だった。症状は 1 バイトの化け ―― 次の run の翻訳結果
+     * （abcl2c の出力）の固定オフセット 785 が 'i'(0x69) → 'j'(0x6A) になり、
+     * 生成 C が `g_idlo = jd;` になって「cc: undefined variable」、
+     * 落ちる場所によっては板の即死（ping も消える）。
+     * kfree した領域を次の kmalloc が配り直すので、古いポインタ経由の
+     * 書き込みが新しいアリーナに落ちていた。 */
     g_active_dispatch = 0;
     ap_set_dispatch(0);
     cc_set_apply(0);
