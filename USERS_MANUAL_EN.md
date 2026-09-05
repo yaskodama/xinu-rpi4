@@ -511,11 +511,16 @@ table: up to 16 entries).
 | Route | What it does |
 | --- | --- |
 | `GET /shell?cmd=<cmd>` | run any shell command, return its output (commands have no stdin) |
+| `POST /cc` | **post AIPL or C; compile and run it on the spot** (§7.8) |
+| `POST /cc?stage=xlat` | translate AIPL to C and **just return it** (runs nothing, §7.8) |
+| `GET /api/x/<path>?method=&args=` | reach an actor published with `web_expose` (§7.8) |
 | `POST /compile` | JIT-compile and run a C program (body = source) |
 | `GET /chat` | on-device LLM chat |
 | `GET /actor` `/send` `/gc` `/jitstats` | actor inventory / message send / actor-pool GC / JIT counters |
 | `GET /usbdiag` `/pcie-init` `/pcie-enum` `/xhci-reset` | USB / PCIe bring-up diagnostics |
 | `GET /fault` `/mmio-read` `/mmio-write` `/mmio-sweep` | fault counters + raw MMIO peek/poke |
+| `GET /api/aptab` `/api/aprun` `/api/mem` | actor table / actor-drive give-ups / free memory (§7.9) |
+| `GET /wx` `/ticks` | is W^X enforced / stack canary and context switches |
 | `POST /reboot` | BCM2711 watchdog reset |
 | `POST /chainload` | upload + jump to a new kernel (no SD swap) |
 
@@ -531,6 +536,91 @@ python3 tools/remote_chainload.py 192.168.3.100 compile/kernel8.img
 
 A bad image just needs a power cycle (the SD card is untouched), which keeps the
 dev loop fast. It needs the HTTP server to be responsive to accept the upload.
+
+----------------------------------------------------------------------
+
+### 7.8 Posting AIPL to run it (`POST /cc`)
+
+**You can post AIPL source directly.** If the first word of the body (after
+skipping whitespace and comments) is `class`, the on-board front end `abcl2c`
+lowers it to C; otherwise the body is treated as C. Either way the in-kernel C
+compiler JITs it to AArch64 and runs it, and **the program's output comes back
+in the reply**.
+
+```sh
+curl --data-binary @g1_hello.aipl http://192.168.3.100/cc
+  hello, AIPL
+  tick 1
+  tick 2
+  => 0
+```
+
+**All ten canonical guide samples run as written** — including `select`, `wait`
+with a deadline, `ai_call`, and printing booleans as `true`/`false`. See
+chapter 39 of the AIPL user's guide.
+
+There are stages:
+
+| Call | What it does |
+| --- | --- |
+| `POST /cc` | translate and JIT (default) |
+| `POST /cc?stage=xlat` | **return the translated C; run nothing** |
+| `POST /cc?resident=1` | resident load (reachable later via `/api/x/`) |
+
+`?stage=xlat` is also **the window for checking the board's health**: compare
+the board's translation with the output of the same `cc/abcl2c.c` built on the
+Mac, byte for byte. A difference means the board's state is damaged. **It is
+the only check that does not risk the board.**
+
+```sh
+cc -DABCL2C_HOST_TEST -w -o /tmp/a2c cc/abcl2c.c
+/tmp/a2c g1_hello.aipl > /tmp/host.c
+curl --data-binary @g1_hello.aipl "http://192.168.3.100/cc?stage=xlat" > /tmp/board.c
+diff /tmp/host.c /tmp/board.c
+```
+
+An actor published to the outside is reachable over HTTP afterwards.
+
+```sh
+curl --data-binary @g5_web.aipl http://192.168.3.100/cc
+curl 'http://192.168.3.100/api/x/echo?method=say&args=hi'
+  => echo: hi
+```
+
+**Things to know**
+
+- **A new program replaces the previous one.** Published routes (`web_expose`)
+  live and die with the program.
+- **Leave about 5 s between posts.**
+- `wait(ms)` works as written, because HTTP is served by a dedicated app
+  worker. The total sleep in one run is capped at 10 s.
+- Actors run as **real Xinu processes**. The target of a `send` may therefore
+  run before the next statement, so output order can vary between runs (both
+  are correct AIPL: `send` promises no ordering).
+
+**The on-board language model.** Karpathy's `stories260K` is baked into the
+kernel and callable from AIPL as `ai_call(prompt)`. Nothing leaves the board.
+About **0.79 s** per call, producing **the same text** as the Pi 3, the Pi 5 and
+the Mac reference implementation.
+
+### 7.9 What to read when it stalls
+
+**Read these while the board is still alive.**
+
+| Route | What it reports |
+| --- | --- |
+| `GET /fault` | the last CPU fault (ESR / FAR / ELR / SPSR / SP) |
+| `GET /api/aptab` | the raw actor table (pid, process state, queue, dead) |
+| `GET /api/aprun` | `ap_run` give-ups, forced kills, worker replacements |
+| `GET /api/mem` | free total, largest block, fragment count |
+| `GET /jitstats` | `spawn_fails`, dropped messages |
+| `GET /ticks` | stack canary (`stkbad`), context-switch count |
+| `GET /wx` | whether W^X is enforced (it probes by writing) |
+| `GET /reboot` | **watchdog reset** — no need to touch the power |
+
+`/reboot` only works **while the board is alive**; use it before you run out of
+board. If HTTP alone stops while ping still answers, the app worker is replaced
+after 25 s (the count shows up in `/api/aprun`).
 
 ----------------------------------------------------------------------
 

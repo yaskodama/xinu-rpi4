@@ -486,11 +486,16 @@ xinu-pi4$ wifi aodv 10.0.0.3
 | ルート | 内容 |
 | --- | --- |
 | `GET /shell?cmd=<cmd>` | 任意のシェルコマンドを実行し出力を返す (stdin なし) |
+| `POST /cc` | **AIPL または C を投げて、その場でコンパイル・実行** (§7.8) |
+| `POST /cc?stage=xlat` | AIPL を C に翻訳して**返すだけ**（実行しない。§7.8） |
+| `GET /api/x/<path>?method=&args=` | `web_expose` で公開したアクタを叩く (§7.8) |
 | `POST /compile` | C プログラムを JIT コンパイル&実行 (本文 = ソース) |
 | `GET /chat` | オンデバイス LLM チャット |
 | `GET /actor` `/send` `/gc` `/jitstats` | アクタ一覧 / 送信 / アクタプール GC / JIT カウンタ |
 | `GET /usbdiag` `/pcie-init` `/pcie-enum` `/xhci-reset` | USB / PCIe bring-up 診断 |
 | `GET /fault` `/mmio-read` `/mmio-write` `/mmio-sweep` | フォルトカウンタ + 生 MMIO peek/poke |
+| `GET /api/aptab` `/api/aprun` `/api/mem` | アクタ表 / アクタ駆動の打ち切り / 空き領域 (§7.9) |
+| `GET /wx` `/ticks` | W^X の実効性 / スタック番人・文脈交換 |
 | `POST /reboot` | BCM2711 watchdog リセット |
 | `POST /chainload` | 新カーネルをアップロードして起動 (SD 交換なし) |
 
@@ -509,6 +514,86 @@ python3 tools/remote_chainload.py 192.168.3.100 compile/kernel8.img
 ```
 
 不良イメージでも電源を入れ直すだけで戻ります (SD は無傷) ので開発ループが速くなります。アップロードには HTTP サーバが応答可能であることが必要です。
+
+----------------------------------------------------------------------
+
+### 7.8 AIPL を投げて動かす（`POST /cc`）
+
+**AIPL のソースをそのまま投げられる。** 本文の最初の語（空白とコメントを読み飛ばして）
+が `class` なら機内の前段 `abcl2c` が C に直し、そうでなければ C として扱う。
+どちらも機内の C コンパイラが AArch64 の機械語に JIT して実行し、
+**プログラムの出力がそのまま応答に返る**。
+
+```sh
+curl --data-binary @g1_hello.aipl http://192.168.3.100/cc
+  hello, AIPL
+  tick 1
+  tick 2
+  => 0
+```
+
+**正典ガイド 10 本がそのまま動く**（`select`・期限つきの `wait`・`ai_call`・
+真偽値の `true`/`false` 表示まで一致）。詳細は AIPL ユーザーズガイド第39章。
+
+段階を選べる。
+
+| 呼び方 | 内容 |
+| --- | --- |
+| `POST /cc` | 翻訳して JIT する（既定） |
+| `POST /cc?stage=xlat` | **翻訳した C を返すだけ。実行しない** |
+| `POST /cc?resident=1` | 常駐ロード（`/api/x/` で後から到達できる） |
+
+`?stage=xlat` は**板の健全性を測る窓**でもある。機内の翻訳結果と、
+Mac 側で同じ `cc/abcl2c.c` をビルドした翻訳器の出力をバイト比較すればよい。
+差が出たら板の状態が壊れている。**板を落とさずに判定できる唯一の方法。**
+
+```sh
+cc -DABCL2C_HOST_TEST -w -o /tmp/a2c cc/abcl2c.c
+/tmp/a2c g1_hello.aipl > /tmp/host.c
+curl --data-binary @g1_hello.aipl "http://192.168.3.100/cc?stage=xlat" > /tmp/board.c
+diff /tmp/host.c /tmp/board.c
+```
+
+外部公開したアクタには、あとから HTTP で届く。
+
+```sh
+curl --data-binary @g5_web.aipl http://192.168.3.100/cc
+curl 'http://192.168.3.100/api/x/echo?method=say&args=hi'
+  => echo: hi
+```
+
+**注意点**
+
+- **前のプログラムは置き換わる。** 公開ルート（`web_expose`）もプログラムと寿命を共にする。
+- **連続で投げるときは 5 秒ほど空ける。**
+- `wait(ms)` はそのまま効く（HTTP は専用のアプリ・ワーカーで処理されるため）。
+  1 回の実行で眠れる合計は 10 秒まで。
+- アクタは **Xinu の実プロセス**として走る。したがって `send` した相手が
+  次の文より先に走ることがあり、出力順が回によって変わりうる
+  （AIPL としてはどちらも正しい。`send` は順序を約束しない）。
+
+**機内の小型言語モデル。** カーネルに Karpathy の `stories260K` を焼き込んであり、
+AIPL から `ai_call(prompt)` で呼べる。機外へは一切出ない。1 回およそ **0.79 秒**で、
+Pi 3・Pi 5・Mac の参照実装と**同じ生成文**になる。
+
+### 7.9 止まったときに読むもの
+
+**板が生きているうちに読むこと。**
+
+| ルート | 内容 |
+| --- | --- |
+| `GET /fault` | 直前の CPU 例外（ESR / FAR / ELR / SPSR / SP） |
+| `GET /api/aptab` | アクタ表の生の姿（pid・プロセス状態・待ち行列・dead） |
+| `GET /api/aprun` | `ap_run` の打ち切り、強制 kill、ワーカー立て直し |
+| `GET /api/mem` | 空きの合計・最大ブロック・断片の数 |
+| `GET /jitstats` | `spawn_fails`、メッセージの取りこぼし |
+| `GET /ticks` | スタック番人（`stkbad`）、文脈交換の回数 |
+| `GET /wx` | W^X が効いているか（自分で書いて試す） |
+| `GET /reboot` | **ウォッチドッグで再起動**（電源に触らずに済む） |
+
+`/reboot` は**板が生きているときだけ**効く。使い切る前に使うこと。
+HTTP だけが止まって ping が通る場合は、アプリ・ワーカーが 25 秒で立て直される
+（回数は `/api/aprun` に出る）。
 
 ----------------------------------------------------------------------
 
