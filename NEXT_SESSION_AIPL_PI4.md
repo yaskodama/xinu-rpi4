@@ -1,74 +1,107 @@
 # Pi 4 を最新 AIPL へ — 再開メモ
 
-最終更新: 2026-09-04（中断）
+最終更新: 2026-09-05
 
 ## 0. まずこれ
 
-**Pi 4（192.168.3.100）は電源が落ちている（ping 無応答）。まず入れ直す。**
-焼いてあるのは `100b85b0…`（AIPL 移植版・**未完成**）。
-戻したいときはカード上の `kernel8.img.bak-pre-aipl-f66854f0…`（移植前）。
+焼いてあるのは `431da890…`（正典ガイド 10/10 が通った版）。
+**手元にビルド済みの `6708b55e…` が未焼き** ―― 連続投入の停止の真因を直したもの。
 
-コミットは `d8ff19f`（**push していない**。未完成のため）。
+コミットは `dba9456` まで（**push していない**。実機で未確認のため）。
+移植前に戻すならカード上の `kernel8.img.bak-pre-aipl-f66854f0…`。
 
-## 1. 何が動いて、何が動かないか
+## 1. 到達点 ―― 10 本すべて正典どおり動いた（2026-09-05）
 
-| | 状態 |
+生の AIPL をそのまま `POST /cc`（カーネル `431da890…`）:
+
+| | 出力 |
 |---|---|
-| 機内前段 `abcl2c` | **動く**。正典ガイド 10 本を翻訳。`/cc?stage=xlat` の出力はホストとバイト一致 |
-| `POST /compile` に生成 C | **動く**。g2 が `twice = 43 / awaited = 20 / v=7` |
-| `POST /cc` に生の AIPL・g1 | **動く**（3 回続けても板は無事） |
-| `POST /cc` に生の AIPL・g2 | **止まる**（`?resident=1` でも既定でも。ping ごと落ちる） |
+| g1 | `hello, AIPL / tick 1 / tick 2` |
+| g2 | `twice = 43 / awaited = 20 / v=7` |
+| g3 | `ok, left=7 / sold out` |
+| g4 | `waiting / got 1 / via select:1` ← **select が Pi 3 / Pi 5 と同じ** |
+| g5 | `/api/x/echo` の案内 |
+| g6 | `1 / 1 / n = 1` |
+| g7 | `fast = 42 / slow(timed out) = 0 / await = 10` ← **wait が効く** |
+| g8 | `literal true ok / literal false ok / b = true / not-eq: true` |
+| g9 | `got actor / after send / pong` |
+| g10 | `fork = 1 / latch = 2` |
 
-## 2. 切り分け済み（これ以上疑わなくてよい）
+**前段は完成**: 10 本すべてで機内 `abcl2c` の翻訳がホストとバイト単位で一致
+（`/cc?stage=xlat`、`stkbad=0`）。
 
-- 6 引数の外部呼び出し … 通る（素の C から `cc_future` `cc_await` `cc_pump_now`）
-- JIT→C→JIT の再入 … 通る（自作 `dispatch` を `cc_future` 経由で呼んで 41）
-- 機内 abcl2c の翻訳 … ホストと**バイト一致**
-- 生成 C そのもの … `/compile` では正しく走る
-- 常駐プログラムの載せ替え … g1 を 3 回で無事
+## 2. ★ 停止の真因 ―― アクタを kill() で叩き落としていた
 
-## 3. 残っている差（ここを潰す）
+決定的な証拠: g1 の出力に**前のプログラムのアクタの行が混ざった**
+（`hello, AIPL / tick 1 / tick 2` のあとに `0 / tick 1 / 0`）。
+アクタが載せ替えを生き延び、新しい `dispatch` で走っていた。
 
-`/compile` は通り `/cc` は止まる。差はごく小さい:
+固まり方（**ping ごと消える**＝割り込みが止まる形）は、
+**`irq_save` 区間の最中のアクタを kill した**症状と一致する。アクタは
+`vheap_alloc` / `ap_post` の割り込み禁止区間や `aipl_lock` の中に居ることがある。
 
-1. `/cc` は先に `abcl2c()` を呼ぶ（`static char xlat[32768]` に出す）
-2. `/cc` は `cc_web_reset()` と `cc_future_reset()` を呼ぶ
-3. 入力が `xlat[]`（静的）か `src[]`（静的）か
-4. `/cc` のハンドラは `static char csrc[8192]` にも本文を写している
+**Pi 3 の VM でも同じ穴を踏んでいる**（`apps/abcl_program.c` の `abcl_vm_kill_prev`）。
+あちらも kill をやめて解決した。**この系統では kill が常に危ない。**
 
-**`/cc?stage=xlat` は板を落とさない**ので、翻訳と実行を分けて測れる。
-次はこの 4 点を一つずつ消して、どれが効いているかを見る。
-（例: `/compile` に投げる前に `/cc?stage=xlat` を挟んでから同じ C を `/compile` へ、など）
+直したもの（`6708b55e…`、未焼き）:
+- `ap_recv` が `g_dead` を見ていなかった ―― 待っているアクタは起こしても待ちに
+  戻るだけで永久に抜けず、だから `ap_killall` は kill に頼るしかなかった
+- `ap_killall`/`ap_reset` を協調的に。印をつけて起こし 3 秒だけ譲り、
+  残ったものだけ kill。強制 kill の回数は `/api/aprun` に出る（0 なら健全）
 
-もう一つの切り口: **g1 は通り g2 は落ちる**。
-g1 は `send` があるので `cc_pump_now`（＝`ap_run`）を通る。
-g2 は `send` が無く `now` と `future` だけ。
+## 3. 潰した仮説（すべて実機のデータで否定）
 
-## 4. 直した穴（確か。同じ形が他にもあるかもしれない）
+| 仮説 | 判定 |
+|---|---|
+| `ap_run` の暴走 | ✗ 5 秒の番犬が発火しない |
+| `/cc` ハンドラ自体 | ✗ 同じ生成 C を素の C として投げると通る |
+| `abcl2c` の翻訳誤り | ✗ 10 本ホストとバイト一致 |
+| JIT→C→JIT の再入 | ✗ 自作 `dispatch` を `cc_future` 経由で呼んで 41 |
+| `ap_spawn` の枯渇 | ✗ `spawn_fails=0` |
+| アプリ・ワーカーのスタック 16 KB | ✗ 64 KB でも同じ |
+| メモリの断片化 | ✗ `/api/mem` で `blocks=2` のまま一定 |
+| 位置（何本目か） | ✗ g1 を 6 回続けても無事 |
 
-**`aipl_lock` は `proc_yield` で回るスピンロックで、限界を超えると錠を横取りする。**
-錠を握ったまま `ap_run()` を呼ぶと、アクタはハンドラの前に `aipl_lock()` を取るので
-回り続け、`ap_run` から見て永久に「待ちに落ちていない」。プリエンプションも
-切ってあるのでネットワークごと止まる。
-**横取りのせいで小さな例だけたまたま動く** —— これがいちばん質が悪い。
-`aipl_unlock_all()` / `aipl_relock()` で挟むこと（`actorproc.c` の `ap_recv` と同じ作法）。
+## 4. 入れた「観測できるようにする」手当て
 
-## 5. Pi 3 / Pi 5 との対照（移植の設計）
+これが無いと落ちるたびに電源を入れ直すしかなく、何も分からなかった。
+
+- **例外からの復帰**（`system/exception.c`）: `recover_spin` は「タイマが割り込んで
+  他プロセスが動く」前提だが、`/cc` 実行中は `g_actor_pump` が立っていて
+  `proc_preempt()` が何もしない。`proc_actor_pump_force_clear()` で落とす
+- **アプリ・ワーカーの立て直し**（`loader/main.c` の `app_watchdog`）: 単一枠が
+  `APP_IDLE` 以外で 25 秒続いたら枠を空にして代わりを立てる。HTTP が自力で戻る
+- **`ap_run` の壁時計打ち切り**（5 秒）と `/api/aprun`
+- **`/api/mem`**（空き・最大ブロック・断片数）、`/fault`（ESR/FAR/ELR）は元からある
+- **`/cc?stage=xlat`**: 翻訳結果だけ返す（板を落とさずに前段を検証できる）
+- アクタのスタックを静的な池（16 体）から配る ―― 毎回の getmem/freemem を無くす
+
+## 5. 移植の設計（三機の対照）
 
 - Pi 4 のアクタは **実プロセス**（`ap_spawn`/`ap_send`）。Pi 3 と同じで、Pi 5 だけが協調ポンプ
 - したがって `cc_pump_now` は Pi 4 では `ap_run()`（Pi 5 は `cc_pump()`）
-- Pi 4 は HTTP を専用のアプリ・ワーカーで処理し、AIPL/LLM 専用プロセスまで持つ
-  （`loader/main.c` の `net_proc_main` / `aipl_proc_main`）。**Pi 5 より器が良い**ので
-  `wait()` は自然に通るはず（まだ実機で確かめていない）
-- `cc/ccpriv.h` と `cc/codegen.c` は Pi 4 と Pi 5 で完全一致。`parse.c` は移植済み
-- Pi 4 固有の `cc_gfx_*` / `cc_win_*` / `cc_chat` / `cc_llm` は温存してある（消さないこと）
+  **★ 値ヒープの錠を握ったまま `ap_run()` を呼んではいけない**（`aipl_unlock_all`/`aipl_relock` で挟む）
+- Pi 4 は HTTP を専用アプリ・ワーカーで処理し、AIPL/LLM 専用プロセスも持つ。
+  そのおかげで `wait()` が自然に通る（Pi 5 は専用プロセスを立てる必要があった）
+- `cc/ccpriv.h` と `cc/codegen.c` は Pi 4 と Pi 5 で完全一致。`parse.c`・`abcl2c.c` は移植済み
+- **Pi 4 固有の `cc_gfx_*` / `cc_win_*` / `cc_chat` / `cc_llm` は温存してある（消さないこと）**
 
-## 6. 三機の到達点（2026-09-04）
+## 6. 次の一手
+
+1. `6708b55e…` を焼いて、10 本の**連続投入**が通ることを確かめる
+   （`/api/aprun` の「強制 kill」が 0 なら協調で畳めている）
+2. 回帰: `/compile` に素の C、`/actor/load`、`/llm`、`/chat`、`/smp-bench`
+3. `web_expose` した先へ `/api/x/echo?method=say&args=hi` が届くか
+   （Pi 4 の `/cc` は既定で `cc_run_source`。常駐は `?resident=1`）
+4. `ai_call` を Pi 4 で（`v_ai_call` は移植済み。モデルは元から焼いてある）
+5. 通ったらコミットを push し、ガイド第39章に Pi 4 の節を足す
+
+## 7. 三機の到達点
 
 | | Pi 3 | Pi 4 | Pi 5 |
 |---|---|---|---|
-| カーネル | `820388da…` | `100b85b0…`（未完成） | `fc71e715…` |
-| 正典ガイド | 9/10 一致 | g1 のみ確認 | **10/10 一致** |
-| 生の AIPL | Mac で `.avm` に | `POST /cc`（不安定） | `POST /cc` |
+| カーネル | `820388da…` | `431da890…`（`6708b55e…` 未焼き） | `fc71e715…` |
+| 正典ガイド | 9/10 一致（g9 は順序） | **10/10 一致**（連続投入は要確認） | **10/10 一致** |
+| 生の AIPL | Mac で `.avm` に | `POST /cc` | `POST /cc` |
 | 出力を読む | `/api/console` | 応答に出る | 応答に出る |
-| `b = true` | ○ | ○（未確認） | ○ |
+| `b = true` | ○ | ○ | ○ |
