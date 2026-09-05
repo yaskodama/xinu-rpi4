@@ -768,6 +768,124 @@ static long cc_pump_now(void)
     return v_int(0);
 }
 
+
+/* ===== 第3段: 返信先の一級性 と 資源の順序 ================================
+   Pi 5 の cc.c と同じ形。違うのは「相手が走るまで待つ」やり方だけで、
+   Pi 5 は cc_pump()、Pi 4 は ap_run()（アクタが実プロセスなので）。 */
+#define RSLOT_MAX 32
+static struct { unsigned char used, taken, filled; long val; } g_rslot[RSLOT_MAX];
+static int g_rcur = -1;
+static int g_rstack[16];
+static int g_rsp = 0;
+
+static int rslot_alloc(void)
+{
+    for (int i = 0; i < RSLOT_MAX; i++)
+        if (!g_rslot[i].used) {
+            g_rslot[i].used = 1; g_rslot[i].taken = 0;
+            g_rslot[i].filled = 0; g_rslot[i].val = v_int(0);
+            return i;
+        }
+    return -1;
+}
+static void rslot_free(int i) { if (i >= 0 && i < RSLOT_MAX) g_rslot[i].used = 0; }
+
+static long cc_replyto(void)
+{
+    if (g_rcur < 0) return v_int(-1);
+    g_rslot[g_rcur].taken = 1;
+    return v_int(g_rcur);
+}
+static long cc_answer(long r, long v)
+{
+    int i = (int)v_int_of(r);
+    if (i < 0 || i >= RSLOT_MAX || !g_rslot[i].used) {
+        emit_str("\ncc: answer: 返信先が無効です（すでに使われたか、期限切れです）\n");
+        return v_int(0);
+    }
+    if (g_rslot[i].filled) {
+        emit_str("\ncc: answer: 同じ返信先へ二度返しています\n");
+        return v_int(0);
+    }
+    g_rslot[i].filled = 1; g_rslot[i].val = v;
+    return v_int(0);
+}
+
+/* now の前後に挟む掛け金。生成コードは
+     cc_now_pop((cc_now_push(), dispatch(...)))
+   の形で呼ぶ。コンマ演算子は左から順に評価されると規格で決まっている。 */
+static long cc_now_push(void)
+{
+    int slot = rslot_alloc();
+    if (g_rsp < 16) g_rstack[g_rsp++] = g_rcur;
+    g_rcur = slot;
+    return v_int(0);
+}
+static long cc_now_pop(long r)
+{
+    int slot = g_rcur;
+    g_rcur = (g_rsp > 0) ? g_rstack[--g_rsp] : -1;
+    if (slot < 0) return r;
+    if (!g_rslot[slot].taken) { rslot_free(slot); return r; }  /* 従来どおり */
+    for (int i = 0; i < 64 && !g_rslot[slot].filled; i++) cc_pump_now();
+    if (g_rslot[slot].filled) r = g_rslot[slot].val;
+    else emit_str("\ncc: now: 返信先を渡した先が answer しませんでした\n");
+    rslot_free(slot);
+    return r;
+}
+
+/* acquire / release ── 対と取得順序の検査は正典の型検査器が担う。
+   ここが持つのは実行時の見張りだけ（取っていない資源の release と放し忘れ）。
+   ★ 限界: 待つ錠にはしていない。acquire と release の間で他のアクタへ
+     譲るのは wait/now を挟んだときだけで、そこで待たせると板を止めうる。 */
+#define RES_MAX 16
+static struct { char name[24]; int depth; } g_res[RES_MAX];
+static int g_res_n = 0;
+
+static int res_find(const char *nm)
+{
+    for (int i = 0; i < g_res_n; i++) {
+        int k = 0;
+        while (k < 23 && g_res[i].name[k] && g_res[i].name[k] == nm[k]) k++;
+        if (g_res[i].name[k] == nm[k]) return i;
+    }
+    if (g_res_n >= RES_MAX) return -1;
+    int i = g_res_n++;
+    int k = 0; while (nm[k] && k < 23) { g_res[i].name[k] = nm[k]; k++; }
+    g_res[i].name[k] = 0; g_res[i].depth = 0;
+    return i;
+}
+static long cc_acquire(long name)
+{
+    const char *nm = v_is_str(name) ? (const char *)name : "?";
+    int i = res_find(nm);
+    if (i < 0) return v_int(0);
+    g_res[i].depth++;
+    return v_int(0);
+}
+static long cc_release(long name)
+{
+    const char *nm = v_is_str(name) ? (const char *)name : "?";
+    int i = res_find(nm);
+    if (i < 0) return v_int(0);
+    if (g_res[i].depth <= 0) {
+        emit_str("\ncc: resource "); emit_str(g_res[i].name);
+        emit_str(" is released without being acquired\n");
+        return v_int(0);
+    }
+    g_res[i].depth--;
+    return v_int(0);
+}
+static void cc_res_report(void)
+{
+    for (int i = 0; i < g_res_n; i++)
+        if (g_res[i].depth > 0) {
+            emit_str("\ncc: resource "); emit_str(g_res[i].name);
+            emit_str(" is still held at the end of the run\n");
+        }
+    g_res_n = 0;
+}
+
 /* ai_call(prompt) — 機内の小型モデル（llm/llm.c）で続きを生成し、結果を
  * 文字列値として返す。外へは一切出ない。Pi 3・Pi 5 と同じモデル・同じ出力。 */
 static long v_ai_call(long prompt)
@@ -993,6 +1111,9 @@ unsigned long cc_resolve_extern(const char *name)
         { "cc_select",  (void *)&cc_select    },
         { "cc_pump_now",(void *)&cc_pump_now  },
         { "cc_is_ok",   (void *)&cc_is_ok     }, { "cc_value",  (void *)&cc_value  },
+        { "cc_now_push",(void *)&cc_now_push  }, { "cc_now_pop",(void *)&cc_now_pop },
+        { "cc_replyto", (void *)&cc_replyto   }, { "cc_answer", (void *)&cc_answer  },
+        { "cc_acquire", (void *)&cc_acquire   }, { "cc_release",(void *)&cc_release },
         { "v_err",      (void *)&v_err        },
         { "v_m_sqrt",  (void *)&v_m_sqrt  }, { "v_m_exp",   (void *)&v_m_exp   },
         { "v_m_log",   (void *)&v_m_log   }, { "v_m_log10", (void *)&v_m_log10 },
@@ -1159,6 +1280,7 @@ int cc_run_source(const char *src, int srclen, char *out, int outcap, long *retv
 
     long rv = 0;
     int rc = compile_run_core(src, (unsigned long)(srclen < 0 ? 0 : srclen), &rv);
+    cc_res_report();          /* 放し忘れた資源をこの実行の出力に出す */
 
     if (rc == 0 && g_aborted && g_cap) {
         const char *note = "cc: aborted (ran past the 100ms runaway-loop deadline)\n";
