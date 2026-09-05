@@ -973,7 +973,14 @@ static int compile_run_core(const char *src, unsigned long n, long *retval)
     ap_run();                   /* drive actor processes until quiescent */
     ap_killall();               /* one-shot: reap the actor processes */
     proc_actor_pump_leave();
+    /* ★ この run のコードを指しているポインタを全部落としてから kfree する。
+     * g_active_dispatch だけ 0 にして ap_set_dispatch と cc_set_apply を
+     * そのままにしていたので、actorproc の g_actor_dispatch と v_list_map の
+     * g_apply が**解放済みのコード**を指したまま残っていた。誰かが呼べば
+     * 野良ジャンプになる。 */
     g_active_dispatch = 0;
+    ap_set_dispatch(0);
+    cc_set_apply(0);
     if (retval) *retval = rc;
 
     kfree(code);

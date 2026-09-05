@@ -223,10 +223,13 @@ void mmu_init(void)
             unsigned long attr;
             if      (pa <  (unsigned long)_start) attr = normal_attr(0, 1); /* below kernel: RW NX */
             else if (pa <  etext)                 attr = normal_attr(1, 0); /* .text:   RO  X      */
-            /* .rodata stays WRITABLE for now.  Making it RO across the whole
-             * image (rather than only its first 2 MiB, as before) is a second,
-             * independent change; isolate the NX one first. */
-            else if (pa <  data)                  attr = normal_attr(0, 1); /* .rodata: RW  NX     */
+            /* ★ .rodata を読み取り専用にする（2026-09-05）。
+             * ここが RW だったせいで、**カーネルの .rodata へ野良書き込みが
+             * 黙って通っていた** ―― 実機で 0xDE038 の 1 バイトが 'i' から 'j' に
+             * 書き換わり、その先で cc: undefined variable になったり板が即死したりする。
+             * RO にすればデータ・アボートになり、例外処理が ESR/FAR/ELR を記録するので
+             * /fault で「どの命令が書いたか」が読める。犯人を捕まえるための変更。 */
+            else if (pa <  data)                  attr = normal_attr(1, 1); /* .rodata: RO  NX     */
             else if (pa <  heap_strt)             attr = normal_attr(0, 1); /* data/bss: RW NX     */
             else                                  attr = normal_attr(0, 0); /* heap:    RW  X      */
             l3_table[t][p] = pa | attr | D_PAGE;
