@@ -52,6 +52,17 @@ void net_responder_set_mac(const unsigned char mac[6])
  * peer on the broadcast domain can update its ARP cache.  Useful
  * when the router's WiFi-LAN bridge forwards broadcast in one
  * direction only (LAN → WiFi but not the reverse). */
+/* aipl_remote.c（AIPL の remote(...)）が自分の MAC/IP を要る。
+   Pi 5 側には元からあった二つを、こちらにも同じ名前で足す。 */
+void net_responder_get_mac(unsigned char out[6])
+{
+    for (int i = 0; i < 6; i++) out[i] = g_my_mac[i];
+}
+void net_responder_get_ip(unsigned char out[4])
+{
+    for (int i = 0; i < 4; i++) out[i] = g_my_ip[i];
+}
+
 void net_responder_send_gratuitous_arp(void)
 {
     uart_puts("garp: G1 enter\n");
