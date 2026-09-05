@@ -4,33 +4,57 @@
 
 ## 0. まずこれ
 
-焼いてあるのは **`d699b41b…`**。`/reboot`（HTTP）が効くので、板が生きている
-うちは電源の入れ直しなしで実験できる ―― 使い切る前に必ずこれを使うこと。
+**Pi 4 は最新 AIPL に対応し、正典ガイド 10/10 が連続投入でも安定した（2026-09-05）。**
+焼いてあるのは **`b24c8e0a…`**。`/reboot`（HTTP）が効くので、板が生きているうちは
+電源の入れ直し無しで実験できる ―― 使い切る前に必ずこれを使うこと。
 
-コミットは `dba9456` まで（**push していない**。実機で未確認のため）。
-移植前に戻すならカード上の `kernel8.img.bak-pre-aipl-f66854f0…`。
+健全性は `/cc?stage=xlat` の出力をホスト翻訳とバイト比較すれば分かる（板を落とさない）:
 
-## 1. 到達点 ―― 10 本すべて正典どおり動いた（2026-09-05）
+```
+cc -DABCL2C_HOST_TEST -w -o /tmp/a2c cc/abcl2c.c
+/tmp/a2c ~/aios/abclcp/docs/samples/guide/g1_hello.aipl > /tmp/host.c
+curl --data-binary @~/aios/abclcp/docs/samples/guide/g1_hello.aipl \
+     "http://192.168.3.100/cc?stage=xlat" > /tmp/board.c
+diff /tmp/host.c /tmp/board.c        # 差が出たら壊れている
+```
 
-生の AIPL をそのまま `POST /cc`（カーネル `431da890…`）:
+## 1. 到達点 ―― 10 本すべて正典どおり、連続投入でも安定
+
+生の AIPL をそのまま `POST /cc`:
 
 | | 出力 |
 |---|---|
 | g1 | `hello, AIPL / tick 1 / tick 2` |
 | g2 | `twice = 43 / awaited = 20 / v=7` |
 | g3 | `ok, left=7 / sold out` |
-| g4 | `waiting / got 1 / via select:1` ← **select が Pi 3 / Pi 5 と同じ** |
+| g4 | `waiting / got 1 / via select:1` ← select が Pi 3 / Pi 5 と同じ |
 | g5 | `/api/x/echo` の案内 |
 | g6 | `1 / 1 / n = 1` |
-| g7 | `fast = 42 / slow(timed out) = 0 / await = 10` ← **wait が効く** |
+| g7 | `fast = 42 / slow(timed out) = 0 / await = 10` ← wait が効く |
 | g8 | `literal true ok / literal false ok / b = true / not-eq: true` |
 | g9 | `got actor / after send / pong` |
 | g10 | `fork = 1 / latch = 2` |
+| g4b | `waiting / timed out`（select の timeout） |
 
-**前段は完成**: 10 本すべてで機内 `abcl2c` の翻訳がホストとバイト単位で一致
-（`/cc?stage=xlat`、`stkbad=0`）。
+通し終えても機内翻訳はホストとバイト一致、`ap_run` 打ち切り 0、強制 kill 0、
+ワーカー立て直し 0。回帰も全部通る（`/compile`、`/actor/load`、
+`ai_call` は Pi3・Pi5 と同じ参照出力 0.79 秒、`/smp-bench` 4 コア 3.00 倍）。
 
-## 2. ★ 停止の真因 ―― アクタを kill() で叩き落としていた
+## ★ 真因: 解放済みコードを指したままの関数ポインタ
+
+`compile_run_core` は run の終わりに `g_active_dispatch = 0` とするだけで、
+**`ap_set_dispatch()` と `cc_set_apply()` を落としていなかった**。
+`actorproc` の `g_actor_dispatch` と `v_list_map` の `g_apply` が
+`kfree` 済みのコードを指したまま残り、次の run の `kmalloc` がその領域を
+配り直すので、古いポインタ経由の書き込みが新しいアリーナに落ちていた。
+
+**症状が分かりにくかった理由**: 化けるのは 1 バイトだけで、しかも
+次の run の翻訳結果の**固定オフセット 785** ―― どのプログラムも先頭 22 行が
+同じなので「プログラム非依存」に見え、`.rodata` の破壊だと思い込んだ。
+落ちる場所によって「`cc: undefined variable`」にも「板の即死（ping も消える）」
+にもなるので、症状が毎回違って見えた。
+
+## 2. 途中で見つけて直した別の穴 ―― アクタを kill() で叩き落としていた
 
 決定的な証拠: g1 の出力に**前のプログラムのアクタの行が混ざった**
 （`hello, AIPL / tick 1 / tick 2` のあとに `0 / tick 1 / 0`）。
