@@ -75,13 +75,14 @@ static int peer_lookup(const unsigned char *ip, unsigned char *mac)
    remote が黙って失敗したとき、どこで落ちているのかを外から読むための数。
    「板が生きている」ことと「電文が通っている」ことは別なので、
    推測でコードを直す前にここを見る。GET /version が出す。 */
-static unsigned long g_n_tx_q, g_n_rx_q, g_n_rx_r, g_n_rx_match, g_n_timeout;
+static unsigned long g_n_tx_q, g_n_rx_q, g_n_rx_r, g_n_rx_match, g_n_timeout, g_n_retx;
 /* 突き合わせが外れたときに、何と何を比べたのかを残す。
    数だけでは「番号が違う」のか「待っていなかった」のかが分かれない。 */
 static long g_dbg_seen_id = -1, g_dbg_wait_at_seen = -2;
 void aipl_remote_stats(unsigned long *o)
 { o[0]=g_n_tx_q; o[1]=g_n_rx_q; o[2]=g_n_rx_r; o[3]=g_n_rx_match; o[4]=g_n_timeout;
-  o[5]=(unsigned long)g_dbg_seen_id; o[6]=(unsigned long)g_dbg_wait_at_seen; }
+  o[5]=(unsigned long)g_dbg_seen_id; o[6]=(unsigned long)g_dbg_wait_at_seen;
+  o[7]=g_n_retx; }
 
 /* ---- 待っている応答（同時に 1 本） --------------------------------------- */
 static volatile int  g_wait_id = -1;          /* 待っている reqid。-1 = 待っていない */
@@ -325,11 +326,20 @@ int aipl_remote_call(const char *hostport, const char *actor, const char *meth,
 
     if (timeout_ms <= 0) timeout_ms = 2000;
     t0 = timer_ticks();                                  /* 100 Hz */
-    while (!g_have) {
-        if ((long)((timer_ticks() - t0) * 10) >= timeout_ms) { g_wait_id = -1; g_n_timeout++; return -2; }
-        net_rx_pump();               /* ★ これが無いと応答を誰も拾わない */
-        proc_sleep_us(2000);         /* 譲る。塞がない */
-    }
+    /* ★ UDP の要求応答なのに再送していなかった。落ちた一発をそのまま待てば
+       必ず期限切れになる。200ms ごとに出し直す。相手は (送り主, reqid) の
+       控えを持つので、メソッドが二度走ることはない。 */
+    { unsigned long last_tx = t0;
+      while (!g_have) {
+          if ((long)((timer_ticks() - t0) * 10) >= timeout_ms) { g_wait_id = -1; g_n_timeout++; return -2; }
+          net_rx_pump();
+          if (timer_ticks() - last_tx >= 20) {          /* 20 刻み = 200ms */
+              send_udp(mac, ip, port, AIPL_PORT, q, n);
+              last_tx = timer_ticks();
+              g_n_retx++;
+          }
+          proc_sleep_us(2000);       /* 譲る。塞がない */
+      } }
     g_wait_id = -1;
     { int k = 0; while (g_reply[k] && k < outcap - 1) { out[k] = g_reply[k]; k++; } out[k] = 0; }
     return 0;

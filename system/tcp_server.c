@@ -1459,7 +1459,7 @@ static int http_build(const char *req, char *out, int max)
               ここを読んで、手元のビルドと突き合わせること。 */
         { extern const char *kernel_build_id(void);
           extern void aipl_remote_stats(unsigned long *o);
-          unsigned long st[7];
+          unsigned long st[8];
           bl = s_put(body, bl, "build ");
           bl = s_put(body, bl, kernel_build_id());
           bl = s_put(body, bl, "\n");
@@ -1471,6 +1471,7 @@ static int http_build(const char *req, char *out, int max)
           bl = s_put(body, bl, " timeout=");       bl = s_putdec(body, bl, (long)st[4]);
           bl = s_put(body, bl, " seen_id=");       bl = s_putdec(body, bl, (long)st[5]);
           bl = s_put(body, bl, " wait_at_seen=");  bl = s_putdec(body, bl, (long)st[6]);
+          bl = s_put(body, bl, " retx=");          bl = s_putdec(body, bl, (long)st[7]);
           bl = s_put(body, bl, "\n"); }
     } else if (starts_with(req, "GET /api/aprun")) {
         /* ap_run が打ち切られた記録。板が死ぬ代わりにここを読む。 */
