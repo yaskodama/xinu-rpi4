@@ -223,13 +223,17 @@ void mmu_init(void)
             unsigned long attr;
             if      (pa <  (unsigned long)_start) attr = normal_attr(0, 1); /* below kernel: RW NX */
             else if (pa <  etext)                 attr = normal_attr(1, 0); /* .text:   RO  X      */
-            /* ★ .rodata を読み取り専用にする（2026-09-05）。
-             * ここが RW だったせいで、**カーネルの .rodata へ野良書き込みが
-             * 黙って通っていた** ―― 実機で 0xDE038 の 1 バイトが 'i' から 'j' に
-             * 書き換わり、その先で cc: undefined variable になったり板が即死したりする。
-             * RO にすればデータ・アボートになり、例外処理が ESR/FAR/ELR を記録するので
-             * /fault で「どの命令が書いたか」が読める。犯人を捕まえるための変更。 */
-            else if (pa <  data)                  attr = normal_attr(1, 1); /* .rodata: RO  NX     */
+            /* .rodata は当面 RW のまま（元どおり）。
+             * ★ 2026-09-05: ここを RO にして実機で試した。結果:
+             *   - 0xDE038 の 1 バイトの化けは **RO にしても起きた** ―― つまりその
+             *     書き込みはこの写像を通っていない（別の写像か、MMU の効かない文脈。
+             *     副コア（smp.c）や、L3 で覆い切れていない領域が疑わしい。
+             *     mmu_init は kimg_blocks を KIMG_2MB で打ち切り、余りを
+             *     g_wx_uncovered に記録している ―― そこを確認すること）
+             *   - さらに、RO にすると通常動作でも板が落ちた ＝ **正規の書き込みが
+             *     .rodata に入っている**。RO 化は、その洗い出しとセットでないと成立しない
+             * どちらも次の一手の手掛かりなので、消さずに残す。 */
+            else if (pa <  data)                  attr = normal_attr(0, 1); /* .rodata: RW  NX     */
             else if (pa <  heap_strt)             attr = normal_attr(0, 1); /* data/bss: RW NX     */
             else                                  attr = normal_attr(0, 0); /* heap:    RW  X      */
             l3_table[t][p] = pa | attr | D_PAGE;
