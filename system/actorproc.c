@@ -131,6 +131,13 @@ int  ap_drop_oob(void)  { return g_ap_drop_oob; }
 int  ap_drop_dead(void) { return g_ap_drop_dead; }
 int  ap_drop_full(void) { return g_ap_drop_full; }
 
+/* 送り主。ap_post の引数を増やすと呼び出し側が全部変わるので、直前に置く形にした。
+   置いた側が使い終わったら戻す（入れ子の send があるため）。 */
+static long g_post_from = -1;
+static long g_ap_sender = -1;
+void ap_set_post_from(long f) { g_post_from = f; }
+long ap_sender(void)          { return g_ap_sender; }
+
 static void ap_post(long to, long method, long reply_to, long a0, long a1, long a2, long a3)
 {
     if (to < 0 || to >= g_nact) { g_ap_drop_oob++; return; }
@@ -151,6 +158,7 @@ static void ap_post(long to, long method, long reply_to, long a0, long a1, long 
     struct ap_msg *m = &g_act[to].q[g_act[to].tail];
     m->method = method; m->a0 = a0; m->a1 = a1; m->a2 = a2; m->a3 = a3;
     m->reply_to = reply_to;
+    m->from     = g_post_from;
     g_act[to].tail = nxt;
     if (g_act[to].waiting) { g_act[to].waiting = 0; proc_ready(g_act[to].pid); }
     irq_restore(d);
@@ -246,6 +254,10 @@ static void actor_proc_main(void)
             proc_exit();                    /* never returns */
         }
         g_cur_reply[self] = m.reply_to;     /* read in the crash path (m may be clobbered) */
+        /* このメッセージを処理しているあいだの sender と、ここから出す send の
+           送り主（＝自分）。ハンドラの中で入れ子に send するので両方要る。 */
+        g_ap_sender = m.from;
+        ap_set_post_from((long)self);
         /* Hold the vheap lock for the duration of the handler so a preemption
          * can't interleave another vheap user (it spin-yields to us).  The
          * net process never takes the lock, so it still preempts us freely. */

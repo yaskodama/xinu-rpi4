@@ -742,6 +742,22 @@ static long v_m_neg  (long a) { if (v_is_int(a)) return v_int(-v_int_of(a));
  * 観測はこの二つだけ。value(r, 既定) は失敗のとき既定を返す。 */
 static long cc_is_ok(long r)          { return v_bool(!v_is_err(r)); }
 static long cc_value(long r, long dflt) { return v_is_err(r) ? dflt : r; }
+/* sender — いま処理しているメッセージの送り主。アクタは実プロセスなので、
+   持っているのは actorproc.c 側（ap_run が配るときに控える）。 */
+static long cc_sender(void) { extern long ap_sender(void); return v_int(ap_sender()); }
+/* timed_out(r) — result の失敗かどうか。is_ok の裏返しだが、正典では
+   これも観測子として名前がある。 */
+static long cc_timed_out(long r) { return v_bool(v_is_err(r)); }
+/* typeof(x) — 実行時の型を文字列で返す。綴りは正典に合わせる。 */
+static long cc_typeof(long w)
+{
+    if (v_is_bool(w))  return v_str("bool");
+    if (v_is_err(w))   return v_str("unit");
+    if (v_is_float(w)) return v_str("float");
+    if (v_is_list(w))  return v_str("array");
+    if (v_is_str(w))   return v_str("string");
+    return v_str("int");
+}
 
 
 
@@ -1120,6 +1136,8 @@ unsigned long cc_resolve_extern(const char *name)
         { "cc_select",  (void *)&cc_select    },
         { "cc_pump_now",(void *)&cc_pump_now  },
         { "cc_is_ok",   (void *)&cc_is_ok     }, { "cc_value",  (void *)&cc_value  },
+        { "cc_timed_out", (void *)&cc_timed_out }, { "cc_typeof", (void *)&cc_typeof },
+        { "cc_sender",  (void *)&cc_sender   },
         { "cc_now_push",(void *)&cc_now_push  }, { "cc_now_pop",(void *)&cc_now_pop },
         { "cc_replyto", (void *)&cc_replyto   }, { "cc_answer", (void *)&cc_answer  },
         { "cc_acquire", (void *)&cc_acquire   }, { "cc_release",(void *)&cc_release },

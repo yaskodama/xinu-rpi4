@@ -3,7 +3,10 @@
 #ifndef XINU_RPI4_ACTORPROC_H
 #define XINU_RPI4_ACTORPROC_H
 
-struct ap_msg { long method, a0, a1, a2, a3, reply_to; };
+/* from は `sender` のため。reply_to とは別に持つ ―― reply_to は「now の
+   呼び出し元へ返す先」で、これを送り主の意味に流用すると、ふつうの send が
+   返信を投げ返してしまう。 */
+struct ap_msg { long method, a0, a1, a2, a3, reply_to, from; };
 
 /* Behaviour callback: invoked by each actor process for every received
  * message.  (The AIPL JIT `dispatch` has exactly this shape; its return
@@ -32,6 +35,8 @@ void ap_note_msg(int actor);         /* count a direct-dispatch message      */
 /* Selective receive used by AIPL `select`: block until a message whose
  * method is one of meths[0..n); returns the matched method, *out gets it. */
 long ap_select(long self, int n, const long *meths, struct ap_msg *out);
+long ap_sender(void);          /* いま処理しているメッセージの送り主 */
+void ap_set_post_from(long f); /* 次の ap_send が名乗る送り主 */
 
 /* let-it-crash: abandon the current actor's in-flight handler and return to
  * its receive loop (the process stays alive).  A synchronous `now` caller is
