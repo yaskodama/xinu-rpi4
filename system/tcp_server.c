@@ -1373,8 +1373,24 @@ static int http_build(const char *req, char *out, int max)
                 if (hd[0]=='/'&&hd[1]=='*') { hd+=2; while (*hd && !(hd[0]=='*'&&hd[1]=='/')) hd++; if(*hd) hd+=2; continue; }
                 break;
             }
-            if (hd[0]=='c'&&hd[1]=='l'&&hd[2]=='a'&&hd[3]=='s'&&hd[4]=='s'&&
-                (hd[5]==' '||hd[5]=='\t'||hd[5]=='\r'||hd[5]=='\n')) {
+            /* ★ AIPL かどうかは「最初の語」で見る。以前は "class" だけを見て
+               いたが、正典には `var x = ...;` や `send a.m();` で始まる
+               プログラムがふつうにあり、それらが C として解析されて
+               "cc: expected type" で落ちていた（AIPL の側は何も悪くない）。
+               C の側は型名か # で始まるので、この語の集合とは重ならない。 */
+            {
+                static const char *aipl_head[] = { "class","var","send","print",
+                                                   "spawn","web_listen","web_expose", 0 };
+                int is_aipl = 0;
+                for (int w = 0; aipl_head[w] && !is_aipl; w++) {
+                    int k = 0;
+                    while (aipl_head[w][k] && hd[k] == aipl_head[w][k]) k++;
+                    if (aipl_head[w][k] == 0) {
+                        char c = hd[k];
+                        if (c==' '||c=='\t'||c=='\r'||c=='\n'||c=='('||c=='!') is_aipl = 1;
+                    }
+                }
+                if (is_aipl) {
                 extern int         abcl2c(const char *, int, char *, int);
                 extern const char *abcl2c_error(void);
                 static char xlat[32768];
@@ -1385,6 +1401,7 @@ static int http_build(const char *req, char *out, int max)
                     bl = s_put(body, bl, "\n");
                     ok = 0;
                 } else { runsrc = xlat; runlen = xr; }
+                }
             }
             if (ok) {
                 extern void cc_web_reset(void);
