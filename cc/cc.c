@@ -1084,6 +1084,9 @@ static long cc_chat(long msg)            /* stateful: continues the KV-cache ses
    ap_run() などを要るのでそこに置いた。表より後ろになるので、名前だけ先に知らせる。 */
 static long cc_remote_send_v(long host, long actor, long meth, long arg);
 static long cc_remote_call_v(long host, long actor, long meth, long arg, long ms);
+static long cc_mesh_neighbors(void);
+static long cc_mesh_broadcast(long svc, long meth, long arg);
+static long cc_mesh_gather(long svc, long meth, long arg, long ms);
 
 unsigned long cc_resolve_extern(const char *name)
 {
@@ -1143,6 +1146,9 @@ unsigned long cc_resolve_extern(const char *name)
         { "cc_acquire", (void *)&cc_acquire   }, { "cc_release",(void *)&cc_release },
         { "cc_remote_send", (void *)&cc_remote_send_v },
         { "cc_remote_call", (void *)&cc_remote_call_v },
+        { "cc_mesh_neighbors",(void *)&cc_mesh_neighbors },
+        { "cc_mesh_broadcast",(void *)&cc_mesh_broadcast },
+        { "cc_mesh_gather",   (void *)&cc_mesh_gather    },
         { "v_err",      (void *)&v_err        },
         { "v_m_sqrt",  (void *)&v_m_sqrt  }, { "v_m_exp",   (void *)&v_m_exp   },
         { "v_m_log",   (void *)&v_m_log   }, { "v_m_log10", (void *)&v_m_log10 },
@@ -1597,6 +1603,62 @@ static long cc_remote_call_v(long host, long actor, long meth, long arg, long ms
                               v_int_of(ms), rb, (int)sizeof rb);
     if (rc != 0) return v_err();       /* 期限切れ・宛先不正 -> result の失敗 */
     return remote_parse(rb);
+}
+
+/* ===== メッシュの三つ =======================================================
+ * neighbors() : string[]                 いま返事をくれる相手の IP
+ * broadcast(役, メソッド, 引数) : unit    撒くだけ。返事は求めない
+ * gather(役, メソッド, 引数, ms) : int[]  期限までに届いた分だけ
+ *
+ * ★ gather の戻りが配列であること自体が仕様である。メッシュでは部分成功が
+ *   普通なので、「全員から返る」を前提にした型は嘘になる。届かなかった相手は
+ *   単に配列に入らない ―― 失敗の機構は増やしていない。 */
+extern int aipl_mesh_probe(char *out, int stride, int max, long ms);
+extern int aipl_mesh_bcast(const char *actor, const char *meth, const char *arg);
+extern int aipl_mesh_gather(const char *actor, const char *meth, const char *arg,
+                            long ms, char *out, int stride, int max);
+
+static long cc_mesh_neighbors(void)
+{
+    char ips[8][16];
+    int n = aipl_mesh_probe(&ips[0][0], 16, 8, 1000);
+    long out = v_list_new();
+    for (int i = 0; i < n; i++) {
+        /* 受信の作業場はこのあと上書きされる。値ヒープへ写してから指す。 */
+        int len = 0; while (ips[i][len]) len++;
+        char *r = vheap_alloc(len + 1);
+        if (!r) continue;
+        for (int k = 0; k <= len; k++) r[k] = ips[i][k];
+        out = v_list_push(out, v_str(r));
+    }
+    return out;
+}
+
+static long cc_mesh_broadcast(long svc, long meth, long arg)
+{
+    char ab[96];
+    const char *n = v_is_str(svc)  ? (const char *)svc  : "";
+    const char *m = v_is_str(meth) ? (const char *)meth : "";
+    aipl_mesh_bcast(n, m, remote_arg_text(arg, ab, sizeof ab));
+    return v_int(0);
+}
+
+static long cc_mesh_gather(long svc, long meth, long arg, long ms)
+{
+    char ab[96], vals[8][40];
+    const char *n = v_is_str(svc)  ? (const char *)svc  : "";
+    const char *m = v_is_str(meth) ? (const char *)meth : "";
+    int got = aipl_mesh_gather(n, m, remote_arg_text(arg, ab, sizeof ab),
+                               v_int_of(ms), &vals[0][0], 40, 8);
+    long out = v_list_new();
+    for (int i = 0; i < got; i++) {
+        long v = remote_parse(vals[i]);
+        /* そのアクタを持っていない板は err を返す。「届かなかった」と
+           「持っていなかった」を配列の上で区別しないのが gather の約束。 */
+        if (v_is_err(v)) continue;
+        out = v_list_push(out, v);
+    }
+    return out;
 }
 
 /* 受け側。Pi 4 は cc_actor_send_str と同じ作法で呼ぶ（アクターが実プロセス
