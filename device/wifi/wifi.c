@@ -2190,6 +2190,20 @@ void kernel_chainload(unsigned long stage, unsigned long len)
  * 10.0.0.<n>/24.  All nodes use a FIXED cell BSSID so they share one cell
  * immediately (deterministic for MANET).  After this the existing data
  * path (responder/ping/udp) works peer-to-peer with no AP/DHCP. */
+/* いまファームウェアが実際に居るセルの BSSID を聞く。
+   ★ 局所変数（wifi_have_ip / wifi_cur_ssid）は「代入したかどうか」しか表さない。
+     ad-hoc では IP を静的に置くだけで status が「接続済み」になってしまい、
+     無線が associate していなくても嘘をつく。実物を聞くこと。
+   戻り: 1=セルに居る（bss に BSSID）/ 0=居ない */
+int wifi_live_bssid(u8 *bss)
+{
+    int k, nz = 0;
+    if (!wifi_ready) return 0;
+    if (wifi_wlcmd(0, WLC_GET_BSSID, 0, 0, bss, 6) != 0) return 0;
+    for (k = 0; k < 6; k++) if (bss[k] && bss[k] != 0xFF) nz = 1;
+    return nz;
+}
+
 int wifi_adhoc(const char *ssid, int channel, int n)
 {
     static u8 jp[64];

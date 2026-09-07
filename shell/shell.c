@@ -815,7 +815,26 @@ static int cmd_wifi(int argc, char **argv)
     extern int  wifi_cfg_save_ap(const char *ssid, const char *pass);
     extern int  wifi_cfg_forget(const char *ssid);
     extern void wifi_cfg_list(void);
-    if (argc < 2) { uart_puts("usage: wifi on|aps|save <ssid> <pass>|forget <ssid>|scan|up <ssid> <pass>|off|...\n"); return 0; }
+    if (argc < 2) { uart_puts("usage: wifi on|aps|save <ssid> <pass>|forget <ssid>|scan|up <ssid> <pass>|off|status|...\n"); return 0; }
+    /* ★ status はファームウェアに「いまどのセルに居るか」を聞く。局所変数だけを
+       見ていると、ad-hoc で IP を代入しただけの状態を「接続済み」と表示して
+       しまう（Pi 3 で実際にそうなっていて、合流の切り分けを誤らせた）。 */
+    if (str_eq(argv[1], "status")) {
+        extern int wifi_live_bssid(unsigned char *);
+        unsigned char bss[6];
+        if (wifi_live_bssid(bss)) {
+            uart_puts("wifi: BSSID ");
+            for (int i = 0; i < 6; i++) {
+                const char *h = "0123456789abcdef";
+                if (i) uart_putc(':');
+                uart_putc(h[(bss[i] >> 4) & 15]); uart_putc(h[bss[i] & 15]);
+            }
+            uart_puts("  (firmware)\n");
+        } else {
+            uart_puts("wifi: BSSID none -- radio is in no cell\n");
+        }
+        return 0;
+    }
     if (str_eq(argv[1], "on"))         wifi_on();      /* join a saved AP (SD) */
     else if (str_eq(argv[1], "aps"))   wifi_cfg_list();
     else if (str_eq(argv[1], "save")) {                /* save AP to /microsd  */
