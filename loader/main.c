@@ -2232,3 +2232,23 @@ void kernel_main(void)
     /* Hand off to the bare-metal REPL (never returns). */
     shell_main();
 }
+
+
+/* ===== カーネル自己更新の板固有部（system/update.c が呼ぶ） ================ */
+const char *update_board_name(void) { return "pi4"; }
+int update_write_kernel(const unsigned char *img, unsigned int len, char *why, int cap)
+{
+    extern int fat32_mount(fat32_t *fs);
+    extern int fat32_write_file_full(fat32_t *fs, const char *name, const void *data, unsigned int len);
+    static fat32_t fs;                       /* 起動した microSD（EMMC2）の FAT32 を改めて開く */
+    const char *m = 0;
+    if (fat32_mount(&fs) != 0) m = "microSD: fat32_mount failed";
+    else if (fat32_write_file_full(&fs, "kernel8.img", img, len) != 0) m = "FAT32 write failed";
+    if (m) { int i = 0; while (m[i] && i < cap - 1) { why[i] = m[i]; i++; } why[i] = 0; return -1; }
+    return 0;
+}
+void update_reboot(void)
+{
+    extern void pm_reset(void);              /* BCM2711 の watchdog で全体をリセット */
+    pm_reset();
+}

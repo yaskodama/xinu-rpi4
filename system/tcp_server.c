@@ -1307,6 +1307,21 @@ static int http_build(const char *req, char *out, int max)
      *   GET /browse?url=U        U を開く（保留 → wm の巡回で取得。応答は "queued"）
      *   GET /browse?lang=ja|en   表示言語を切り替える（控えから組み直すだけ）
      *   GET /browse?raw=1        受信した HTML そのまま */
+    if (starts_with(req, "GET /update")) {
+        /* カーネル自己更新: ?check=1 で GitHub の最新と比べる、?install=1 で取って書いて再起動。
+           保留にして wm の巡回で行う。応答は今の状態。 */
+        extern void browser_request_url(const char *);
+        extern const char *update_state(void); extern int update_result(void);
+        extern const char *kernel_build_id(void);
+        if (q_int(req, "check", 0) == 1) browser_request_url("xinu://update?check=1");
+        else if (q_int(req, "install", 0) == 1) browser_request_url("xinu://update?install=1");
+        int p = 0;
+        p = s_put(out, p, "HTTP/1.0 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
+        p = s_put(out, p, "running= "); p = s_put(out, p, kernel_build_id());
+        p = s_put(out, p, "\nresult= "); p = s_putdec(out, p, update_result());
+        p = s_put(out, p, "  state= "); p = s_put(out, p, update_state()); p = s_put(out, p, "\n");
+        return p;
+    }
     if (starts_with(req, "GET /browse")) {
         extern const char *browser_url(void), *browser_text(void), *browser_note(void), *browser_raw(void);
         extern int  browser_text_len(void), browser_status(void), browser_raw_len(void);

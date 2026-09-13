@@ -442,11 +442,17 @@ static void menu_action_makina(void)
     extern void avm_run_makina(void);        /* open + run SOLID.AVM off USB /sd */
     avm_run_makina();
 }
+static void menu_action_update(void)
+{
+    extern void browser_request_url(const char *);   /* wm の巡回で GitHub の最新と比べ、窓に結果を出す */
+    browser_request_url("xinu://update?check=1");
+}
 static const struct { const char *label; void (*action)(void); } wm_menu_items[] = {
     { "New Shell window", menu_action_shell },
     { "New BASIC window", menu_action_basic },
     { "Run AIPL actor",   menu_action_aipl  },
     { "MAKINA",           menu_action_makina },
+    { "Check update",     menu_action_update },
 };
 #define WM_MENU_N ((int)(sizeof(wm_menu_items) / sizeof(wm_menu_items[0])))
 
