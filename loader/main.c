@@ -2236,14 +2236,30 @@ void kernel_main(void)
 
 /* ===== カーネル自己更新の板固有部（system/update.c が呼ぶ） ================ */
 const char *update_board_name(void) { return "pi4"; }
+/* 書いたものを読み戻して照合する。板を起動不能にしないための最後の砦。 */
+static unsigned char upd_verify_buf[3u * 1024u * 1024u];
+static int upd_write_verified(fat32_t *fs, const char *name, const unsigned char *img, unsigned int len)
+{
+    extern int fat32_write_file_full(fat32_t *fs, const char *name, const void *data, unsigned int len);
+    extern int fat32_read_file_full(fat32_t *fs, const char *name, void *out, unsigned int max);
+    if (fat32_write_file_full(fs, name, img, len) != 0) return -1;
+    int n = fat32_read_file_full(fs, name, upd_verify_buf, sizeof upd_verify_buf);
+    if (n != (int)len) return -2;
+    for (unsigned int i = 0; i < len; i++) if (upd_verify_buf[i] != img[i]) return -3;
+    return 0;
+}
 int update_write_kernel(const unsigned char *img, unsigned int len, char *why, int cap)
 {
     extern int fat32_mount(fat32_t *fs);
-    extern int fat32_write_file_full(fat32_t *fs, const char *name, const void *data, unsigned int len);
     static fat32_t fs;                       /* 起動した microSD（EMMC2）の FAT32 を改めて開く */
-    const char *m = 0;
+    const char *m = 0; int r;
     if (fat32_mount(&fs) != 0) m = "microSD: fat32_mount failed";
-    else if (fat32_write_file_full(&fs, "kernel8.img", img, len) != 0) m = "FAT32 write failed";
+    /* 二段構え: まず kernel8.new に書いて読み戻し（書き込み経路が今この板で通ることを確かめる）、
+       通ったら kernel8.img を書いて、これも読み戻す。どこかで違えば再起動しない。 */
+    else if ((r = upd_write_verified(&fs, "kernel8.new", img, len)) != 0)
+        m = r == -1 ? "stage 1: FAT32 write failed" : (r == -2 ? "stage 1: read-back length differs" : "stage 1: read-back mismatch");
+    else if ((r = upd_write_verified(&fs, "kernel8.img", img, len)) != 0)
+        m = r == -1 ? "stage 2: FAT32 write failed (kernel8.new is intact)" : (r == -2 ? "stage 2: read-back length differs (do not power off)" : "stage 2: read-back mismatch (do not power off)");
     if (m) { int i = 0; while (m[i] && i < cap - 1) { why[i] = m[i]; i++; } why[i] = 0; return -1; }
     return 0;
 }

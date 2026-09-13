@@ -51,6 +51,7 @@
 #define CMD_SET_BLOCKLEN   0x10020000   /* CMD16, R1                        */
 #define CMD_READ_SINGLE    0x113A0010   /* CMD17, R1 + data card->host      */
 #define CMD_WRITE_SINGLE   0x183A0000   /* CMD24, R1 + data host->card      */
+#define CMD_SEND_STATUS    0x0D020000   /* CMD13, R1: card status（bit8 READY_FOR_DATA） */
 #define INT_WRITE_RDY      0x00000010   /* buffer write-ready (bit 4)       */
 
 #define POLL_LIMIT         3000000UL
@@ -129,6 +130,7 @@ static int sd_cmd(unsigned int cmdtm, unsigned int arg)
     return wait_int(INT_CMD_DONE);
 }
 
+static unsigned int g_rca;               /* CMD13 で書き込み後の busy を待つのに要る */
 int sd_init(void)
 {
     unsigned long t;
@@ -185,7 +187,7 @@ int sd_init(void)
 
         if (sd_cmd(CMD_ALL_SEND_CID, 0) != 0)  { sd_dbg_step = 80;  continue; }  /* CMD2 */
         if (sd_cmd(CMD_SEND_REL_ADDR, 0) != 0) { sd_dbg_step = 90;  continue; }  /* CMD3 */
-        rca = EMMC_RESP0 & 0xFFFF0000u;
+        rca = EMMC_RESP0 & 0xFFFF0000u; g_rca = rca;
         if (sd_cmd(CMD_SELECT_CARD, rca) != 0) { sd_dbg_step = 100; continue; }  /* CMD7 */
         if (sd_cmd(CMD_SET_BLOCKLEN, SD_BLOCK_SIZE) != 0) { sd_dbg_step = 110; continue; } /* CMD16 */
 
@@ -248,7 +250,15 @@ int sd_write_block(unsigned long lba, const void *buf)
     if (wait_int(INT_WRITE_RDY) != 0) return -1;
     for (int i = 0; i < SD_BLOCK_SIZE / 4; i++) EMMC_DATA = p[i];
     if (wait_int(INT_DATA_DONE) != 0) return -1;
-    return 0;
+    /* ★ カードが書き終わる（programming 状態を抜ける）まで待つ。待たずに次の読み書きを
+       出すと、同じ扇区の読み戻しが古い中身を返し、FAT の読み-変更-書きで前の更新が消える。
+       自己更新で kernel8.img を書いたとき、FAT の連鎖が途切れて板が起動しなくなった真因（の候補）。
+       CMD13 の READY_FOR_DATA（bit 8）が立つまで。 */
+    for (unsigned long t = 0; t < POLL_LIMIT; t++) {
+        if (sd_cmd(CMD_SEND_STATUS, g_rca) != 0) return -1;
+        if (EMMC_RESP0 & 0x100u) return 0;
+    }
+    return -1;
 }
 
 #else /* !SD_BASE — QEMU: no controller we can talk to */
