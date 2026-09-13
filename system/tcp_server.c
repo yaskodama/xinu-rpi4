@@ -1110,6 +1110,35 @@ static void jit_measure(void)
     proc_exit();
 }
 
+/* ---- 先取り(preemption)下での文脈切替が壊れていないかの検出器 ----
+ * 同じ決定的な計算を複数プロセスで同時に回す。先取りで切り替わるたびに
+ * ELR_EL1/SPSR_EL1 が正しく退避・復帰されていなければ、どれかの答えが狂うか
+ * 板が落ちる。ここで使う計算は積・和・剰余だけで、メモリを持たない
+ * （＝答えが狂ったら原因は文脈切替以外にない）。 */
+#define PT_MAXP 8
+static volatile long pt_res[PT_MAXP];
+static volatile int  pt_pid[PT_MAXP];
+static volatile int  pt_done, pt_np;
+static volatile long pt_n;
+
+static long pt_kernel(long n)
+{
+    long acc = 0;
+    for (long i = 0; i < n; i++) acc = (acc + i * 7 + 3) % 1000003L;
+    return acc;
+}
+
+static void pt_task(void)
+{
+    extern int currpid;
+    int me = -1;
+    for (int k = 0; k < pt_np; k++) if (pt_pid[k] == currpid) { me = k; break; }
+    long acc = pt_kernel(pt_n);
+    if (me >= 0) pt_res[me] = acc;
+    pt_done++;
+    proc_exit();
+}
+
 static void jit_run(unsigned long period_ms, unsigned long samples,
                     int with_hog, unsigned long chunk_us)
 {
@@ -1265,6 +1294,40 @@ static int http_build(const char *req, char *out, int max)
      *                              pixel stream starting at byte offset N
      * Default thumbnail width 160 (height tracks the 4:3 source).  A browser
      * page (served from the Mac) loops off=0,1200,... to rebuild each frame. */
+    /* ---- /browse : 機内ブラウザ（xinu-rpi5 から移植） -------------------------
+     *   GET /browse              直近の本文（整形済みの文字）と net= の計器
+     *   GET /browse?url=U        U を開く（保留 → wm の巡回で取得。応答は "queued"）
+     *   GET /browse?lang=ja|en   表示言語を切り替える（控えから組み直すだけ）
+     *   GET /browse?raw=1        受信した HTML そのまま */
+    if (starts_with(req, "GET /browse")) {
+        extern const char *browser_url(void), *browser_text(void), *browser_note(void), *browser_raw(void);
+        extern int  browser_text_len(void), browser_status(void), browser_raw_len(void);
+        extern int  browser_netinfo(char *, int);
+        extern void browser_request_url(const char *);
+        extern void browser_set_lang(int);
+        static char urlbuf[256], enc[256];
+        if (q_param(req, "url", enc, sizeof enc)) { url_decode(enc, urlbuf, sizeof urlbuf); browser_request_url(urlbuf); }
+        { char lb[8]; if (q_param(req, "lang", lb, sizeof lb)) browser_set_lang(lb[0] == 'j' || lb[0] == 'J'); }
+        int raw = q_int(req, "raw", 0);
+        int p = 0;
+        p = s_put(out, p, "HTTP/1.0 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                          "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
+        p = s_put(out, p, "url= ");      p = s_put(out, p, browser_url());
+        p = s_put(out, p, "\nstatus= "); p = s_putdec(out, p, browser_status());
+        p = s_put(out, p, "  note= ");   p = s_put(out, p, browser_note());
+        p = s_put(out, p, "\nbytes= ");  p = s_putdec(out, p, browser_raw_len());
+        p = s_put(out, p, "  text= ");   p = s_putdec(out, p, browser_text_len());
+        { char nb[320]; browser_netinfo(nb, sizeof nb); p = s_put(out, p, "\nnet= "); p = s_put(out, p, nb); }
+        p = s_put(out, p, "\n----\n");
+        { const char *b = raw ? browser_raw() : browser_text();
+          int n = raw ? browser_raw_len() : browser_text_len();
+          int cap = max - p - 8;
+          if (n > cap) n = cap;
+          for (int i = 0; i < n; i++) out[p++] = b[i]; }
+        p = s_put(out, p, "\n");
+        return p;
+    }
+
     if (starts_with(req, "GET /fb")) {
         /* Self-contained: build the WHOLE response into `out` and return here,
          * so it never touches the shared header/404 tail (which was corrupting
@@ -1797,6 +1860,95 @@ static int http_build(const char *req, char *out, int max)
         bl = s_putdec(body, bl, usN ? (long)((us1 * 100UL) / usN) : 0);
         bl = s_put(body, bl, "\n");
         bl = s_put(body, bl, "agree = "); bl = s_put(body, bl, (r1 == rN) ? "yes\n" : "NO\n");
+    } else if (starts_with(req, "GET /avm-run")) {
+        /* 指定ミリ秒のあいだ AIPL の VM を回す。HDMI 無しの板では他に駆動源が無い。 */
+        ctype = "text/plain";
+        extern long avm_pump(long ms);
+        int ms = q_int(req, "ms", 1000);
+        long ticks = avm_pump(ms);
+        bl = s_put(body, bl, "avm-run ms="); bl = s_putdec(body, bl, (long)ms);
+        bl = s_put(body, bl, " ticks=");     bl = s_putdec(body, bl, ticks);
+        { extern long avm_get_pump_rounds(void);
+          bl = s_put(body, bl, " rounds="); bl = s_putdec(body, bl, avm_get_pump_rounds()); }
+        bl = s_put(body, bl, "\n");
+    } else if (starts_with(req, "GET /avm-par")) {
+        /* AIPL のアクター並列（多コア配布）を実行時に入切し、計器を読む。
+         *   /avm-par            -> 状態と計器
+         *   /avm-par?on=1|0     -> 並列配布の入切
+         *   /avm-par?reset=1    -> 計器を 0 に戻す
+         * us/msgs が「1 メッセージあたりの配布コスト」。方式の比較はここで決まる。
+         * core_hits はコア別に実行したメッセージ数＝4 コアが本当に働いた証拠。 */
+        ctype = "text/plain";
+        extern void avm_set_par(int on), avm_par_reset_stats(void);
+        extern int  avm_get_par(void), avm_get_par_nbatch(void), avm_get_par_lastbn(void);
+        extern long avm_get_par_us(void), avm_get_par_msgs(void), avm_get_core_hits(int);
+        extern int  smp_cores_online(void);
+        int on = q_int(req, "on", -1);          /* 無ければ -1 -> 触らない */
+        if (on >= 0) avm_set_par(on);
+        if (q_int(req, "reset", 0) == 1) avm_par_reset_stats();
+        long us = avm_get_par_us(), ms = avm_get_par_msgs();
+        bl = s_put(body, bl, "avm-par enable="); bl = s_putdec(body, bl, (long)avm_get_par());
+        bl = s_put(body, bl, " cores_online="); bl = s_putdec(body, bl, (long)smp_cores_online());
+        bl = s_put(body, bl, " nbatch=");   bl = s_putdec(body, bl, (long)avm_get_par_nbatch());
+        bl = s_put(body, bl, " lastbn=");   bl = s_putdec(body, bl, (long)avm_get_par_lastbn());
+        bl = s_put(body, bl, " us=");       bl = s_putdec(body, bl, us);
+        bl = s_put(body, bl, " msgs=");     bl = s_putdec(body, bl, ms);
+        bl = s_put(body, bl, " us_per_msg_x100=");
+        bl = s_putdec(body, bl, ms ? (us * 100) / ms : 0);
+        bl = s_put(body, bl, " core_hits=");
+        for (int c = 0; c < 4; c++) { if (c) bl = s_put(body, bl, "/");
+            bl = s_putdec(body, bl, avm_get_core_hits(c)); }
+        /* 検算: 標本は合計を照合し、正なら色2・誤なら色4 の線を引く。
+           ok>0 かつ ng=0 でなければ、その測定値は信用してはいけない。 */
+        { extern long avm_get_line_ok(void), avm_get_line_ng(void);
+          bl = s_put(body, bl, " ok="); bl = s_putdec(body, bl, avm_get_line_ok());
+          bl = s_put(body, bl, " ng="); bl = s_putdec(body, bl, avm_get_line_ng()); }
+        bl = s_put(body, bl, " path=workers\n");
+    } else if (starts_with(req, "GET /elrfix")) {
+        /* 例外復帰時の ELR/SPSR 書き戻しを on/off する。板を落とし得るので明示操作。 */
+        extern volatile unsigned int elr_restore_on;
+        int on = q_int(req, "on", -1);          /* has_query は無いので番兵で判定 */
+        if (on >= 0) elr_restore_on = on ? 1u : 0u;
+        bl = s_put(body, bl, "elr_restore_on = ");
+        bl = s_putdec(body, bl, (long)elr_restore_on);
+        bl = s_put(body, bl, (elr_restore_on ? "  (修正あり)\n" : "  (修正なし=旧挙動)\n"));
+    } else if (starts_with(req, "GET /preempttest")) {
+        /* 割り込み区間での文脈切替が壊れていないかを **数** で見る計器。
+         * ELR_EL1/SPSR_EL1 を退避しないと、先取りで切り替えられたプロセスは
+         * 他人の PC へ eret して戻る。答えの決まった計算を複数プロセスで
+         * 同時に回し、単独で回した基準値と突き合わせる。 */
+        extern volatile unsigned int elr_restore_on;
+        int np = q_int(req, "procs", 4);
+        if (np < 1) np = 1;
+        if (np > PT_MAXP) np = PT_MAXP;
+        pt_n = q_int(req, "n", 200000);
+        if (pt_n < 1) pt_n = 1;
+
+        long want = pt_kernel(pt_n);          /* 基準値: 誰にも邪魔されずに計算 */
+        pt_np = np; pt_done = 0;
+        for (int k = 0; k < np; k++) { pt_res[k] = -1; pt_pid[k] = -1; }
+        int made = 0;
+        for (int k = 0; k < np; k++) {
+            int pid = proc_create(pt_task, 16384, "pttask");
+            if (pid <= 0) break;
+            pt_pid[k] = pid; made++;
+        }
+        pt_np = made;
+        for (int k = 0; k < made; k++) proc_ready(pt_pid[k]);
+        unsigned long dl = now_us() + 60000000UL;
+        while (pt_done < made && now_us() < dl) proc_yield();
+
+        int bad = 0;
+        for (int k = 0; k < made; k++) if (pt_res[k] != want) bad++;
+        bl = s_put(body, bl, "preempttest procs="); bl = s_putdec(body, bl, (long)made);
+        bl = s_put(body, bl, " n="); bl = s_putdec(body, bl, pt_n);
+        bl = s_put(body, bl, " elr_restore_on="); bl = s_putdec(body, bl, (long)elr_restore_on);
+        bl = s_put(body, bl, "\nexpect = "); bl = s_putdec(body, bl, want);
+        bl = s_put(body, bl, "\ngot    =");
+        for (int k = 0; k < made; k++) { bl = s_put(body, bl, " "); bl = s_putdec(body, bl, pt_res[k]); }
+        bl = s_put(body, bl, "\nfinished = "); bl = s_putdec(body, bl, (long)pt_done);
+        bl = s_put(body, bl, "\nmismatch = "); bl = s_putdec(body, bl, (long)bad);
+        bl = s_put(body, bl, bad ? "   *** 壊れている ***\n" : "   OK\n");
     } else if (starts_with(req, "GET /nqpart") || starts_with(req, "POST /nqpart")) {
         /* Distributed N-Queens partial: count solutions for first-queen columns
          * [c0,c1) at board size n, using all cores.  See rpi5 for the protocol.

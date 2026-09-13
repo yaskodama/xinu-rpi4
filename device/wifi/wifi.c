@@ -1254,6 +1254,9 @@ void wifi_off(void)
 /* Desktop WiFi indicator accessors (M10). */
 const char *wifi_ssid(void) { return wifi_cur_ssid; }
 void wifi_ipaddr(u8 *o) { int i; for (i = 0; i < 4; i++) o[i] = wifi_ip[i]; }
+void wifi_netmask(u8 *o) { int i; for (i = 0; i < 4; i++) o[i] = wifi_mask[i]; }
+void wifi_macaddr(u8 *o) { int i; for (i = 0; i < 6; i++) o[i] = wifi_mac[i]; }
+int  wifi_eth_tx(const unsigned char *eth, int len) { return wifi_data_tx(eth, len); }
 static int dhcp_build(u8 *out, const u8 *mac, u32 xid, const u8 *reqip, const u8 *srvid)
 {
     u8 *e = out, *ip, *udp, *bootp, *opt; int dhcplen, udplen, iplen, i;
@@ -1386,6 +1389,14 @@ static int aodv_ip_in(u8 *e, int elen);
 static u8   g_mn_node = 0;              /* self id = 10.0.0.<n> の n */
 static u8   g_mn_peers[MN_MAXNBR];      /* distinct src nodes heard from */
 static int  g_mn_peersn = 0;
+/* 近隣表の読み出し（機内ブラウザの xinu://mesh が一覧にする）。戻り値は件数。 */
+int wifi_mesh_peers(unsigned char *out, int cap)
+{
+    int n = g_mn_peersn < cap ? g_mn_peersn : cap;
+    for (int i = 0; i < n; i++) out[i] = g_mn_peers[i];
+    return n;
+}
+int wifi_mesh_self(void) { return g_mn_node ? g_mn_node : wifi_ip[3]; }
 static u32  g_mn_hello_tx = 0, g_mn_hello_last = 0, g_mn_rx = 0;
 static u16  g_mn_seq = 0;
 
@@ -1458,6 +1469,10 @@ static void wifi_handle_frame(u8 *fr, int len, int doff)
     int elen = len - (doff + bdc), et, i;
     if (elen < 14) return;
     et = (e[12] << 8) | e[13];
+    /* 機内ブラウザがメッシュ上の板のページを取りに行くときの応答（ARP 応答・
+       自分の一時ポート宛の TCP）。ARP は学習だけして 0 を返すので下の応答器にも渡る。 */
+    { extern int browser_handle(const unsigned char *frame, int len);
+      if (browser_handle(e, elen)) return; }
     if (et == 0x0806 && elen >= 42) {                /* ARP */
         u8 *a = e + 14;
         int op = (a[6] << 8) | a[7];

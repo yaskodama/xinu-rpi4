@@ -149,6 +149,10 @@ static void genet_rx_tick(void)
          * IMPORTANT: keep this loop free of per-packet uart_puts() —
          * the framebuffer console is slow and printing here is what
          * historically let the ring back up to overflow. */
+        /* 機内ブラウザの待ち（ARP 応答・DNS 応答・自分の一時ポート宛の TCP）を先に。
+           browser_handle は ARP を消費せず 0 を返すので応答器にも渡る。 */
+        { extern int browser_handle(const unsigned char *frame, int len);
+          if (browser_handle(pkt, len)) { genet_rx_release(); continue; } }
         if (!dhcp_handle_packet(pkt, len) &&
             !tcp_handle_packet(pkt, len) &&
             !aipl_remote_handle(pkt, len)) {     /* AIPL remote(...) = UDP/9010 */
@@ -367,6 +371,9 @@ static void net_yield_tick(void)
      * bring-up blocks this wm tick ~1 min, but net/app keep serving the
      * Ethernet gateway + /fb mirror, and the HTTP reply already flushed. */
     { extern void wifi_adhoc_poll_pending(void); wifi_adhoc_poll_pending(); }
+    /* 機内ブラウザ: 起動 10 秒後に airilab.app を取り、60 秒ごとに更新、クリックで辿る。
+       取得中は proc_yield() で net プロセスに譲りながら待つ（この tick は数秒止まる）。 */
+    { extern void browser_poll_pending(void); browser_poll_pending(); }
     /* TCP retransmit timer.  The net process only wakes on an RX interrupt,
      * so if the peer goes silent — exactly the case where a lost segment
      * needs retransmitting — its tick would never run.  Kick it from here
@@ -2178,6 +2185,29 @@ void kernel_main(void)
         runtime_win.content_bg   = 0xFF14100AU;
         runtime_win.draw_content = win_runtime;
         wm_add(&runtime_win);
+
+        /* 機内ブラウザの窓（xinu-rpi5 から移植）。airilab.app を起動時に出す。
+         * 画面 1024x768 の右上寄り。クリック: リンク／[EN]／上半分=戻る・下半分=進む。 */
+        {
+            extern void browser_draw_window(void *self, unsigned int frame);
+            extern void browser_click(void *self, int lx, int ly);
+            static window_t browser_win;
+            browser_win.x = 300;
+            browser_win.y = 30;
+            browser_win.width  = 700;
+            browser_win.height = 600;
+            const char *bt = "Browser (airilab.app)";
+            int i = 0;
+            for (; i < WM_TITLE_MAX && bt[i]; i++) browser_win.title[i] = bt[i];
+            browser_win.title[i] = 0;
+            browser_win.chrome_color = 0xFF60FFC0U;
+            browser_win.title_bg     = 0xFF105040U;
+            browser_win.title_fg     = 0xFFFFFFFFU;
+            browser_win.content_bg   = 0xFF0A0E14U;
+            browser_win.draw_content = (void (*)(window_t *, unsigned int))browser_draw_window;
+            browser_win.on_click     = (void (*)(window_t *, int, int))browser_click;
+            wm_add(&browser_win);
+        }
 
         /* The old draggable "WiFi" window is gone — wm_run() now paints a
          * persistent WiFi status badge (signal bars + SSID + IP when connected)
