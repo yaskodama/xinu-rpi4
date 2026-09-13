@@ -1518,6 +1518,11 @@ static void wifi_handle_frame(u8 *fr, int len, int doff)
                 wifi_data_tx(e, 14 + iptot);
                 wifi_log("[wifi] -> ICMP echo reply\r\n");
             }
+        } else if (ip[9] == 6 && wifi_ip_eq(ip + 16)) {
+            /* 無線の IP 宛の TCP（メッシュ上の板のブラウザからの接続）を HTTP サーバへ。
+               返事は tcp_server が「来た口」＝無線へ返す（via=1）。有線の制御面は動かさない。 */
+            extern int tcp_handle_packet_via(const unsigned char *, int, int);
+            tcp_handle_packet_via(e, elen, 1);
         }
     }
 }
