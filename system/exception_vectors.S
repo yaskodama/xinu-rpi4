@@ -99,7 +99,7 @@ exception_init:
 // ----------------------------------------------------------------
 .global irq_entry
 irq_entry:
-    sub     sp, sp, #(16 * 16 + 32 * 16)
+    sub     sp, sp, #(16 * 17 + 32 * 16)
     stp     x0,  x1,  [sp, #16 *  0]
     stp     x2,  x3,  [sp, #16 *  1]
     stp     x4,  x5,  [sp, #16 *  2]
@@ -135,6 +135,17 @@ irq_entry:
     stp     q28, q29, [sp, #16 * 16 + 32 * 14]
     stp     q30, q31, [sp, #16 * 16 + 32 * 15]
 
+    // ---- ELR_EL1 / SPSR_EL1 も退避する（この板に無かった穴）----
+    // irq_dispatch_c は proc_preempt() -> proc_resched() -> ctxsw() を呼び、
+    // **割り込み区間の中で別プロセスへ切り替わる**。その間に別のプロセスが
+    // 同じように割り込まれると ELR_EL1/SPSR_EL1 が上書きされ、元のプロセスは
+    // 他人の PC へ eret して戻る。FP を退避しているのと同じ理由で、これも要る。
+    // オフセット 768 は stp の即値範囲(±504)を超えるので、いったん x2 に載せる。
+    mrs     x0,  elr_el1
+    mrs     x1,  spsr_el1
+    add     x2,  sp,  #(16 * 16 + 32 * 16)
+    stp     x0,  x1,  [x2]
+
     bl      irq_dispatch_c
 
     ldp     q0,  q1,  [sp, #16 * 16 + 32 *  0]
@@ -154,6 +165,17 @@ irq_entry:
     ldp     q28, q29, [sp, #16 * 16 + 32 * 14]
     ldp     q30, q31, [sp, #16 * 16 + 32 * 15]
 
+    // ---- ELR_EL1 / SPSR_EL1 の復帰（elr_restore_on=0 で修正前の挙動に戻せる）----
+    // 同じ起動のまま A/B を取るための切り替え。既定は 1（＝直っている側）。
+    add     x2,  sp,  #(16 * 16 + 32 * 16)
+    ldp     x0,  x1,  [x2]
+    adrp    x3,  elr_restore_on
+    ldr     w3,  [x3, #:lo12:elr_restore_on]
+    cbz     w3,  1f
+    msr     elr_el1,  x0
+    msr     spsr_el1, x1
+1:
+
     ldp     x0,  x1,  [sp, #16 *  0]
     ldp     x2,  x3,  [sp, #16 *  1]
     ldp     x4,  x5,  [sp, #16 *  2]
@@ -170,7 +192,7 @@ irq_entry:
     ldp     x26, x27, [sp, #16 * 13]
     ldp     x28, x29, [sp, #16 * 14]
     ldr     x30,      [sp, #16 * 15]
-    add     sp, sp, #(16 * 16 + 32 * 16)
+    add     sp, sp, #(16 * 17 + 32 * 16)
     eret
 
 // ----------------------------------------------------------------
@@ -184,7 +206,7 @@ irq_entry:
 // ----------------------------------------------------------------
 .global sync_entry
 sync_entry:
-    sub     sp, sp, #(16 * 16 + 32 * 16)
+    sub     sp, sp, #(16 * 17 + 32 * 16)
     stp     x0,  x1,  [sp, #16 *  0]
     stp     x2,  x3,  [sp, #16 *  1]
     stp     x4,  x5,  [sp, #16 *  2]
@@ -218,6 +240,17 @@ sync_entry:
     stp     q28, q29, [sp, #16 * 16 + 32 * 14]
     stp     q30, q31, [sp, #16 * 16 + 32 * 15]
 
+    // ---- ELR_EL1 / SPSR_EL1 も退避する（この板に無かった穴）----
+    // irq_dispatch_c は proc_preempt() -> proc_resched() -> ctxsw() を呼び、
+    // **割り込み区間の中で別プロセスへ切り替わる**。その間に別のプロセスが
+    // 同じように割り込まれると ELR_EL1/SPSR_EL1 が上書きされ、元のプロセスは
+    // 他人の PC へ eret して戻る。FP を退避しているのと同じ理由で、これも要る。
+    // オフセット 768 は stp の即値範囲(±504)を超えるので、いったん x2 に載せる。
+    mrs     x0,  elr_el1
+    mrs     x1,  spsr_el1
+    add     x2,  sp,  #(16 * 16 + 32 * 16)
+    stp     x0,  x1,  [x2]
+
     bl      sync_dispatch_c
 
     ldp     q0,  q1,  [sp, #16 * 16 + 32 *  0]
@@ -236,6 +269,17 @@ sync_entry:
     ldp     q26, q27, [sp, #16 * 16 + 32 * 13]
     ldp     q28, q29, [sp, #16 * 16 + 32 * 14]
     ldp     q30, q31, [sp, #16 * 16 + 32 * 15]
+
+    // ---- ELR_EL1 / SPSR_EL1 の復帰（elr_restore_on=0 で修正前の挙動に戻せる）----
+    // 同じ起動のまま A/B を取るための切り替え。既定は 1（＝直っている側）。
+    add     x2,  sp,  #(16 * 16 + 32 * 16)
+    ldp     x0,  x1,  [x2]
+    adrp    x3,  elr_restore_on
+    ldr     w3,  [x3, #:lo12:elr_restore_on]
+    cbz     w3,  2f
+    msr     elr_el1,  x0
+    msr     spsr_el1, x1
+2:
     ldp     x0,  x1,  [sp, #16 *  0]
     ldp     x2,  x3,  [sp, #16 *  1]
     ldp     x4,  x5,  [sp, #16 *  2]
@@ -252,5 +296,5 @@ sync_entry:
     ldp     x26, x27, [sp, #16 * 13]
     ldp     x28, x29, [sp, #16 * 14]
     ldr     x30,      [sp, #16 * 15]
-    add     sp, sp, #(16 * 16 + 32 * 16)
+    add     sp, sp, #(16 * 17 + 32 * 16)
     eret

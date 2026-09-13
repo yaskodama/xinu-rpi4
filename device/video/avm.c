@@ -166,6 +166,98 @@ static void vm_enqueue(int self, int recv, const char *method, int na, long *a)
     vm_qt = nx;
 }
 
+/* ===== multi-core actor dispatch（Pi 5 から移植）==========================
+ * 別々のアクター宛で、描画も WAIT も含まないメッセージを 4 コアへ配る。
+ * 各コアは自分のアクターの領域(vm_obj[self].f[])と自前の値スタックしか触らない。
+ * メソッドが「生む」3 つだけが共有物なので、そこを分ける:
+ *   - send  -> コアごとの控え(par_q[core])。join 後に vm_q へ併合
+ *   - spawn -> オブジェクト表をコアごとに重ならない範囲へ分割
+ *   - draw  -> 除外。WAIT か描画命令を含むクラスは par_safe=0 として
+ *              従来どおり 1 コア経路を通る（表示物の見た目は変わらない）
+ * D-cache の扱いは板ごとに違うので、ここは smp_parallel_sum の障壁に依存する。 */
+#define PAR_NCORES    4
+#define PAR_SENDQ     512
+#define PAR_BATCH_MAX 32                                  /* <= VM_MAXOBJ */
+static unsigned char vm_class_parsafe[VM_MAX_CLASSES];   /* 1 = WAIT/描画を含まない */
+static int           avm_par_enable = 0;                 /* 既定 OFF。/avm-par?on=1 で入る */
+static volatile int  avm_par_nbatch = 0;                 /* 診断: 配ったバッチ数 */
+static volatile int  avm_par_lastbn = 0;                 /* 診断: 最後のバッチ長 */
+static unsigned long avm_now_us(void)
+{
+    unsigned long ct, hz;
+    __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(ct));
+    __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz));
+    return hz ? (ct * 1000000UL) / hz : 0;
+}
+static int           avm_root_id  = -1;  /* 読み込んだ根オブジェクト（tick の宛先） */
+static volatile long avm_pump_rounds = 0;
+static volatile long avm_line_ok  = 0;   /* 診断: 検算に通ったラウンド数 */
+static volatile long avm_line_ng  = 0;   /* 診断: 検算に落ちたラウンド数 */
+long avm_get_line_ok(void) { return avm_line_ok; }
+long avm_get_line_ng(void) { return avm_line_ng; }
+static volatile long avm_par_us   = 0;   /* 診断: 並列配布に費やした総時間[us] */
+static volatile long avm_par_msgs = 0;   /* 診断: 並列で配ったメッセージ総数   */
+long avm_get_par_us(void)   { return avm_par_us; }
+long avm_get_par_msgs(void) { return avm_par_msgs; }
+void avm_par_hits_reset(void);
+void avm_par_reset_stats(void) { avm_line_ok = 0; avm_line_ng = 0;
+                                 avm_par_us = 0; avm_par_msgs = 0; avm_par_nbatch = 0;
+                                 avm_par_hits_reset(); }
+void avm_set_par(int on) { avm_par_enable = on ? 1 : 0; }
+int  avm_get_par(void)   { return avm_par_enable; }
+int  avm_get_par_nbatch(void) { return avm_par_nbatch; }
+int  avm_get_par_lastbn(void) { return avm_par_lastbn; }
+static volatile int  par_active = 0;                     /* バッチ実行中は 1 */
+static vmmsg_t   par_q[PAR_NCORES][PAR_SENDQ];           /* コアごとの send 控え */
+static int       par_qn[PAR_NCORES];
+static int       par_spawn_next[PAR_NCORES], par_spawn_hi[PAR_NCORES];
+static vmmsg_t  *par_batch;                              /* 実行中のバッチ */
+
+/* メソッド本体に並列不可の命令(WAIT/描画)が入っているか。
+ * オペランドを正しく読み飛ばすので、オペランド byte を命令と誤読しない。 */
+static int code_has_unsafe(const unsigned char *code, int len)
+{
+    int pc = 0;
+    while (pc < len) {
+        unsigned char op = code[pc++];
+        switch (op) {
+            case 0x07: case 0x45: case 0x46: case 0x47: case 0x48: return 1; /* WAIT/LINE/CLS/TRI/MESH3D */
+            case 0x01: pc += 4; break;                       /* PUSHI         */
+            case 0x02: case 0x03: case 0x04: pc += 1; break; /* field/arg     */
+            case 0x30: case 0x31: case 0x41: pc += 2; break; /* JMP/JMPZ/SPAWN */
+            case 0x40: case 0x44: pc += 3; break;            /* SEND/PRINTF   */
+            default: break;                                  /* オペランド無し */
+        }
+    }
+    return 0;
+}
+
+/* バッチ実行中はコアごとに単一書き手なので錠は要らない。 */
+static void par_send(int core, int self, int recv, const char *method, int na, long *a)
+{
+    int n = par_qn[core];
+    if (n >= PAR_SENDQ) return;                            /* あふれたら捨てる */
+    par_q[core][n].self = recv; par_q[core][n].sender = self;
+    par_q[core][n].method = method; par_q[core][n].na = na;
+    for (int i = 0; i < na && i < 8; i++) par_q[core][n].a[i] = a[i];
+    par_qn[core] = n + 1;
+}
+
+/* このコアの持ち分の範囲から新しいオブジェクトを取る（重ならないので競合しない）。 */
+static int par_spawn(int core, int cls)
+{
+    if (cls < 0 || cls >= vm_n_class) return -1;
+    for (int i = par_spawn_next[core]; i < par_spawn_hi[core]; i++) {
+        if (!vm_obj[i].used) {
+            vm_obj[i].used = 1; vm_obj[i].cls = cls;
+            for (int f = 0; f < VM_MAXF; f++) vm_obj[i].f[f] = 0;
+            par_spawn_next[core] = i + 1;
+            return i;
+        }
+    }
+    return -1;                                             /* 範囲を使い切った */
+}
+
 static int vm_spawn(int cls)
 {
     if (cls < 0 || cls >= vm_n_class) return -1;
@@ -747,12 +839,21 @@ static int avm_load(unsigned char *buf, int len)
         avm_mesh_normals();
         mesh_has = 1;
     }
+    /* 並列で配ってよいクラスに印を付ける。WAIT も描画命令も含まないクラスだけが
+     * ワーカ・コアで走れる（自分の領域しか触らず、send/spawn はコアごとに控える）。 */
+    for (c = 0; c < vm_n_class; c++) {
+        vmclass_t *cl = &vm_class[c];
+        int safe = 1;
+        for (mi = 0; mi < cl->n_methods && mi < VM_MAX_METHODS; mi++)
+            if (code_has_unsafe(buf + cl->m[mi].code_off, cl->m[mi].code_len)) { safe = 0; break; }
+        vm_class_parsafe[c] = (unsigned char)safe;
+    }
     return vm_n_class > 0 ? 0 : -1;
 }
 
 /* ===== bytecode dispatch (one message) ================================== */
 #define VM_VSTACK 128
-static void avm_dispatch(int self, int sender, const char *method, long *args, int n_args)
+static void avm_dispatch(int self, int sender, const char *method, long *args, int n_args, int core)
 {
     if (self < 0 || self >= VM_MAXOBJ || !vm_obj[self].used) return;
     vmclass_t *cl = &vm_class[vm_obj[self].cls];
@@ -813,13 +914,21 @@ static void avm_dispatch(int self, int sender, const char *method, long *args, i
                      long va[8]; if (na>8) na=8;
                      for (i=na-1;i>=0;i--) va[i]=VPOP();
                      int recv=(int)VPOP();
-                     if (mn>=0 && mn<vm_n_str) vm_enqueue(self, recv, vm_str[mn], na, va); } break;
-        case 0x41: { int ci=vm_u16(code+pc); pc+=2; VPUSH(vm_spawn(ci)); } break; /* SPAWN */
+                     if (mn>=0 && mn<vm_n_str) {
+                         if (par_active) par_send(core, self, recv, vm_str[mn], na, va);
+                         else            vm_enqueue(self, recv, vm_str[mn], na, va);
+                     } } break;
+        case 0x41: { int ci=vm_u16(code+pc); pc+=2;
+                     VPUSH(par_active ? par_spawn(core, ci) : vm_spawn(ci)); } break; /* SPAWN */
         case 0x42: { (void)VPOP(); } break;                                     /* PRINT (ignored) */
         case 0x43: pc = clen; break;                                            /* RET */
         case 0x44: { int fi=vm_u16(code+pc); pc+=2; int na=code[pc++]; (void)fi; /* PRINTF (ignored) */
                      for (int i=0;i<na;i++) VPOP(); } break;
         case 0x45: { long col=VPOP(),y2=VPOP(),x2=VPOP(),y1=VPOP(),x1=VPOP();   /* LINE */
+                     /* 計器: ベンチ標本は検算の結果を線の色で表す(2=正 / 4=誤)。
+                      * 数えておけば /avm-par から正誤が読め、実験値が
+                      * 正しい実行の上で採られたことを外から確かめられる。 */
+                     if (col == 2) avm_line_ok++; else if (col == 4) avm_line_ng++;
                      vm_line((int)x1,(int)y1,(int)x2,(int)y2,(int)col); } break;
         case 0x46: vm_cls(); break;                                             /* CLS */
         case 0x47: { long col=VPOP(),y3=VPOP(),x3=VPOP(),y2=VPOP(),x2=VPOP(),y1=VPOP(),x1=VPOP(); /* TRI */
@@ -833,6 +942,22 @@ static void avm_dispatch(int self, int sender, const char *method, long *args, i
     }
 #undef VPUSH
 #undef VPOP
+}
+
+/* 計器: どのコアが何通のメッセージを実行したか。「4 コアが本当に働いているか」を
+ * 推測でなく数で示す。 */
+static volatile long par_core_hits[PAR_NCORES];
+long avm_get_core_hits(int c) { return (c >= 0 && c < PAR_NCORES) ? par_core_hits[c] : -1; }
+void avm_par_hits_reset(void) { for (int c = 0; c < PAR_NCORES; c++) par_core_hits[c] = 0; }
+
+/* SMP 区間関数: par_batch[lo..hi) をこのコアで配る（core = 0..3）。 */
+static long par_dispatch_range(long lo, long hi, int core)
+{
+    if (core >= 0 && core < PAR_NCORES) par_core_hits[core] += (hi - lo);
+    for (long i = lo; i < hi; i++)
+        avm_dispatch(par_batch[i].self, par_batch[i].sender, par_batch[i].method,
+                     par_batch[i].a, par_batch[i].na, core);
+    return 0;
 }
 
 /* ===== cooperative tick: advance the VM by ONE frame ===================== */
@@ -887,10 +1012,76 @@ static void avm_tick(void)
     vm_frame_done = 0;
     long guard = 0;
     while (vm_qh != vm_qt && !vm_frame_done && ++guard < 2000000L) {
+        /* 先頭から「別々のアクター宛で par_safe な」連なりを集めて各コアへ配る。
+         * 描画/WAIT のアクターや宛先の重複が出たらそこで切るので FIFO は保たれる。 */
+        if (avm_par_enable && smp_cores_online() >= 2) {
+            static vmmsg_t batch[PAR_BATCH_MAX];
+            int batch_self[PAR_BATCH_MAX], bn = 0, qi = vm_qh;
+            while (qi != vm_qt && bn < PAR_BATCH_MAX) {
+                vmmsg_t *m = &vm_q[qi];
+                int ok = m->self >= 0 && m->self < VM_MAXOBJ && vm_obj[m->self].used
+                         && vm_class_parsafe[vm_obj[m->self].cls];
+                for (int k = 0; ok && k < bn; k++) if (batch_self[k] == m->self) ok = 0;
+                if (!ok) break;
+                batch[bn] = *m; batch_self[bn] = m->self; bn++;
+                qi = (qi + 1) % VM_Q;
+            }
+            if (bn >= 2) {
+                vm_qh = qi;                                   /* バッチを消費 */
+                int nc = smp_cores_online();
+                if (nc > bn) nc = bn;
+                for (int c = 0; c < PAR_NCORES; c++) {
+                    par_qn[c] = 0;
+                    par_spawn_next[c] = c * VM_MAXOBJ / PAR_NCORES;
+                    par_spawn_hi[c]   = (c + 1) * VM_MAXOBJ / PAR_NCORES;
+                }
+                par_batch = batch; par_active = 1;
+                avm_par_nbatch++; avm_par_lastbn = bn;        /* 診断 */
+                {
+                    unsigned long d0 = avm_now_us();
+                    smp_parallel_sum(par_dispatch_range, bn, nc);
+                    avm_par_us += (long)(avm_now_us() - d0);
+                    avm_par_msgs += bn;
+                }
+                par_active = 0;
+                for (int c = 0; c < PAR_NCORES; c++)          /* 生まれた send を併合 */
+                    for (int j = 0; j < par_qn[c]; j++)
+                        vm_enqueue(par_q[c][j].sender, par_q[c][j].self,
+                                   par_q[c][j].method, par_q[c][j].na, par_q[c][j].a);
+                int mx = 0;                                   /* オブジェクト上限を数え直す */
+                for (int i = 0; i < VM_MAXOBJ; i++) if (vm_obj[i].used) mx = i + 1;
+                vm_nobj = mx;
+                continue;
+            }
+        }
         vmmsg_t m = vm_q[vm_qh]; vm_qh = (vm_qh + 1) % VM_Q;
-        avm_dispatch(m.self, m.sender, m.method, m.a, m.na);
+        avm_dispatch(m.self, m.sender, m.method, m.a, m.na, 0);
     }
 }
+
+/* 指定ミリ秒のあいだ VM を回す。戻り値は tick した回数。
+ * この板は HDMI が無く wm_run() が呼ばれないので、これが唯一の駆動源になる。
+ * 呼び出し元(HTTP ハンドラ)はその間ブロックする ―― 測定窓を正確にするための割り切り。 */
+long avm_pump(long ms)
+{
+    unsigned long t0 = avm_now_ms();
+    long ticks = 0, rounds = 0;
+    if (ms < 0) ms = 0;
+    if (ms > 60000) ms = 60000;                 /* 上限 60 秒（板を独占しすぎない） */
+    while ((long)(avm_now_ms() - t0) < ms) {
+        /* WAIT は「フレームの区切り」を立てるだけで tick を積み直さない。
+         * 読み込み時に一度だけ積まれた tick が尽きればそこで終わる ―― これが
+         * 「標本が 2 ラウンドで止まる」の正体だった。空なら積み直して次を回す。 */
+        if (vm_qh == vm_qt && avm_root_id >= 0) {
+            vm_enqueue(-1, avm_root_id, "tick", 0, 0);
+            rounds++;
+        }
+        avm_tick(); ticks++;
+    }
+    avm_pump_rounds = rounds;
+    return ticks;
+}
+long avm_get_pump_rounds(void) { return avm_pump_rounds; }
 
 /* ---- playback controls (toolbar buttons + arrow keys) ---- */
 void avm_ctl(int cmd)   /* 0 play, 1 pause, 2 stop, 3 prev, 4 next */
@@ -955,6 +1146,7 @@ int avm_loadrun(int len)
 
     int id = vm_spawn(0);                         /* class 0 = synthetic __boot */
     if (id < 0) return -1;
+    avm_root_id = id;                             /* 駆動源が tick を積み直すため */
     vm_enqueue(-1, id, "tick", 0, 0);
     avm_active = 1;                                /* vmgfx_draw will tick it */
     return id;

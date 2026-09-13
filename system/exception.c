@@ -20,6 +20,11 @@ extern void aipl_force_release(void);   /* system/proc.c */
 extern void proc_set_preempt(int on);   /* system/proc.c */
 
 /* Captured fault state — surfaced by the /fault diagnostic route. */
+/* 例外復帰時に ELR_EL1/SPSR_EL1 を書き戻すか。既定 1（＝直っている側）。
+ * 0 にすると修正前の挙動に戻るので、同じ起動のまま A/B が取れる。
+ * exception_vectors.S の irq_entry / sync_entry が adrp で直接読む。 */
+volatile unsigned int elr_restore_on = 1;
+
 volatile unsigned long g_fault_count;
 volatile unsigned long g_fault_esr, g_fault_far, g_fault_elr, g_fault_spsr, g_fault_sp;
 
